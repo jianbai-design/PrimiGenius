@@ -1,0 +1,121 @@
+{
+  "name": "primigenius",
+  "version": "1.1.7",
+  "main": "main.js",
+  "description": "Bioinformatics Analysis Tool with Podman Support",
+  "author": "生信美学",
+  "scripts": {
+    "start": "electron .",
+    "dist": "node build/electron-builder-wrapper.js --win --x64 --publish never"
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.primigenius.framework",
+    "productName": "PrimiGenius",
+    "artifactName": "PrimiGenius-Setup-${version}.${ext}",
+    "directories": {
+      "output": "dist_output",
+      "buildResources": "build"
+    },
+    "icon": "build/icon.ico",
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "requestedExecutionLevel": "asInvoker",
+      "icon": "build/icon.ico"
+    },
+    "files": [
+      "main.js",
+      "src/**/*",
+      "package.json",
+      "!plugins/**/*",
+      "!backend/**/*",
+      "!build/**/*",
+      "!r_libs/**/*",
+      "!r_libs_*/**/*",
+      "!outputs/**/*",
+      "!podman-data/**/*",
+      "!podman-config/**/*",
+      "!podman-data-dev/**/*",
+      "!podman-config-dev/**/*",
+      "!dist/**/*",
+      "!podman-5.8.2/**/*",
+      "!bin{,/**/*}",
+      "!include{,/**/*}",
+      "!lib{,/**/*}",
+      "!lib64{,/**/*}",
+      "!pyvenv.cfg",
+      "!*.md",
+      "!*.spec",
+      "!*.bat",
+      "!*.ps1",
+      "!.git/**/*",
+      "!node_modules/.cache/**/*",
+      "!test_data.tsv"
+    ],
+    "extraResources": [
+      {
+        "from": "backend/dist/app",
+        "to": "backend",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "build/icon.ico",
+        "to": "icon.ico"
+      },
+      {
+        "from": "podman",
+        "to": "podman",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "build/wsl.2.7.3.0.x64.msi",
+        "to": "wsl.2.7.3.0.x64.msi"
+      },
+      {
+        "from": "build/jre8.zip",
+        "to": "jre8.zip"
+      }
+    ],
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": true,
+      "allowElevation": true,
+      "include": "build/installer.nsh",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "deleteAppDataOnUninstall": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "PrimiGenius"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "jianbai-design",
+        "repo": "PrimiGenius"
+      }
+    ]
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.3",
+    "iconv-lite": "^0.7.2",
+    "marked": "^4.3.0",
+    "xlsx": "^0.18.5"
+  }
+}

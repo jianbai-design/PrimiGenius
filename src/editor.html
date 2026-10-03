@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Vector Editor — LIVE</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="vendor/fontawesome/css/all.min.css">
+    <style>
+        /* Editor-only mode: full-screen editor, no main UI */
+        html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#1e1e1e; }
+        .r-vector-editor-overlay.r-ve-standalone {
+            position:fixed; inset:0; background:transparent; z-index:1;
+            display:flex; align-items:stretch; justify-content:stretch;
+        }
+        .r-vector-editor-overlay.r-ve-standalone .r-ve-window {
+            margin:0; border-radius:0; width:100%; height:100%;
+        }
+        /* Hide any non-essential chrome */
+        #top-nav, #tab-bar-container, #main-container, #context-menu, #custom-modal { display:none !important; }
+        /* Hide the close button — native window provides its own */
+        .r-ve-close-btn { display:none !important; }
+    </style>
+</head>
+<body>
+    <!-- The vector editor overlay will be injected here dynamically -->
+    <script>
+        // Mark this as a standalone editor window
+        window.__editorStandalone = true;
+    </script>
+    <script src="renderer.js"></script>
+</body>
+</html>
