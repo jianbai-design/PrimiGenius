@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="550" viewBox="0 0 1280 550" role="img" aria-labelledby="title desc">
+<title id="title">PrimiGenius — A desktop workspace for bioinformatics analysis</title>
+<desc id="desc">CLI + R tools; Workflows; Environments; Results + figures</desc>
+<defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#f0f7ff"/><stop offset="1" stop-color="#f8fafc"/></linearGradient></defs>
+<rect x="1" y="1" width="1278" height="548" rx="24" fill="url(#bg)" stroke="#dbe5f0"/>
+<g font-family="Segoe UI, Microsoft YaHei, Arial, sans-serif">
+<rect x="56" y="54" width="70" height="70" rx="19" fill="#2563eb"/>
+<g stroke="#fff" stroke-width="3" fill="none"><path d="M77 76h28v28H77zM77 76l28 28m0-28-28 28"/></g><g fill="#fff"><circle cx="77" cy="76" r="5"/><circle cx="105" cy="76" r="5"/><circle cx="77" cy="104" r="5"/><circle cx="105" cy="104" r="5"/></g>
+<text x="148" y="103" font-size="49" font-weight="700" fill="#102a43">PrimiGenius</text>
+<text x="58" y="164" font-size="25" fill="#52677d">A desktop workspace for bioinformatics analysis</text>
+<rect x="1055" y="67" width="168" height="36" rx="18" fill="#e0ecff"/><text x="1139" y="91" text-anchor="middle" font-size="16" font-weight="600" fill="#2455a4">Windows x64</text>
+<text x="58" y="217" font-size="13" font-weight="700" letter-spacing="1.3" fill="#557398">ONE INTERFACE · FOUR CONNECTED CAPABILITIES</text>
+<rect x="56" y="238" width="280" height="172" rx="16" fill="#fff" stroke="#d7e3ef"/>
+<g transform="translate(78,257)" stroke="#2563eb" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M8 11 2 17l6 6m16-12 6 6-6 6M19 7l-6 20"/></g>
+<text x="78" y="326" font-size="23" font-weight="650" fill="#173653">CLI + R tools</text>
+<text x="78" y="355" font-size="16" fill="#596e83">Plugin-driven analysis</text>
+<text x="78" y="380" font-size="16" fill="#596e83">Inputs, parameters, outputs</text>
+<rect x="352" y="238" width="280" height="172" rx="16" fill="#fff" stroke="#d7e3ef"/>
+<g transform="translate(374,257)" stroke="#2563eb" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="10" height="8" rx="2"/><rect x="20" y="20" width="10" height="8" rx="2"/><path d="M7 11v13h13M12 7h13v13"/></g>
+<text x="374" y="326" font-size="23" font-weight="650" fill="#173653">Workflows</text>
+<text x="374" y="355" font-size="16" fill="#596e83">Connect analysis nodes</text>
+<text x="374" y="380" font-size="16" fill="#596e83">Organize multi-step tasks</text>
+<rect x="648" y="238" width="280" height="172" rx="16" fill="#fff" stroke="#d7e3ef"/>
+<g transform="translate(670,257)" stroke="#2563eb" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="m16 2 14 8v15l-14 8L2 25V10Zm0 16 14-8M16 18 2 10M16 18v15"/></g>
+<text x="670" y="326" font-size="23" font-weight="650" fill="#173653">Environments</text>
+<text x="670" y="355" font-size="16" fill="#596e83">Podman · WSL · R packages</text>
+<text x="670" y="380" font-size="16" fill="#596e83">Prepare analysis runtimes</text>
+<rect x="944" y="238" width="280" height="172" rx="16" fill="#fff" stroke="#d7e3ef"/>
+<g transform="translate(966,257)" stroke="#2563eb" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="28" height="28" rx="3"/><path d="M8 25v-7m8 7V10m8 15V15"/></g>
+<text x="966" y="326" font-size="23" font-weight="650" fill="#173653">Results + figures</text>
+<text x="966" y="355" font-size="16" fill="#596e83">Browse and preview output</text>
+<text x="966" y="380" font-size="16" fill="#596e83">Edit SVG figures</text>
+<circle cx="100" cy="467" r="13" fill="#dbeafe"/>
+<text x="100" y="472" text-anchor="middle" font-size="13" font-weight="700" fill="#1d4ed8">1</text>
+<text x="126" y="473" font-size="17" font-weight="600" fill="#36536d">Install tools</text>
+<path d="M301 467h43m-6-5 6 5-6 5" stroke="#9aafc4" stroke-width="1.7" fill="none"/>
+<circle cx="396" cy="467" r="13" fill="#dbeafe"/>
+<text x="396" y="472" text-anchor="middle" font-size="13" font-weight="700" fill="#1d4ed8">2</text>
+<text x="422" y="473" font-size="17" font-weight="600" fill="#36536d">Configure inputs</text>
+<path d="M597 467h43m-6-5 6 5-6 5" stroke="#9aafc4" stroke-width="1.7" fill="none"/>
+<circle cx="692" cy="467" r="13" fill="#dbeafe"/>
+<text x="692" y="472" text-anchor="middle" font-size="13" font-weight="700" fill="#1d4ed8">3</text>
+<text x="718" y="473" font-size="17" font-weight="600" fill="#36536d">Run analyses</text>
+<path d="M893 467h43m-6-5 6 5-6 5" stroke="#9aafc4" stroke-width="1.7" fill="none"/>
+<circle cx="988" cy="467" r="13" fill="#dbeafe"/>
+<text x="988" y="472" text-anchor="middle" font-size="13" font-weight="700" fill="#1d4ed8">4</text>
+<text x="1014" y="473" font-size="17" font-weight="600" fill="#36536d">Inspect results</text>
+</g></svg>

@@ -6,9 +6,7 @@ PrimiGenius 是面向生物信息学分析的 Windows 桌面程序，将命令�
 
 [下载安装包](https://github.com/jianbai-design/PrimiGenius/releases) · [反馈问题](https://github.com/jianbai-design/PrimiGenius/issues) · [插件仓库](https://github.com/jianbai-design/PrimiGenius-plugins)
 
-![PrimiGenius 概念插画](docs/images/primigenius-overview.jpg)
-
-*使用 Canva 制作的概念插画，并非真实软件界面截图。*
+![PrimiGenius 功能概览](docs/images/primigenius-overview.zh-CN.svg)
 
 ## 功能
 
@@ -34,18 +32,97 @@ PrimiGenius 是面向生物信息学分析的 Windows 桌面程序，将命令�
 
 ## 应用结构
 
+### 应用进程与通信
+
 ```mermaid
-flowchart LR
-    UI[Electron 界面] --> MAIN[Electron 主进程]
-    MAIN --> API[本机 Python API]
-    UI --> API
-    API --> RUNTIME[Podman / WSL]
-    RUNTIME --> TOOLS[工具与 R 镜像]
-    UI --> STORE[独立插件注册表]
-    API --> FILES[本地输入与结果]
+flowchart TB
+    UI["渲染进程 · src/renderer.js<br/>CLI / R 表单 · 工作流编排<br/>结果 / SVG 编辑器 · 商店 / 环境面板"]
+    MAIN["Electron · main.js<br/>原生窗口 / 对话框 · IPC<br/>后端启动 · 更新 / 插件下载"]
+    subgraph BACKEND["Python 后端 · backend/app.py"]
+        API["Flask API<br/>127.0.0.1 · 动态端口"]
+        CONFIG["插件发现<br/>配置读取"]
+        RUN["任务调度<br/>文件 / 输出接口"]
+        RPKG["R 包安装<br/>依赖准备"]
+    end
+    PM["PodmanManager<br/>backend/podman_manager.py<br/>机器生命周期 · WSL 恢复 · API 连接"]
+    UI <-->|IPC| MAIN
+    MAIN -->|启动 Python / 端口传递| API
+    UI -->|本地 HTTP| API
+    API -.->|SSE 日志 / 状态| UI
+    API --> CONFIG
+    API --> RUN
+    API --> RPKG
+    RUN --> PM
+    RPKG --> PM
+    class UI,MAIN ui
+    class API,CONFIG,RUN,RPKG,PM backend
+    classDef ui fill:#eaf2ff,stroke:#5684c4,color:#18324f
+    classDef backend fill:#e9f7f3,stroke:#469d86,color:#194e40
+    classDef runtime fill:#fff4df,stroke:#c19b48,color:#624a20
 ```
 
-主进程启动 Python 后端，后端在 `127.0.0.1` 上绑定可用端口。插件与容器镜像分开分发。
+### 任务执行与本地数据
+
+```mermaid
+flowchart TB
+    TASK["后端任务调度"]
+    PM["PodmanManager<br/>Docker 兼容 API / Podman 客户端"]
+    MACHINE["WSL 2 + Podman 机器"]
+    CLI["CLI 工具容器"]
+    R["共享 R 运行容器"]
+    HOST["Windows 主机<br/>原生 GUI / Java 进程"]
+    DATA["本地输入 / 输出目录"]
+    LIB["持久化 R 包库"]
+    STATE["机器配置 / 运行状态"]
+    TASK --> PM
+    TASK --> HOST
+    PM --> MACHINE
+    PM <-->|读取 / 更新| STATE
+    MACHINE --> CLI
+    MACHINE --> R
+    CLI <-->|目录挂载| DATA
+    R <-->|目录挂载| DATA
+    R <-->|包库挂载| LIB
+    HOST <-->|文件访问| DATA
+    TASK <-->|文件 / 结果接口| DATA
+    class TASK,PM backend
+    class MACHINE,CLI,R,HOST runtime
+    classDef ui fill:#eaf2ff,stroke:#5684c4,color:#18324f
+    classDef backend fill:#e9f7f3,stroke:#469d86,color:#194e40
+    classDef runtime fill:#fff4df,stroke:#c19b48,color:#624a20
+```
+
+### 插件与运行环境分发
+
+```mermaid
+flowchart TB
+    STORE["插件商店 / 更新界面"]
+    MAIN["Electron 主进程<br/>下载 / 签名校验"]
+    REGISTRY["插件注册表<br/>签名插件包"]
+    RELEASE["GitHub 主程序 Releases"]
+    INSTALL["后端插件安装接口"]
+    PLUGINS["本地已安装插件<br/>配置 / 脚本"]
+    RUNTIME["Podman / R 运行环境准备"]
+    IMAGES["容器镜像仓库"]
+    RREPO["R 包仓库"]
+    STORE <-->|IPC| MAIN
+    MAIN <-->|HTTPS| REGISTRY
+    MAIN <-->|HTTPS| RELEASE
+    MAIN -->|安装接口| INSTALL
+    INSTALL --> PLUGINS
+    PLUGINS -->|声明的依赖| RUNTIME
+    RUNTIME <-->|拉取镜像| IMAGES
+    RUNTIME <-->|安装包| RREPO
+    class STORE,MAIN ui
+    class INSTALL,RUNTIME backend
+    classDef ui fill:#eaf2ff,stroke:#5684c4,color:#18324f
+    classDef backend fill:#e9f7f3,stroke:#469d86,color:#194e40
+    classDef runtime fill:#fff4df,stroke:#c19b48,color:#624a20
+```
+
+界面通过 Electron IPC 调用原生窗口、文件对话框、更新和插件下载功能，通过本机 HTTP API 提交分析任务；SSE 将日志和状态返回界面。工作流编排位于渲染进程。主进程负责启动 Python 后端并将动态端口传给界面。
+
+后端读取插件配置，分派 CLI、R 或原生 GUI/Java 任务，并提供文件与结果接口。PodmanManager 管理 WSL/Podman 机器和服务连接；容器通过目录挂载访问输入和输出。R 包安装与运行使用共享的 R 运行环境。插件、镜像、R 包和主程序更新来自图中对应的外部分发服务。
 
 ## 从源码运行
 
@@ -113,9 +190,3 @@ python -B -m unittest discover -s backend/tests -p "test_*.py"
 主程序依据 [GNU GPL v3.0](LICENSE) 分发。第三方资源保留各自许可证，Font Awesome 的许可文本位于[此文件](src/vendor/fontawesome/LICENSE.txt)。
 
 插件源码及插件包、注册表、容器镜像、第三方运行时二进制、签名密钥和用户数据不属于本次源码公开范围。插件在[独立插件仓库](https://github.com/jianbai-design/PrimiGenius-plugins)维护，遵循各自适用的条款。旧插件包已从当前目录树中移除，早期提交仍保留在 Git 历史中。
-
-## 参与贡献
-
-通过 [Issues](https://github.com/jianbai-design/PrimiGenius/issues) 反馈问题或提出建议。请提供主程序版本、Windows 版本、复现步骤、预期与实际表现，以及脱敏日志。分析任务失败时，也请注明插件名称和版本。
-
-主程序改动应适用于不同插件，并说明验证方式。贡献内容中请勿包含凭据、分析数据、本机运行状态和生成产物。
