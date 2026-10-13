@@ -2254,25 +2254,58 @@ ipcMain.on('update-editor-lang', (event, lang) => {
 
 // ---- IPC: Open GitHub OAuth in-app browser window ----
 let ghAuthWindow = null;
-ipcMain.handle('open-github-auth', (event, { url, userCode }) => {
+ipcMain.handle('open-github-auth', (event, { url, userCode, codeBounds, lang }) => {
+    const parentBounds = mainWindow.getContentBounds();
+    const area = screen.getDisplayMatching(mainWindow.getBounds()).workArea;
+    const gap = 16;
+    let width = Math.min(520, Math.max(1, area.width - gap * 2));
+    const height = Math.min(700, Math.max(1, area.height - gap * 2));
+    let x = area.x + area.width - width - gap;
+    let y = parentBounds.y;
+    if (codeBounds && ['x', 'y', 'width', 'viewportWidth'].every(key => Number.isFinite(codeBounds[key]))
+        && codeBounds.viewportWidth > 0 && codeBounds.width > 0) {
+        const scale = parentBounds.width / codeBounds.viewportWidth;
+        const codeLeft = parentBounds.x + codeBounds.x * scale;
+        const codeRight = codeLeft + codeBounds.width * scale;
+        const rightSpace = area.x + area.width - gap - (codeRight + gap);
+        const leftSpace = codeLeft - gap - (area.x + gap);
+        if (rightSpace >= 340) {
+            width = Math.min(width, Math.floor(rightSpace));
+            x = Math.ceil(codeRight + gap);
+        } else if (leftSpace >= 340) {
+            width = Math.min(width, Math.floor(leftSpace));
+            x = Math.floor(codeLeft - gap - width);
+        }
+        y = parentBounds.y + codeBounds.y * scale;
+    }
+    x = Math.round(Math.max(area.x + gap, Math.min(x, area.x + area.width - width - gap)));
+    y = Math.round(Math.max(area.y + gap, Math.min(y, area.y + area.height - height - gap)));
+    const bounds = { x, y, width, height };
+    const title = userCode
+        ? `GitHub — ${lang === 'zh' ? '授权码' : 'Code'}: ${userCode}`
+        : 'GitHub Authorization';
     if (ghAuthWindow && !ghAuthWindow.isDestroyed()) {
+        ghAuthWindow.setBounds(bounds);
+        ghAuthWindow.setTitle(title);
+        if (ghAuthWindow.isMinimized()) ghAuthWindow.restore();
         ghAuthWindow.loadURL(url);
         ghAuthWindow.focus();
         return { status: 'reused' };
     }
     ghAuthWindow = new BrowserWindow({
-        width: 520,
-        height: 700,
+        ...bounds,
         parent: mainWindow,
         modal: false,
         autoHideMenuBar: true,
-        title: 'GitHub Authorization',
+        title,
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true
         }
     });
     ghAuthWindow.setMenuBarVisibility(false);
+    // Keep the device code visible through GitHub login and authorization redirects.
+    ghAuthWindow.on('page-title-updated', event => event.preventDefault());
     ghAuthWindow.loadURL(url);
     ghAuthWindow.on('closed', () => { ghAuthWindow = null; });
     return { status: 'opened' };

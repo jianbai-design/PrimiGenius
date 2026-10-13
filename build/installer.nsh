@@ -35,6 +35,19 @@ Var PreserveExistingEnvironment
 !macroend
 
 !macro customInit
+  ; Change only the fresh-install default. Keep registered upgrade paths and
+  ; the explicit /D override selected by electron-builder's initMultiUser.
+  ReadRegStr $0 HKLM "${INSTALL_REGISTRY_KEY}" InstallLocation
+  ${StdUtils.GetParameter} $R0 "D" ""
+  ${If} $0 == ""
+  ${AndIf} $R0 == ""
+    ; All-users shell context resolves LocalAppData to ProgramData. Switch
+    ; briefly so the default belongs to the installing Windows user.
+    SetShellVarContext current
+    StrCpy $INSTDIR "$LOCALAPPDATA\${APP_FILENAME}"
+    SetShellVarContext all
+  ${EndIf}
+
   ; customInit runs before application files are replaced, so it can also
   ; recognize a manual in-place upgrade (not only electron-updater's
   ; --updated invocation).

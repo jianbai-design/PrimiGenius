@@ -2,8 +2,8 @@ FROM rocker/r-ver:4.6.1@sha256:18aac8c3b1fece4c60720f5f9b0dc066e04409c7de2896b28
 LABEL org.primigenius.r-version="4.6.1"
 LABEL org.primigenius.bioconductor-version="3.23"
 LABEL org.primigenius.base-digest="sha256:18aac8c3b1fece4c60720f5f9b0dc066e04409c7de2896b28528e7be0bdd9535"
-LABEL org.primigenius.recipe-version="4"
-LABEL org.primigenius.recipe-sha256="feebcf0d7b3a347e0464b8aca29387585b37097018345f94e8b75c654057c546"
+LABEL org.primigenius.recipe-version="5"
+LABEL org.primigenius.recipe-sha256="afcc1ffc56c5bcdfe8958ca8aac87e9b91247b0d6e1dd13451b3312a31668449"
 ARG APT_MIRROR=https://archive.ubuntu.com/ubuntu
 RUN set -eu; \
     echo "[APT] Using ${APT_MIRROR}"; \
@@ -19,6 +19,8 @@ RUN set -eu; \
         make \
         pkg-config \
         cmake \
+        rustc-1.89 \
+        cargo-1.89 \
         libuv1-dev \
         libgdal-dev \
         libproj-dev \
@@ -27,7 +29,7 @@ RUN set -eu; \
         libharfbuzz-dev \
         libfribidi-dev \
         libfontconfig1-dev \
-        libfreetype6-dev \
+        libfreetype-dev \
         libpng-dev \
         libtiff-dev \
         libjpeg-dev \
@@ -44,5 +46,6 @@ RUN set -eu; \
     && \
     sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && \
     locale-gen en_US.UTF-8 && \
+    ln -sf /usr/bin/rustc-1.89 /usr/local/bin/rustc && ln -sf /usr/bin/cargo-1.89 /usr/local/bin/cargo || exit 1; rustc --version && cargo --version && dpkg --compare-versions "$(rustc --version | cut -d ' ' -f2)" ge 1.88.0 && dpkg --compare-versions "$(cargo --version | cut -d ' ' -f2)" ge 1.88.0 || { echo "[SYS-DEPS] Rust/Cargo >= 1.88.0 required; R installation stopped." >&2; exit 1; };  \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8

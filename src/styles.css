@@ -1386,6 +1386,70 @@ body {
     padding-bottom: 92px;
 }
 
+.welcome-github-star {
+    position: absolute;
+    top: 12px;
+    right: 4px;
+    z-index: 4;
+    display: inline-flex;
+    align-items: center;
+    overflow: hidden;
+    border: 1px solid #d2dced;
+    border-radius: 10px;
+    background: linear-gradient(135deg, #fff 0%, #f3f7ff 100%);
+    color: #465675;
+    font-size: 13px;
+    line-height: 36px;
+    text-decoration: none;
+    box-shadow: 0 3px 10px rgba(68, 96, 146, 0.1), inset 0 1px 0 #fff;
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.welcome-github-star:hover {
+    border-color: #9cb8e2;
+    box-shadow: 0 4px 14px rgba(68, 96, 146, 0.18), inset 0 1px 0 #fff;
+}
+
+.welcome-github-star:focus-visible {
+    outline: 2px solid #2196f3;
+    outline-offset: 3px;
+}
+
+.welcome-github-star-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 10px 0 6px;
+    font-weight: 600;
+}
+
+.welcome-github-star-label .welcome-github-star-logo {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border-radius: 8px;
+    background: linear-gradient(145deg, #edf2ff, #dce8ff);
+    color: #4b64a0;
+    font-size: 18px;
+}
+
+.welcome-github-star-label .welcome-github-star-spark {
+    color: #e6a629;
+    font-size: 12px;
+}
+
+.welcome-github-star-count {
+    padding: 0 12px;
+    border-left: 1px solid #dce4f1;
+    font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 600px) {
+    .welcome-box { padding-top: 44px; }
+}
+
 .welcome-dna-wrap {
     position: relative;
     font-size: 62px;

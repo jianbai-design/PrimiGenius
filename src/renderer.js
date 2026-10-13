@@ -146,6 +146,7 @@ const i18nData = {
         'nav-plugin-store': '插件商店',
         'welcome-title': '欢迎使用 PrimiGenius',
         'welcome-tab': '欢迎',
+        'welcome-star-title': '前往 GitHub 为 PrimiGenius 点 Star（需登录）',
         'welcome-desc-1': '独立思考，至真至善。',
         'welcome-desc-2': '作者：巫函忆，徐自强，稻壳',
         'welcome-citation-body': '请引用 PrimiGenius GitHub 仓库，以及你在本次分析中实际使用到的工具相关文献。',
@@ -285,6 +286,7 @@ const i18nData = {
         'nav-plugin-store': 'Plugin Store',
         'welcome-title': 'Welcome to PrimiGenius',
         'welcome-tab': 'Welcome',
+        'welcome-star-title': 'Open GitHub to star PrimiGenius (sign in required)',
         'welcome-desc-1': 'Independent Thinking, Ultimate Truth and Goodness.',
         'welcome-desc-2': 'Author: Hanyiwu, Ziqiangxv, Daoke',
         'welcome-citation-body': 'Please cite the PrimiGenius GitHub repository and the references for the tools actually used in your analysis.',
@@ -609,6 +611,11 @@ function updateLanguage(lang) {
     if(welcomeDesc2) welcomeDesc2.innerText = t('welcome-desc-2');
     const welcomeCitationBody = document.getElementById('welcome-citation-body');
     if (welcomeCitationBody) welcomeCitationBody.innerText = t('welcome-citation-body');
+    const welcomeStar = document.getElementById('welcome-github-star');
+    if (welcomeStar) {
+        welcomeStar.title = t('welcome-star-title');
+        welcomeStar.setAttribute('aria-label', t('welcome-star-title'));
+    }
     const logHeader = document.getElementById('log-header');
     if(logHeader) logHeader.innerText = t('log-header');
 
@@ -9439,7 +9446,7 @@ async function ghDeviceLogin() {
     }
     return new Promise((resolve) => {
         const dlg = document.createElement('dialog');
-        dlg.style.cssText = 'border:none;border-radius:14px;padding:0;background:#fff;box-shadow:0 8px 40px rgba(0,0,0,0.3);z-index:200000;min-width:420px;max-width:500px;';
+        dlg.style.cssText = 'border:none;border-radius:14px;padding:0;background:#fff;box-shadow:0 8px 40px rgba(0,0,0,0.3);z-index:200000;width:min(420px,calc(100vw - 32px));min-width:0;max-width:420px;margin-left:16px;margin-right:auto;box-sizing:border-box;';
 
         dlg.innerHTML = `
             <div style="padding:18px 24px 12px;font-size:17px;font-weight:700;color:#333;border-bottom:1px solid #eee;display:flex;align-items:center;gap:10px;">
@@ -9451,7 +9458,12 @@ async function ghDeviceLogin() {
                 <div style="margin-top:12px;color:#666;font-size:14px;">${zh?'正在请求授权码…':'Requesting authorization code…'}</div>
             </div>
         `;
-        const closeDlg = (result) => { try{dlg.close();}catch(e){} try{dlg.remove();}catch(e){} resolve(result); };
+        let cancelled = false;
+        const closeDlg = (result) => {
+            cancelled = true;
+            ipcRenderer.invoke('close-github-auth').catch(() => {});
+            try{dlg.close();}catch(e){} try{dlg.remove();}catch(e){} resolve(result);
+        };
         dlg.addEventListener('cancel', e => { e.preventDefault(); closeDlg(null); });
         document.body.appendChild(dlg);
         dlg.showModal();
@@ -9466,14 +9478,20 @@ async function ghDeviceLogin() {
                 }, { retries: 3, timeoutMs: 4500 });
                 if (!codeResp.ok) throw new Error(`HTTP ${codeResp.status}`);
                 const codeData = await codeResp.json();
+                if (cancelled) return;
                 const { device_code, user_code, verification_uri, expires_in, interval } = codeData;
 
                 // Auto-copy code to clipboard
                 try { require('electron').clipboard.writeText(user_code); } catch(e) { navigator.clipboard.writeText(user_code).catch(()=>{}); }
 
-                // Open in-app browser window directly
                 const verifyUrl = `${verification_uri}?user_code=${encodeURIComponent(user_code)}`;
-                try { await ipcRenderer.invoke('open-github-auth', { url: verifyUrl, userCode: user_code }); } catch(e) {}
+                const openAuthWindow = () => {
+                    const rect = dlg.getBoundingClientRect();
+                    return ipcRenderer.invoke('open-github-auth', {
+                        url: verifyUrl, userCode: user_code, lang: currentLang,
+                        codeBounds: { x: rect.x, y: rect.y, width: rect.width, viewportWidth: window.innerWidth }
+                    });
+                };
 
                 dlg.innerHTML = `
                     <div style="padding:18px 24px 12px;font-size:17px;font-weight:700;color:#333;border-bottom:1px solid #eee;display:flex;align-items:center;gap:10px;">
@@ -9511,7 +9529,7 @@ async function ghDeviceLogin() {
 
                 // Reopen auth window button
                 dlg.querySelector('.gh-reopen-btn').onclick = async () => {
-                    try { await ipcRenderer.invoke('open-github-auth', { url: verifyUrl, userCode: user_code }); } catch(e) {}
+                    try { await openAuthWindow(); } catch(e) {}
                 };
                 const openBrowserBtn = dlg.querySelector('.gh-open-browser-btn');
                 if (openBrowserBtn) openBrowserBtn.onclick = () => {
@@ -9519,11 +9537,11 @@ async function ghDeviceLogin() {
                 };
 
                 dlg.querySelector('.dlg-cancel').onclick = () => closeDlg(null);
+                // Render the code panel before positioning the separate native window.
+                try { await openAuthWindow(); } catch(e) {}
 
                 const pollInterval = (interval || 5) * 1000;
                 const deadline = Date.now() + (expires_in || 900) * 1000;
-                let cancelled = false;
-                dlg.addEventListener('cancel', () => { cancelled = true; try { ipcRenderer.invoke('close-github-auth'); } catch(e) {} });
 
                 while (Date.now() < deadline && !cancelled) {
                     await new Promise(r => setTimeout(r, pollInterval));
@@ -9539,6 +9557,7 @@ async function ghDeviceLogin() {
                             })
                         }, { retries: 1, timeoutMs: 5000 });
                         const tokenData = await tokenResp.json();
+                        if (cancelled) return;
                         if (tokenData.access_token) {
                             _ghSetToken(tokenData.access_token);
                             // Close in-app auth window
@@ -15352,7 +15371,7 @@ function renderRPanelUI(instance, container) {
                     }
                     const card = document.createElement('div');
                     card.dataset.dynParamId = '__card_' + param.id;
-                    card.style.cssText = 'flex:1; min-width:200px; border:1px solid #555; border-radius:6px; padding:8px 10px 10px; background:rgba(30,30,50,0.25);';
+                    card.style.cssText = 'box-sizing:border-box; flex:1; min-width:200px; border:1px solid #555; border-radius:6px; padding:8px 10px 10px; background:rgba(30,30,50,0.25);';
                     currentCardEl = card;
 
                     const collapsed = !S[param.id];
@@ -22914,6 +22933,33 @@ async function post(url, d, timeoutMs) {
     }
 }
 
+async function initWelcomeGithubStar() {
+    const card = document.getElementById('welcome-github-star');
+    const count = document.getElementById('welcome-github-star-count');
+    if (!card || !count) return;
+    card.addEventListener('click', (event) => {
+        event.preventDefault();
+        require('electron').shell.openExternal(card.href).catch(error => {
+            console.warn('[GitHub Star] Could not open browser:', error);
+        });
+    });
+
+    try {
+        const response = await _ghFetch('https://api.github.com/repos/jianbai-design/PrimiGenius', {
+            headers: { Accept: 'application/vnd.github+json' },
+            credentials: 'omit'
+        }, { timeoutMs: 5000, noRetry: true });
+        if (!response.ok) return;
+        const data = await response.json();
+        if (Number.isSafeInteger(data.stargazers_count) && data.stargazers_count >= 0) {
+            count.textContent = data.stargazers_count.toLocaleString('en-US');
+            count.hidden = false;
+        }
+    } catch (error) {
+        // The link remains usable when GitHub is unavailable or rate-limited.
+    }
+}
+
 // Apply initial language to replace static text in HTML (ensure labels reflect `currentLang`)
 if (!window.__editorStandalone) {
     // === 全局拖放保护：防止 Electron 窗口在拖入文件时导航离开 ===
@@ -22933,6 +22979,7 @@ if (!window.__editorStandalone) {
     // Normal main window mode
     openWelcomeTab();
     updateLanguage(currentLang);
+    initWelcomeGithubStar();
     init();
 
     // Restore focus for text inputs without changing select behavior.

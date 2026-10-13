@@ -2757,11 +2757,12 @@ R_IMAGE_ARCHIVE_ACCELERATORS = (
     'https://hubp.llkk.cc/',
 )
 R_LEGACY_DOCKER_IMAGE = f'{R_DOCKER_IMAGE_REPOSITORY}:latest'
-R_CUSTOM_RECIPE_VERSION = 4
+R_CUSTOM_RECIPE_VERSION = 5
 R_CUSTOM_IMAGE = f'primigenius-r-base:r{R_VERSION}-bioc{BIOCONDUCTOR_VERSION}-v{R_CUSTOM_RECIPE_VERSION}'
 R_LEGACY_CUSTOM_IMAGES = (
     'primigenius-r-base:install-v2',
     f'primigenius-r-base:r{R_VERSION}-bioc{BIOCONDUCTOR_VERSION}-v3',
+    f'primigenius-r-base:r{R_VERSION}-bioc{BIOCONDUCTOR_VERSION}-v4',
 )
 R_LIBRARY_GENERATION = f'r{R_VERSION}-bioc{BIOCONDUCTOR_VERSION}'
 R_LEGACY_LIBS_DIR = os.path.join(APP_INSTALL_DIR, 'r_libs')
@@ -2771,13 +2772,27 @@ R_RUNTIME_STATE_FILE = os.path.join(APP_INSTALL_DIR, '.primigenius_r_runtime.jso
 R_PACKAGE_LOCK_FILE = os.path.join(APP_INSTALL_DIR, '.primigenius_r_package.lock')
 os.makedirs(R_LIBS_DIR, exist_ok=True)
 R_LIBS_ENV = {'R_LIBS': '/r_libs:/usr/local/lib/R/site-library:/usr/lib/R/library', 'LANG': 'en_US.UTF-8', 'LC_ALL': 'en_US.UTF-8'}
+# Use Ubuntu's supported versioned toolchain; unversioned Noble Rust is too old.
+R_RUST_SERIES = '1.89'
+R_RUST_MIN_VERSION = '1.88.0'
 R_SYSTEM_DEPS = (
-    'ca-certificates build-essential gfortran make pkg-config cmake '
+    f'ca-certificates build-essential gfortran make pkg-config cmake rustc-{R_RUST_SERIES} cargo-{R_RUST_SERIES} '
     'libuv1-dev libgdal-dev libproj-dev libgeos-dev libudunits2-dev '
-    'libharfbuzz-dev libfribidi-dev libfontconfig1-dev libfreetype6-dev '
+    'libharfbuzz-dev libfribidi-dev libfontconfig1-dev libfreetype-dev '
     'libpng-dev libtiff-dev libjpeg-dev libcairo2-dev libxt-dev '
     'libcurl4-openssl-dev libxml2-dev libssl-dev libgit2-dev '
     'zlib1g-dev libbz2-dev liblzma-dev libsqlite3-dev'
+)
+_R_RUST_CHECK = (
+    'rustc --version && cargo --version && '
+    f'dpkg --compare-versions "$(rustc --version | cut -d \' \' -f2)" ge {R_RUST_MIN_VERSION} && '
+    f'dpkg --compare-versions "$(cargo --version | cut -d \' \' -f2)" ge {R_RUST_MIN_VERSION} '
+    f'|| {{ echo "[SYS-DEPS] Rust/Cargo >= {R_RUST_MIN_VERSION} required; R installation stopped." >&2; exit 1; }}; '
+)
+_R_RUST_SETUP = (
+    f'ln -sf /usr/bin/rustc-{R_RUST_SERIES} /usr/local/bin/rustc && '
+    f'ln -sf /usr/bin/cargo-{R_RUST_SERIES} /usr/local/bin/cargo || exit 1; '
+    + _R_RUST_CHECK
 )
 _R_APT_HTTPS_SETUP = (
     "sed -i 's|http://archive.ubuntu.com|https://archive.ubuntu.com|g; "
@@ -2939,6 +2954,7 @@ R_CUSTOM_RECIPE_SHA256 = hashlib.sha256(json.dumps({
     'recipe_version': R_CUSTOM_RECIPE_VERSION,
     'base_image': R_DOCKER_IMAGE,
     'system_dependencies': R_SYSTEM_DEPS.split(),
+    'rust_toolchain_setup': _R_RUST_SETUP,
     'apt_https_setup': _R_APT_HTTPS_SETUP,
     'apt_mirrors': R_APT_MIRRORS,
     'locale': 'en_US.UTF-8',
@@ -3390,6 +3406,30 @@ class _RPackageRWLock:
 _R_PACKAGE_RW_LOCK = _RPackageRWLock()
 
 
+def _r_system_deps_prefix():
+    """Prepare and verify the complete build environment before running any R installer."""
+    return (
+        'set -e; '
+        'r_deps_ready=1; '
+        f'for r_dep in locales {R_SYSTEM_DEPS}; do '
+        '  if [ "$(dpkg-query -W -f=\'${Status}\' "$r_dep" 2>/dev/null)" != "install ok installed" ]; then '
+        '    r_deps_ready=0; break; '
+        '  fi; '
+        'done; '
+        'if [ "$r_deps_ready" != 1 ]; then '
+        '  echo "[SYS-DEPS] Installing R system dependencies..."; '
+        + _R_APT_HTTPS_SETUP + ' '
+        '  apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=30 update && '
+        f'  DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=30 install -y --no-install-recommends locales {R_SYSTEM_DEPS} '
+        '  || { echo "[SYS-DEPS] System dependency installation failed; R installation stopped." >&2; exit 1; }; '
+        '  sed -i \'/en_US.UTF-8/s/^# //g\' /etc/locale.gen; '
+        '  locale-gen en_US.UTF-8; '
+        'fi; '
+        + _R_RUST_SETUP
+        + 'export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8; '
+    )
+
+
 def _r_custom_recipe_text():
     lines = [
         f'FROM {R_DOCKER_IMAGE}',
@@ -3413,6 +3453,7 @@ def _r_custom_recipe_text():
         '    && \\',
         "    sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && \\",
         '    locale-gen en_US.UTF-8 && \\',
+        '    ' + _R_RUST_SETUP + ' \\',
         '    apt-get clean && rm -rf /var/lib/apt/lists/*',
         'ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8',
         '',
@@ -3616,7 +3657,7 @@ def _ensure_custom_r_image(client=None, silent=False, progress_cb=None):
         try:
             validation_container = client.containers.run(
                 image=R_CUSTOM_IMAGE,
-                command=['Rscript', '-e', f'stopifnot(as.character(getRversion()) == "{R_VERSION}")'],
+                command=['bash', '-ec', _R_RUST_CHECK + shlex.join(['Rscript', '-e', f'stopifnot(as.character(getRversion()) == "{R_VERSION}")'])],
                 detach=True,
                 platform='linux/amd64',
                 log_config={'type': 'json-file'},
@@ -3624,7 +3665,7 @@ def _ensure_custom_r_image(client=None, silent=False, progress_cb=None):
             validation_result = _robust_container_wait(validation_container, timeout=120)
             validation_exit = int(validation_result.get('StatusCode', -1)) if isinstance(validation_result, dict) else -1
             if validation_exit != 0:
-                raise RuntimeError(f'custom R image failed the pinned R version smoke test (exit {validation_exit})')
+                raise RuntimeError(f'custom R image failed the R/Rust/Cargo smoke test (exit {validation_exit})')
         finally:
             if validation_container is not None:
                 try:
@@ -3719,44 +3760,55 @@ def _probe_r_repo_bundle(name, cran_repo, bioc_mirror, timeout=4.0):
 
 
 def _select_auto_r_repo_bundle(force=False):
-    now = time.time()
+    # Keep selection under the lock so concurrent callers reuse one probe round.
     with _R_REPO_AUTO_LOCK:
+        now = time.time()
         cached = _R_REPO_AUTO_CACHE.get('selection')
         if not force and cached and now - float(_R_REPO_AUTO_CACHE.get('time') or 0) < 1800:
             return cached['cran'], cached['bioc']
 
-    results = []
-    result_lock = threading.Lock()
+        results = []
+        failures = {}
+        result_lock = threading.Lock()
 
-    def probe(bundle):
-        try:
-            result = _probe_r_repo_bundle(*bundle)
-            with result_lock:
-                results.append(result)
-        except Exception as e:
-            log(f'[R-REPO] Auto probe failed for {bundle[0]}: {e}')
+        def probe(bundle):
+            try:
+                result = _probe_r_repo_bundle(*bundle)
+                with result_lock:
+                    results.append(result)
+            except Exception as e:
+                # Candidate failures are expected during auto selection. Do not
+                # let late workers emit errors after a usable mirror was chosen.
+                with result_lock:
+                    failures[bundle[0]] = str(e)
 
-    threads = [threading.Thread(target=probe, args=(bundle,), daemon=True) for bundle in R_REPOSITORY_BUNDLES]
-    for thread in threads:
-        thread.start()
-    deadline = time.monotonic() + 5.0
-    for thread in threads:
-        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        threads = [threading.Thread(target=probe, args=(bundle,), daemon=True) for bundle in R_REPOSITORY_BUNDLES]
+        for thread in threads:
+            thread.start()
+        deadline = time.monotonic() + 5.0
+        for thread in threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
-    if results:
-        selected = min(results, key=lambda item: item['latency_ms'])
-    else:
-        selected = {
-            'name': 'global-fallback',
-            'cran': 'https://cloud.r-project.org',
-            'bioc': 'https://bioconductor.org',
-            'latency_ms': None,
-        }
-    with _R_REPO_AUTO_LOCK:
+        with result_lock:
+            completed = list(results)
+            failed = dict(failures)
+        if completed:
+            selected = min(completed, key=lambda item: item['latency_ms'])
+        else:
+            selected = {
+                'name': 'global-fallback',
+                'cran': 'https://cloud.r-project.org',
+                'bioc': 'https://bioconductor.org',
+                'latency_ms': None,
+            }
+            details = '; '.join(f'{bundle[0]}: {failed.get(bundle[0], "probe deadline exceeded")}'
+                                for bundle in R_REPOSITORY_BUNDLES)
+            log(f'[WARN] [R-REPO] No mirror passed auto probe; using official fallback (not verified). {details}')
         _R_REPO_AUTO_CACHE['selection'] = selected
         _R_REPO_AUTO_CACHE['time'] = time.time()
-    log(f'[R-REPO] Auto selected {selected["name"]}: CRAN={selected["cran"]}, Bioconductor={selected["bioc"]}')
-    return selected['cran'], selected['bioc']
+        if completed:
+            log(f'[R-REPO] Auto selected {selected["name"]}: CRAN={selected["cran"]}, Bioconductor={selected["bioc"]}')
+        return selected['cran'], selected['bioc']
 
 
 def _load_r_runtime_state():
@@ -3814,6 +3866,7 @@ def _complete_r_runtime_migration(client=None, lock_held=False):
     state = _load_r_runtime_state()
     if (state.get('migration_complete') and state.get('cleanup_complete') and
             state.get('library_generation') == R_LIBRARY_GENERATION and
+            state.get('recipe_sha256') == R_CUSTOM_RECIPE_SHA256 and
             not any(os.path.isdir(path) for path in legacy_libraries)):
         return
     client = client or get_docker_client()
@@ -3965,21 +4018,13 @@ def _run_r_container_with_realtime_logs(client, command, mounts, environment, li
                 r_image = R_CUSTOM_IMAGE
         needs_deps_prefix = install_system_deps and r_image != R_CUSTOM_IMAGE
         if needs_deps_prefix:
-            deps_check = (
-                'if ! dpkg -s libuv1-dev >/dev/null 2>&1; then '
-                '  echo "[SYS-DEPS] Installing R system dependencies..."; '
-                f'  {_R_APT_HTTPS_SETUP} '
-                f'  apt-get -o Acquire::Retries=5 update -qq && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y -qq locales {R_SYSTEM_DEPS} 2>/dev/null; '
-                f'  {_R_LOCALE_SETUP} '
-                '  echo "[SYS-DEPS] System dependencies installed."; '
-                'fi; '
-            )
+            deps_check = _r_system_deps_prefix()
             if isinstance(command, list):
-                command = ['bash', '-c', deps_check + 'stdbuf -oL -eL ' + ' '.join(f"'{c}'" if ' ' in c else c for c in command)]
+                command = ['bash', '-c', deps_check + 'stdbuf -oL -eL ' + shlex.join(command)]
             elif isinstance(command, str):
                 command = ['bash', '-c', deps_check + command]
         elif isinstance(command, list) and command and str(command[0]).lower() == 'rscript':
-            command = ['bash', '-c', 'stdbuf -oL -eL ' + ' '.join(f"'{c}'" if ' ' in c else c for c in command)]
+            command = ['bash', '-c', 'stdbuf -oL -eL ' + shlex.join(command)]
 
         container = client.containers.run(
             image=r_image,
@@ -4453,15 +4498,7 @@ def _run_r_install_job_locked(job_id, pkgs, repo=None, local_path=None, skip_rep
         if r_image == R_CUSTOM_IMAGE:
             deps_prefix = ''
         else:
-            deps_prefix = (
-                'if ! dpkg -s libuv1-dev >/dev/null 2>&1; then '
-                '  echo "[SYS-DEPS] Installing R system dependencies..."; '
-                f'  {_R_APT_HTTPS_SETUP} '
-                f'  apt-get -o Acquire::Retries=5 update -qq && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y -qq locales {R_SYSTEM_DEPS} 2>/dev/null; '
-                f'  {_R_LOCALE_SETUP} '
-                '  echo "[SYS-DEPS] System dependencies installed."; '
-                'fi; '
-            )
+            deps_prefix = _r_system_deps_prefix()
         container = client.containers.run(
             image=r_image,
             command=["bash", "-c", deps_prefix + "stdbuf -oL -eL Rscript " + script_path_in_container],
@@ -4654,7 +4691,7 @@ def _run_rscript_docker(script_path, params, out_dir, plugin_dir, extra_mounts=N
                     '  unresolved_1 <- install_targets(targets, force=FALSE, label=label); '
                     '  if (length(unresolved_1) == 0) return(invisible(TRUE)); '
                     '  cat(paste0("=== Failed packages: ", paste(unresolved_1, collapse=", "), " ===\\n")); '
-                    '  # If repo metadata is unavailable, still retry all unresolved packages via Bioc-only repos. '
+                    '  # If repo metadata is unavailable, still retry all unresolved packages via Bioc-only repos.\n'
                     '  bioc_marks <- vapply(unresolved_1, is_bioc_pkg, logical(1), USE.NAMES=FALSE); '
                     '  retry_targets <- unresolved_1[is.na(bioc_marks) | bioc_marks]; '
                     '  if (length(retry_targets) == 0) retry_targets <- unresolved_1; '
@@ -4714,7 +4751,7 @@ def _run_rscript_docker(script_path, params, out_dir, plugin_dir, extra_mounts=N
                                 preflight_r_image = R_CUSTOM_IMAGE
                         preflight_container = client.containers.run(
                             image=preflight_r_image,
-                            command=["bash", "-c", "Rscript " + preflight_script_path],
+                            command=["bash", "-c", ('' if preflight_r_image == R_CUSTOM_IMAGE else _r_system_deps_prefix()) + shlex.join(['Rscript', preflight_script_path])],
                             mounts=mounts, environment=env,
                             detach=True, user='0', platform='linux/amd64',
                             log_config={'type': 'json-file'}
@@ -4810,16 +4847,8 @@ def _run_rscript_docker(script_path, params, out_dir, plugin_dir, extra_mounts=N
     if r_image == R_CUSTOM_IMAGE:
         deps_prefix = ''
     else:
-        deps_prefix = (
-            'if ! dpkg -s libuv1-dev >/dev/null 2>&1; then '
-            '  echo "[SYS-DEPS] Installing R system dependencies..."; '
-            f'  {_R_APT_HTTPS_SETUP} '
-            f'  apt-get -o Acquire::Retries=5 update -qq && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y -qq locales {R_SYSTEM_DEPS} 2>/dev/null; '
-            f'  {_R_LOCALE_SETUP} '
-            '  echo "[SYS-DEPS] System dependencies installed."; '
-            'fi; '
-        )
-    bash_cmd = deps_prefix + ' '.join(f"'{c}'" if ' ' in c else c for c in cmd_list)
+        deps_prefix = _r_system_deps_prefix()
+    bash_cmd = deps_prefix + shlex.join(cmd_list)
 
     try:
         try:
