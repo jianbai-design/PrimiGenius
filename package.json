@@ -1,21 +1,46 @@
 {
   "name": "primigenius",
-  "version": "1.1.8",
+  "version": "1.2.0",
   "main": "main.js",
-  "description": "Bioinformatics Analysis Tool with Podman Support",
+  "description": "Bioinformatics Analysis Tool with Built-in Container Runtime",
   "author": "生信美学",
   "scripts": {
+    "build:ui": "node node_modules/typescript/bin/tsc -p tsconfig.vector.json && node build/build_preview.js",
+    "prestart": "npm run build:ui",
     "start": "electron .",
-    "dist": "node build/electron-builder-wrapper.js --win --x64 --publish never"
+    "dist": "python -B build/build_installer.py",
+    "runtime:verify": "python -B runtime/bundle.py --verify",
+    "dist:release": "python -B build/build_installer.py --release"
   },
   "devDependencies": {
     "electron": "^28.0.0",
-    "electron-builder": "^24.13.3"
+    "electron-builder": "^24.13.3",
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3",
+    "@codemirror/commands": "6.11.1",
+    "@codemirror/lang-json": "6.0.2",
+    "@codemirror/lang-python": "6.2.1",
+    "@codemirror/lang-xml": "6.1.0",
+    "@codemirror/language": "6.13.1",
+    "@codemirror/legacy-modes": "6.5.5",
+    "@codemirror/search": "6.7.2",
+    "@codemirror/state": "6.7.6",
+    "@codemirror/view": "6.43.15",
+    "3dmol": "2.5.5",
+    "dompurify": "3.4.17",
+    "geotiff": "3.0.5",
+    "igv": "3.8.10",
+    "openseadragon": "6.1.1",
+    "tabulator-tables": "6.7.1"
   },
   "build": {
     "appId": "com.primigenius.framework",
     "productName": "PrimiGenius",
     "artifactName": "PrimiGenius-Setup-${version}.${ext}",
+    "electronLanguages": [
+      "zh-CN",
+      "en-US"
+    ],
     "directories": {
       "output": "dist_output",
       "buildResources": "build"
@@ -64,6 +89,20 @@
     ],
     "extraResources": [
       {
+        "from": "runtime/r-environment",
+        "to": "r-environment",
+        "filter": [
+          "manifest.json",
+          "packages.txt",
+          "r-packages.txt",
+          "licenses.tar.gz",
+          "Containerfile",
+          "build.Containerfile",
+          "stage/environment.tar.gz",
+          "stage/environment.tar.xz"
+        ]
+      },
+      {
         "from": "backend/dist/app",
         "to": "backend",
         "filter": [
@@ -75,8 +114,8 @@
         "to": "icon.ico"
       },
       {
-        "from": "podman",
-        "to": "podman",
+        "from": "runtime/release",
+        "to": "runtime",
         "filter": [
           "**/*"
         ]
@@ -99,7 +138,7 @@
       "installerIcon": "build/icon.ico",
       "uninstallerIcon": "build/icon.ico",
       "installerHeaderIcon": "build/icon.ico",
-      "deleteAppDataOnUninstall": true,
+      "deleteAppDataOnUninstall": false,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "PrimiGenius"
@@ -113,9 +152,13 @@
     ]
   },
   "dependencies": {
+    "docx-preview": "0.4.1",
     "electron-updater": "^6.8.3",
     "iconv-lite": "^0.7.2",
     "marked": "^4.3.0",
-    "xlsx": "^0.18.5"
+    "saxes": "6.0.0",
+    "tar": "6.2.1",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz",
+    "yauzl": "3.4.0"
   }
 }

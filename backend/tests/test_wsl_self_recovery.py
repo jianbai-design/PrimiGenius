@@ -150,7 +150,7 @@ class WslSelfRecoveryTests(unittest.TestCase):
                     ['wsl', '--terminate', distro_name], timeout=12
                 )
 
-    def test_suspend_preparation_stops_service_then_owned_distro(self):
+    def test_suspend_preparation_preserves_shared_distro(self):
         self.manager._stop_wsl_podman_service = mock.Mock()
         self.manager._run_host_command.return_value = mock.Mock(returncode=0)
 
@@ -158,11 +158,9 @@ class WslSelfRecoveryTests(unittest.TestCase):
             ok, message = self.manager.prepare_for_host_suspend()
 
         self.assertTrue(ok)
-        self.assertIn('stopped before system suspend', message)
+        self.assertIn('workloads preserved', message)
         self.manager._stop_wsl_podman_service.assert_called_once_with()
-        self.manager._run_host_command.assert_called_once_with(
-            ['wsl', '--terminate', 'podman-primigenius-dev'], timeout=12
-        )
+        self.manager._run_host_command.assert_not_called()
 
     def test_service_restart_uses_fixed_modern_and_legacy_service_names(self):
         self.manager._restart_wsl_control_service_elevated = (

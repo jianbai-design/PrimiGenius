@@ -14,8 +14,8 @@ PrimiGenius 是面向生物信息学分析的 Windows 桌面程序，将命令�
 | --- | --- |
 | CLI 与 R 工具 | 查找已安装工具，配置输入文件、参数和输出目录。 |
 | Workflow Builder | 将工具连接成工作流并管理执行过程。 |
-| 插件管理 | 浏览插件商店或安装本地插件包。 |
-| 运行环境管理 | 管理 Podman 镜像和机器，准备 R 包依赖。 |
+| 插件管理 | 浏览插件商店、使用自由市场或安装本地插件包。 |
+| 运行环境管理 | 管理内置 WSL/容器运行环境并准备离线 R 环境。 |
 | 结果查看与编辑 | 浏览输出文件，预览支持的格式，编辑 SVG 图形。 |
 | 桌面辅助功能 | 中英文界面、执行日志、主程序更新和内置浏览器。 |
 
@@ -30,160 +30,81 @@ PrimiGenius 是面向生物信息学分析的 Windows 桌面程序，将命令�
 
 首次下载插件、镜像和 R 包需要联网；能否离线运行取决于本机已准备的资源。分析文件保存在所选的本地位置。
 
-## 应用结构
+## 1.2.0 运行架构
 
-### 应用进程与通信
+![PrimiGenius 1.2.0 运行架构](docs/release-notes/v1.2.0/architecture-1.2.0.png)
 
-```mermaid
-flowchart TB
-    UI["渲染进程 · src/renderer.js<br/>CLI / R 表单 · 工作流编排<br/>结果 / SVG 编辑器 · 商店 / 环境面板"]
-    MAIN["Electron · main.js<br/>原生窗口 / 对话框 · IPC<br/>后端启动 · 更新 / 插件下载"]
-    subgraph BACKEND["Python 后端 · backend/app.py"]
-        API["Flask API<br/>127.0.0.1 · 动态端口"]
-        CONFIG["插件发现<br/>配置读取"]
-        RUN["任务调度<br/>文件 / 输出接口"]
-        RPKG["R 包安装<br/>依赖准备"]
-    end
-    PM["PodmanManager<br/>backend/podman_manager.py<br/>机器生命周期 · WSL 恢复 · API 连接"]
-    UI <-->|IPC| MAIN
-    MAIN -->|启动 Python / 端口传递| API
-    UI -->|本地 HTTP| API
-    API -.->|SSE 日志 / 状态| UI
-    API --> CONFIG
-    API --> RUN
-    API --> RPKG
-    RUN --> PM
-    RPKG --> PM
-    class UI,MAIN ui
-    class API,CONFIG,RUN,RPKG,PM backend
-    classDef ui fill:#eaf2ff,stroke:#5684c4,color:#18324f
-    classDef backend fill:#e9f7f3,stroke:#469d86,color:#194e40
-    classDef runtime fill:#fff4df,stroke:#c19b48,color:#624a20
-```
+界面通过 Electron IPC 调用桌面功能，通过本机 HTTP/SSE 与 Python 后端交换请求、状态和日志。后端管理任务、持久状态、插件与共享 R 包库；容器接口依次经过专用 Windows 命名管道、内置 Windows/Linux 桥接组件、复用的 WSL 标准输入输出通道和专用 Unix socket，连接内置 Libpod 引擎。原生程序与 Java GUI 插件通过本地进程运行。
 
-### 任务执行与本地数据
+运行引擎依据固定上游版本及 `runtime/engine`、`runtime/bridge` 中的集成源码构建。安装资源提供运行引擎和固定版本 R 4.6.1 / Bioconductor 3.23 离线环境；插件、镜像、软件包和主程序更新按需访问各自的分发服务。
 
-```mermaid
-flowchart TB
-    TASK["后端任务调度"]
-    PM["PodmanManager<br/>Docker 兼容 API / Podman 客户端"]
-    MACHINE["WSL 2 + Podman 机器"]
-    CLI["CLI 工具容器"]
-    R["共享 R 运行容器"]
-    HOST["Windows 主机<br/>原生 GUI / Java 进程"]
-    DATA["本地输入 / 输出目录"]
-    LIB["持久化 R 包库"]
-    STATE["机器配置 / 运行状态"]
-    TASK --> PM
-    TASK --> HOST
-    PM --> MACHINE
-    PM <-->|读取 / 更新| STATE
-    MACHINE --> CLI
-    MACHINE --> R
-    CLI <-->|目录挂载| DATA
-    R <-->|目录挂载| DATA
-    R <-->|包库挂载| LIB
-    HOST <-->|文件访问| DATA
-    TASK <-->|文件 / 结果接口| DATA
-    class TASK,PM backend
-    class MACHINE,CLI,R,HOST runtime
-    classDef ui fill:#eaf2ff,stroke:#5684c4,color:#18324f
-    classDef backend fill:#e9f7f3,stroke:#469d86,color:#194e40
-    classDef runtime fill:#fff4df,stroke:#c19b48,color:#624a20
-```
-
-### 插件与运行环境分发
-
-```mermaid
-flowchart TB
-    STORE["插件商店 / 更新界面"]
-    MAIN["Electron 主进程<br/>下载 / 签名校验"]
-    REGISTRY["插件注册表<br/>签名插件包"]
-    RELEASE["GitHub 主程序 Releases"]
-    INSTALL["后端插件安装接口"]
-    PLUGINS["本地已安装插件<br/>配置 / 脚本"]
-    RUNTIME["Podman / R 运行环境准备"]
-    IMAGES["容器镜像仓库"]
-    RREPO["R 包仓库"]
-    STORE <-->|IPC| MAIN
-    MAIN <-->|HTTPS| REGISTRY
-    MAIN <-->|HTTPS| RELEASE
-    MAIN -->|安装接口| INSTALL
-    INSTALL --> PLUGINS
-    PLUGINS -->|声明的依赖| RUNTIME
-    RUNTIME <-->|拉取镜像| IMAGES
-    RUNTIME <-->|安装包| RREPO
-    class STORE,MAIN ui
-    class INSTALL,RUNTIME backend
-    classDef ui fill:#eaf2ff,stroke:#5684c4,color:#18324f
-    classDef backend fill:#e9f7f3,stroke:#469d86,color:#194e40
-    classDef runtime fill:#fff4df,stroke:#c19b48,color:#624a20
-```
-
-界面通过 Electron IPC 调用原生窗口、文件对话框、更新和插件下载功能，通过本机 HTTP API 提交分析任务；SSE 将日志和状态返回界面。工作流编排位于渲染进程。主进程负责启动 Python 后端并将动态端口传给界面。
-
-后端读取插件配置，分派 CLI、R 或原生 GUI/Java 任务，并提供文件与结果接口。PodmanManager 管理 WSL/Podman 机器和服务连接；容器通过目录挂载访问输入和输出。R 包安装与运行使用共享的 R 运行环境。插件、镜像、R 包和主程序更新来自图中对应的外部分发服务。
+自由市场基于 GitHub 实现插件提交、合作、审核及签名安装。本仓库包含市场客户端与后端适配；`marketplace/github` 提供部署到独立市场仓库的工作流与处理源码。签名私钥和账号会话不包含在源码中。
 
 ## 从源码运行
 
-使用 Windows x64，并确保 Node.js/npm 和 Python 位于 `PATH` 中。本次发布整理环境为 Node.js 24.14.0 和 Python 3.14.3，其他版本的兼容性尚未确认。容器任务需要 WSL 2 和 Podman；应用可使用系统安装的 Podman，也可使用 `podman/` 下的二进制文件。
+使用 Windows x64，并确保 Node.js/npm 和 Python 位于 `PATH` 中。本次发布整理环境为 Node.js 24.14.0 和 Python 3.14.3，其他版本的兼容性尚未确认。容器任务需要 WSL 2 及下述配套运行资源；应用通过内置引擎工作，不依赖 Windows Podman 客户端。
 
 ```powershell
 git clone https://github.com/jianbai-design/PrimiGenius.git
 cd PrimiGenius
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r backend/requirements.txt
+python -m pip install -r backend/requirements.txt pywin32==311
 npm ci
 npm start
 ```
 
-开发模式使用当前环境中的 `python`。依赖清单固定了直接 Python 依赖版本，尚未完整锁定传递依赖。Docker SDK 连接路径不要求安装可选的原生 Podman Python 客户端。本源码仓库不附带分析插件。
+开发模式使用当前环境中的 `python`。依赖清单固定了直接 Python 依赖版本，尚未完整锁定传递依赖。Docker SDK 通过本地专用桥接通道连接引擎，不要求额外安装原生 Podman Python 客户端。本源码仓库不附带分析插件。
 
 ## 构建 Windows 安装包
 
-构建使用 PyInstaller 和 electron-builder/NSIS。当前打包配置还要求以下外部资源，它们不保存在源码仓库中：
+当前构建入口依次编译界面、校验运行资源、冻结 Python 后端并生成 Windows x64 NSIS 安装包。打包前需要准备以下外部输入：
 
 | 路径 | 资源 |
 | --- | --- |
-| `podman/podman.exe`、`podman/win-sshproxy.exe` | 来自 [Podman Releases](https://github.com/containers/podman/releases) 的 Windows 二进制文件。 |
-| `build/wsl.2.7.3.0.x64.msi` | 来自 [WSL Releases](https://github.com/microsoft/WSL/releases) 的对应 x64 MSI。 |
-| `build/jre8.zip` | 可再分发、并符合应用 Java 运行目录结构的 Java 8 运行时压缩包。 |
+| `runtime/release/` | 内置引擎、Windows/Linux 桥接程序、rootfs、源码/许可证及摘要清单，由 `runtime/build.py` 和 `runtime/bundle.py` 生成。 |
+| `runtime/r-environment/` | `stage/` 下的离线 R 压缩包、许可证包和清单元数据；构建/导出工具为 `build/build_r_environment.py`，已提交配方与清单说明 1.2.0 的资源约定。 |
+| `build/wsl.2.7.3.0.x64.msi` | 对应 Windows x64 WSL 安装程序。 |
+| `build/jre8.zip` | 可再分发的 Java 8 运行时压缩包，构建时交付为完整 `java/jre` 目录。 |
 
-打包前需要准备这些资源，并分别核对再分发条件。仅克隆源码还不足以复现包含运行资源的安装包。仓库已提供图标和 NSIS 安装脚本；构建包装脚本会下载或复用 electron-builder 的 `winCodeSign` 工具。
+运行引擎和离线 R 的构建需要明确指定已备齐配方依赖的 Linux/WSL 构建环境。可先查看 `python -B runtime/build.py --help` 和 `python -B build/build_r_environment.py --help`。这些工具会下载或使用外部上游资源；本源码仓库不保存已构建镜像及第三方运行时二进制，相关资源保留各自许可条款。
 
 ```powershell
 npm ci
 python -m pip install -r backend/requirements-build.txt
-cd backend
-python -m PyInstaller app.spec --noconfirm
-cd ..
+python -B build/build_installer.py --check
 npm run dist
 ```
 
-安装包输出到 `dist_output/`。也可使用 `build_installer.bat`；它会删除旧构建产物，并终止可能占用文件的进程，执行前请保存工作。打包与首次启动分析需要分别验证。
+`build_installer.bat` 调用相同 Python 构建入口。每次构建使用独立临时目录，并在 `dist_output/` 下新建输出目录，保留已有构建和用户进程。`npm run dist:release` 额外要求匹配的验收记录，不会自动发布版本。构建成功不等于完整安装或历史版本升级已通过验收。
 
-`backend/init_podman.py` 是会强制删除 Podman 机器的维护脚本，**不是常规安装步骤**；需要保留环境数据时不要运行它。
+`backend/init_podman.py` 通过正常初始化流程准备或诊断所属运行环境，不会强制删除已有机器。
 
 ## 源码目录与检查
 
 ```text
 main.js                 Electron 主进程与桌面集成
-src/                    界面、样式及本地前端资源
-backend/                Python API、Podman 管理和依赖清单
-backend/tests/          后端回归检查
-build/                  安装脚本、构建包装脚本和应用图标
-.docker/                R 运行镜像构建配方
-docs/images/            README 配图
+src/                    界面、预览/编辑模块及附许可证的浏览器资源
+backend/                Python API、运行环境、任务、日志和依赖清单
+build/                  安装/构建脚本与应用图标
+runtime/engine/         在固定上游源码树内构建的 Libpod 集成代码
+runtime/bridge/         Windows/Linux 通信源码与 Go 模块摘要
+runtime/                运行环境配方、构建工具与回归检查
+runtime/r-environment/  离线 R 配方及清单元数据，不含镜像
+marketplace/            自由市场工作流、处理逻辑与检查
+.docker/                维护中的 R 环境配方
+docs/                   README 配图与架构图
 ```
 
 ```powershell
 node --check main.js
 node --check src/renderer.js
-python -B -m unittest discover -s backend/tests -p "test_*.py"
+python -B runtime/run_core_checks.py --output build/core-regression.json
+node runtime/test_vector_runtime.cjs
+node marketplace/test_market.cjs
 ```
 
-这些检查覆盖部分后端约定和语法，不能替代 Windows 界面、WSL/容器和安装包测试。
+测试按需使用隔离夹具。界面、WSL 及完整安装验收需要各自的运行资源和环境，快速检查不能替代这些验收。仓库排除运行时二进制、私钥、本地会话/状态、已下载插件、构建缓存和生成的验证报告。
 
 ## 许可证与公开范围
 

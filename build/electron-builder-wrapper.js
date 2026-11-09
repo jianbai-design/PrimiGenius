@@ -2,6 +2,7 @@ const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
 const https = require("https");
 const path = require("path");
+const { publicGithubCandidates } = require("../src/github-public");
 
 const PROJECT_DIR = path.resolve(__dirname, "..");
 const TOOL_VERSION = "2.6.0";
@@ -93,6 +94,7 @@ function downloadFile(url, destinationPath) {
                 "User-Agent": "PrimiGenius-Build/1.0",
             },
         }, (response) => {
+            clearTimeout(connectionTimeout);
             if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
                 response.resume();
                 downloadFile(response.headers.location, destinationPath).then(resolve, reject);
@@ -118,11 +120,26 @@ function downloadFile(url, destinationPath) {
             });
         });
 
+        const connectionTimeout = setTimeout(() => request.destroy(new Error('Build tool connection timed out')), 10000);
         request.on("error", (error) => {
+            clearTimeout(connectionTimeout);
             fs.rmSync(destinationPath, { force: true });
             reject(error);
         });
     });
+}
+
+async function downloadToolArchive() {
+    let mode = 'auto';
+    try { mode = JSON.parse(fs.readFileSync(path.join(PROJECT_DIR, '.primigenius_network_profile.json'), 'utf8')).mode; } catch (_) {}
+    let lastError;
+    for (const url of publicGithubCandidates(TOOL_URL, {}, mode)) {
+        try {
+            await downloadFile(url, TOOL_ARCHIVE_PATH);
+            return;
+        } catch (error) { lastError = error; }
+    }
+    throw lastError;
 }
 
 function extractArchive(archivePath, targetDir) {
@@ -171,7 +188,7 @@ async function ensureLocalTooling() {
             fs.copyFileSync(cachedArchive, TOOL_ARCHIVE_PATH);
         } else {
             console.log(`[build] Downloading ${TOOL_ARCHIVE_NAME}...`);
-            await downloadFile(TOOL_URL, TOOL_ARCHIVE_PATH);
+            await downloadToolArchive();
         }
     }
 
@@ -225,33 +242,28 @@ function patchElectronBuilder(toolDir) {
 
 async function main() {
     process.chdir(PROJECT_DIR);
+    const templateArg = process.argv.indexOf("--pg-nsis-templates");
+    if (templateArg === -1) throw new Error("Build through build_installer.bat: protected NSIS templates are required");
+    if (templateArg !== -1) {
+        const templateRoot = path.resolve(process.argv[templateArg + 1] || "");
+        const relative = path.relative(path.join(PROJECT_DIR, "build"), templateRoot);
+        if (!relative.startsWith("installer-work-") || relative.includes("..") ||
+            !fs.existsSync(path.join(templateRoot, "include", "installUtil.nsh"))) {
+            throw new Error("Invalid isolated NSIS template directory");
+        }
+        const installUtil = fs.readFileSync(path.join(templateRoot, "include", "installUtil.nsh"), "utf8");
+        if (!installUtil.includes("!insertmacro PGProtectLegacyData") ||
+            installUtil.includes("ExecWait") || installUtil.includes("old-uninstaller.exe")) {
+            throw new Error("Unsafe NSIS templates: legacy uninstallation must be removed");
+        }
+        // Keep electron-builder's normal two-stage signed uninstaller generation.
+        require("app-builder-lib/out/targets/nsis/nsisUtil").nsisTemplatesDir = templateRoot;
+        process.argv.splice(templateArg, 2);
+    }
+
     const toolDir = await ensureLocalTooling();
     console.log(`[build] Using local rcedit from ${toolDir}`);
     patchElectronBuilder(toolDir);
-
-    for (const dirName of ["dist_output", "dist"]) {
-        const dir = path.join(PROJECT_DIR, dirName);
-        try {
-            if (fs.existsSync(dir)) {
-                const renamed = dir + "_old_" + Date.now();
-                try {
-                    fs.renameSync(dir, renamed);
-                } catch (renameErr) {
-                    console.log(`[build] Could not rename ${dirName}, trying recursive delete...`);
-                    try {
-                        fs.rmSync(dir, { recursive: true, force: true });
-                    } catch (rmErr) {
-                        console.log(`[build] Could not fully delete ${dirName}, will attempt build anyway.`);
-                    }
-                    continue;
-                }
-                setTimeout(() => {
-                    try { fs.rmSync(renamed, { recursive: true, force: true }); } catch {}
-                }, 10000);
-            }
-        } catch {}
-    }
-
     require("electron-builder/out/cli/cli");
 }
 

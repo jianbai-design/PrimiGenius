@@ -1,0 +1,7 @@
+FROM registry.fedoraproject.org/fedora@sha256:923dd7d4362a78ef7edc1887cb599720e9f59ff8669a38c81062c6e2aaa83204
+RUN dnf install -y --setopt=install_weak_deps=False \
+    golang-1.26.9-1.fc44 gcc-16.2.1-2.fc44 \
+    gpgme-devel-2.0.1-5.fc44 libseccomp-devel-2.6.1-2.fc44 \
+    systemd-devel-259.9-1.fc44 device-mapper-devel-1.02.212-2.fc44 \
+    btrfs-progs-devel-7.1-1.fc44 make git && dnf clean all
+ENV GOTOOLCHAIN=local GOPROXY=https://goproxy.cn,direct

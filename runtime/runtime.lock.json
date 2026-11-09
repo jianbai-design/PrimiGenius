@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "engine": "primigenius-libpod",
+  "podman_version": "5.8.5",
+  "podman_commit": "6d48b6f12f793176f3f6bc808b5a440984c14eb2",
+  "source_url": "https://codeload.github.com/podman-container-tools/podman/tar.gz/6d48b6f12f793176f3f6bc808b5a440984c14eb2",
+  "source_sha256": "227589056a0576f6d41205e5de1be03545d4e664fa2cf3aa6265c139eaf0b974",
+  "baseline_os": "Fedora 44",
+  "baseline_components": {
+    "crun": "1.28-1.fc44",
+    "conmon": "2.2.1-2.fc44",
+    "netavark": "1.17.2-1.fc44",
+    "aardvark-dns": "1.17.1-1.fc44"
+  }
+}

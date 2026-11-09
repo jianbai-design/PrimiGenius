@@ -1,0 +1,69 @@
+name: Community market
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+permissions: {}
+jobs:
+  prepare:
+    if: >-
+      !github.event.issue.pull_request &&
+      (github.event_name == 'issues' || startsWith(github.event.comment.body, '/market ')) &&
+      github.event.sender.type == 'User'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Validate submission with read-only credentials
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python -B market_runner.py prepare
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: market-prepared
+          path: market-prepared/
+          retention-days: 2
+          compression-level: 0
+  commit:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: market-prepared
+          path: market-prepared/
+      - name: Recheck permissions and apply reviewed decisions
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MARKET_SIGNING_KEY: ${{ secrets.MARKET_SIGNING_KEY }}
+        run: python -B market_runner.py commit
+  report-failure:
+    needs: [prepare, commit]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          persist-credentials: false
+      - env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python -B market_runner.py failure

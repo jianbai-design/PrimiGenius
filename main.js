@@ -1,4 +1,5 @@
-const { app, BrowserWindow, ipcMain, screen, Menu, nativeImage, dialog, shell, powerMonitor } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, Menu, nativeImage, dialog, shell, powerMonitor, Tray, protocol } = require('electron');
+require('./src/pdf-preview-theme').installPdfPreviewTheme(app);
 const path = require('path');
 const { spawn, execSync, execFileSync } = require('child_process');
 const os = require('os');
@@ -7,10 +8,63 @@ const http = require('http');
 const https = require('https');
 const { autoUpdater } = require('electron-updater');
 const crypto = require('crypto');
+const { publicGithubCandidates, raceGithubReads } = require('./src/github-public');
+const desktopApiToken = crypto.randomBytes(32).toString('hex');
+const graphicsPolicy = require('./src/gpu-policy').configureGraphics(app);
+const { register: registerMarket, REPOSITORY: MARKET_REPOSITORY } = require('./src/github-market-main');
+registerMarket({ app, ipcMain, dialog, shell,
+    net: require('electron').net,
+    safeStorage: require('electron').safeStorage, getWindow: () => mainWindow,
+    getBackendPort: () => backendPort,
+    getBackendToken: () => desktopApiToken,
+    getNetworkMode: () => _getPluginDownloadNetworkMode(),
+    getDownloadCounts: async (plugins, forceRefresh) => {
+        const history = await _fetchPluginReleaseHistory({ repository: MARKET_REPOSITORY, forceRefresh });
+        return { counts: _pluginInstallCountsFromReleases(plugins, history.releases), stale: history.stale };
+    },
+    download: async (url, file, verifyFile, progress = {}) => _downloadCandidateByRace(
+        _pluginDownloadCandidates(url, await _getPluginDownloadNetworkMode()), file,
+        { expectZip: true, verifyFile, downloadTimeoutMs: 120000, onProgress: progress.onProgress, log: progress.log }) });
+
+
+ipcMain.handle('rendering-diagnostics', event => {
+    const url = event.sender.getURL();
+    if (!url.startsWith('file:')) throw new Error('Graphics diagnostics require a local application view');
+    return graphicsPolicy.snapshot();
+});
+
+ipcMain.handle('preview-image-thumbnail', async (event, filePath) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents || event.senderFrame !== event.sender.mainFrame) {
+        throw new Error('Image preview requires the application window');
+    }
+    if (typeof filePath !== 'string' || !path.isAbsolute(filePath) || !/\.(png|jpe?g|bmp|webp|tiff?)$/i.test(filePath)) {
+        throw new Error('Unsupported image path');
+    }
+    const image = await nativeImage.createThumbnailFromPath(filePath, {width:1600,height:1200});
+    if (image.isEmpty()) throw new Error('Thumbnail unavailable');
+    return image.toDataURL();
+});
 
 let mainWindow;
+const filePreviews = require('./src/file-preview-service').registerPreviewService(ipcMain, () => mainWindow);
+protocol.registerSchemesAsPrivileged([{scheme:'pg-preview',privileges:{standard:true,secure:true,supportFetchAPI:true,corsEnabled:true,stream:true}}]);
+app.whenReady().then(()=>filePreviews.installProtocol(protocol));
+app.on('will-quit', () => filePreviews.closeAll());
 let pyProc = null;
 let backendPort = null;
+const runtimeStates = new Map();
+
+function handleRuntimeStateLine(line) {
+    const prefix = 'PRIMIGENIUS_RUNTIME_STATE=';
+    if (!line.startsWith(prefix)) return false;
+    try {
+        const update = JSON.parse(line.slice(prefix.length));
+        if (!['engine', 'r'].includes(update.kind) || !update.state || typeof update.state !== 'object') return true;
+        runtimeStates.set(update.kind, update);
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('runtime-state', update);
+    } catch (error) { console.warn('Invalid backend runtime state:', error.message); }
+    return true;
+}
 let focusGuardUntil = 0;
 let focusGuardTimer = null;
 let latestUpdatePayload = null;
@@ -19,6 +73,9 @@ let manualDownloadedInstallerPath = '';
 let manualDownloadedInstallerVersion = '';
 let manualDownloadInProgress = false;
 let resumeRecoveryTimer = null;
+let runtimeTray = null;
+let runtimeQuitPending = false;
+let runtimeQuitApproved = false;
 
 ipcMain.on('get-backend-port-sync', (event) => {
     event.returnValue = backendPort;
@@ -31,12 +88,12 @@ const GITHUB_RELEASE_DOWNLOAD_ACCELERATORS = [
     { label: 'v6.gh-proxy.org', prefix: 'https://v6.gh-proxy.org/' },
     { label: 'cdn.gh-proxy.org', prefix: 'https://cdn.gh-proxy.org/' },
     { label: 'ghproxy.net', prefix: 'https://ghproxy.net/' },
-    { label: 'gh-proxy.cn', prefix: 'https://gh-proxy.cn/' }
+    { label: 'eo.gh-proxy.cn', prefix: 'https://eo.gh-proxy.cn/github/' },
+    { label: 'z2.gh-proxy.cn', prefix: 'https://z2.gh-proxy.cn/github/' },
+    { label: 'cf.gh-proxy.cn', prefix: 'https://cf.gh-proxy.cn/github/' }
 ];
 
 const GITHUB_RELEASE_LEGACY_DOWNLOAD_ACCELERATORS = [
-    { label: 'mirror.ghproxy.com', prefix: 'https://mirror.ghproxy.com/' },
-    { label: 'gh.llkk.cc', prefix: 'https://gh.llkk.cc/' },
     { label: 'hubp.llkk.cc', prefix: 'https://hubp.llkk.cc/' }
 ];
 
@@ -69,22 +126,22 @@ function _orderReleaseDownloadUrlsForMode(urls, networkMode = 'auto') {
 
 const UPDATE_MIRROR_RELEASE_API_CANDIDATES = [
     'https://api.github.com/repos/jianbai-design/PrimiGenius/releases/latest',
-    'https://mirror.ghproxy.com/https://api.github.com/repos/jianbai-design/PrimiGenius/releases/latest',
-    'https://gh.llkk.cc/https://api.github.com/repos/jianbai-design/PrimiGenius/releases/latest'
+    'https://eo.gh-proxy.cn/github/https://api.github.com/repos/jianbai-design/PrimiGenius/releases/latest',
+    'https://cf.gh-proxy.cn/github/https://api.github.com/repos/jianbai-design/PrimiGenius/releases/latest'
 ];
 
 // ---- 插件远程更新配置 ----
 // 策略1: 通过 API 找最新 Release，从中下载 plugins-registry.json
 const PLUGIN_REGISTRY_API_CANDIDATES = [
     'https://api.github.com/repos/jianbai-design/PrimiGenius-plugins/releases/latest',
-    'https://mirror.ghproxy.com/https://api.github.com/repos/jianbai-design/PrimiGenius-plugins/releases/latest',
-    'https://gh.llkk.cc/https://api.github.com/repos/jianbai-design/PrimiGenius-plugins/releases/latest'
+    'https://eo.gh-proxy.cn/github/https://api.github.com/repos/jianbai-design/PrimiGenius-plugins/releases/latest',
+    'https://cf.gh-proxy.cn/github/https://api.github.com/repos/jianbai-design/PrimiGenius-plugins/releases/latest'
 ];
 const PLUGIN_REGISTRY_RELEASE_ASSET_CANDIDATES = [
     'https://github.com/jianbai-design/PrimiGenius-plugins/releases/latest/download/plugins-registry.json',
     ..._githubReleaseDownloadUrls('https://github.com/jianbai-design/PrimiGenius-plugins/releases/latest/download/plugins-registry.json'),
-    'https://mirror.ghproxy.com/https://github.com/jianbai-design/PrimiGenius-plugins/releases/latest/download/plugins-registry.json',
-    'https://gh.llkk.cc/https://github.com/jianbai-design/PrimiGenius-plugins/releases/latest/download/plugins-registry.json',
+    'https://eo.gh-proxy.cn/github/https://github.com/jianbai-design/PrimiGenius-plugins/releases/latest/download/plugins-registry.json',
+    'https://cf.gh-proxy.cn/github/https://github.com/jianbai-design/PrimiGenius-plugins/releases/latest/download/plugins-registry.json',
     'https://hubp.llkk.cc/https://github.com/jianbai-design/PrimiGenius-plugins/releases/latest/download/plugins-registry.json'
 ];
 // 策略2: 备用，main 分支 raw URL
@@ -97,17 +154,17 @@ const PLUGIN_REGISTRY_RAW_CANDIDATES = [
     'https://fastly.jsdelivr.net/gh/jianbai-design/PrimiGenius-plugins@master/plugins-registry.json',
     'https://gcore.jsdelivr.net/gh/jianbai-design/PrimiGenius-plugins@main/plugins-registry.json',
     'https://gcore.jsdelivr.net/gh/jianbai-design/PrimiGenius-plugins@master/plugins-registry.json',
-    'https://mirror.ghproxy.com/https://raw.githubusercontent.com/jianbai-design/PrimiGenius-plugins/main/plugins-registry.json',
-    'https://mirror.ghproxy.com/https://raw.githubusercontent.com/jianbai-design/PrimiGenius-plugins/master/plugins-registry.json',
-    'https://gh.llkk.cc/https://raw.githubusercontent.com/jianbai-design/PrimiGenius-plugins/main/plugins-registry.json',
-    'https://gh.llkk.cc/https://raw.githubusercontent.com/jianbai-design/PrimiGenius-plugins/master/plugins-registry.json',
+    'https://eo.gh-proxy.cn/github/https://raw.githubusercontent.com/jianbai-design/PrimiGenius-plugins/main/plugins-registry.json',
+    'https://eo.gh-proxy.cn/github/https://raw.githubusercontent.com/jianbai-design/PrimiGenius-plugins/master/plugins-registry.json',
+    'https://cf.gh-proxy.cn/github/https://raw.githubusercontent.com/jianbai-design/PrimiGenius-plugins/main/plugins-registry.json',
+    'https://cf.gh-proxy.cn/github/https://raw.githubusercontent.com/jianbai-design/PrimiGenius-plugins/master/plugins-registry.json',
     'https://hubp.llkk.cc/https://raw.githubusercontent.com/jianbai-design/PrimiGenius-plugins/main/plugins-registry.json',
     'https://hubp.llkk.cc/https://raw.githubusercontent.com/jianbai-design/PrimiGenius-plugins/master/plugins-registry.json'
 ];
 const PLUGIN_REGISTRY_CONTENTS_CANDIDATES = [
     'https://api.github.com/repos/jianbai-design/PrimiGenius-plugins/contents/plugins-registry.json?ref=main',
-    'https://mirror.ghproxy.com/https://api.github.com/repos/jianbai-design/PrimiGenius-plugins/contents/plugins-registry.json?ref=main',
-    'https://gh.llkk.cc/https://api.github.com/repos/jianbai-design/PrimiGenius-plugins/contents/plugins-registry.json?ref=main'
+    'https://eo.gh-proxy.cn/github/https://api.github.com/repos/jianbai-design/PrimiGenius-plugins/contents/plugins-registry.json?ref=main',
+    'https://cf.gh-proxy.cn/github/https://api.github.com/repos/jianbai-design/PrimiGenius-plugins/contents/plugins-registry.json?ref=main'
 ];
 const PLUGIN_REGISTRY_REPO = 'jianbai-design/PrimiGenius-plugins';
 const PLUGIN_SPLIT_REGISTRY_DEFS = [
@@ -161,8 +218,8 @@ async function _purgePluginRegistryCdnCache() {
 // Release API（用于获取 Release 描述/notes）
 const PLUGIN_RELEASE_API_CANDIDATES = [
     'https://api.github.com/repos/jianbai-design/PrimiGenius-plugins/releases/latest',
-    'https://mirror.ghproxy.com/https://api.github.com/repos/jianbai-design/PrimiGenius-plugins/releases/latest',
-    'https://gh.llkk.cc/https://api.github.com/repos/jianbai-design/PrimiGenius-plugins/releases/latest'
+    'https://eo.gh-proxy.cn/github/https://api.github.com/repos/jianbai-design/PrimiGenius-plugins/releases/latest',
+    'https://cf.gh-proxy.cn/github/https://api.github.com/repos/jianbai-design/PrimiGenius-plugins/releases/latest'
 ];
 
 // 插件签名公钥（与 nodjs_crypto/keys/plugin-sign-public.pem 对应）
@@ -180,6 +237,7 @@ let pluginUpdateCheckDone = false;
 let pluginRegistryCache = { data: null, time: 0 };
 let localPluginCache = { data: null, time: 0 };
 let pluginReleaseHistoryCache = { data: null, time: 0 };
+const otherReleaseHistoryCaches = new Map();
 const PLUGIN_UPDATE_CACHE_TTL = 5 * 60 * 1000;
 const PLUGIN_INSTALL_COUNT_CACHE_TTL = 30 * 60 * 1000;
 const ANONYMOUS_INSTALLATION_ID_FILE = 'anonymous-installation-id';
@@ -322,18 +380,31 @@ function _fetchJson(url, timeoutMs = 6500, options = {}) {
         let finished = false;
         let req = null;
         let deadlineTimer = null;
+        const signal = options.signal;
+        const deadlineAt = options.deadlineAt || Date.now() + timeoutMs;
+        const cleanup = () => {
+            if (deadlineTimer) clearTimeout(deadlineTimer);
+            if (signal) signal.removeEventListener('abort', abort);
+        };
+        const abort = () => {
+            const error = Object.assign(new Error('GitHub read cancelled'), { name: 'AbortError' });
+            finishReject(error);
+            if (req) req.destroy(error);
+        };
         const finishResolve = (value) => {
             if (finished) return;
             finished = true;
-            if (deadlineTimer) clearTimeout(deadlineTimer);
+            cleanup();
             resolve(value);
         };
         const finishReject = (error) => {
             if (finished) return;
             finished = true;
-            if (deadlineTimer) clearTimeout(deadlineTimer);
+            cleanup();
             reject(error);
         };
+        if (signal && signal.aborted) return abort();
+        if (signal) signal.addEventListener('abort', abort, { once: true });
         const headers = {
             'User-Agent': 'PrimiGenius-Updater/1.0',
             'Accept': 'application/vnd.github+json'
@@ -343,19 +414,25 @@ function _fetchJson(url, timeoutMs = 6500, options = {}) {
             headers.Pragma = 'no-cache';
         }
         const token = process.env.PRIMIGENIUS_GITHUB_TOKEN || process.env.GITHUB_TOKEN || '';
-        if (token && /api\.github\.com/i.test(url)) {
+        if (!options.anonymous && token && new URL(url).origin === 'https://api.github.com') {
             headers.Authorization = `Bearer ${token}`;
         }
         req = https.get(url, {
             headers
         }, (res) => {
+            res.on('error', finishReject);
             const status = Number(res.statusCode || 0);
             if (status >= 300 && status < 400 && res.headers.location) {
                 if (finished) return;
                 finished = true;
-                if (deadlineTimer) clearTimeout(deadlineTimer);
+                cleanup();
                 res.resume();
-                _fetchJson(res.headers.location, timeoutMs, options).then(resolve).catch(reject);
+                try {
+                    if ((options.redirects || 0) >= 5) throw new Error('Too many redirects');
+                    _fetchJson(new URL(res.headers.location, url).href, timeoutMs, {
+                        ...options, deadlineAt, redirects: (options.redirects || 0) + 1
+                    }).then(resolve).catch(reject);
+                } catch (error) { reject(error); }
                 return;
             }
             if (status < 200 || status >= 300) {
@@ -368,8 +445,9 @@ function _fetchJson(url, timeoutMs = 6500, options = {}) {
                 finishReject(new Error(`HTTP ${status}${detail}`));
                 return;
             }
+            res.setEncoding('utf8');
             let raw = '';
-            res.on('data', chunk => { raw += chunk.toString('utf8'); });
+            res.on('data', chunk => { raw += chunk; });
             res.on('end', () => {
                 if (finished) return;
                 try {
@@ -384,7 +462,7 @@ function _fetchJson(url, timeoutMs = 6500, options = {}) {
             const error = new Error('timeout');
             finishReject(error);
             if (req) req.destroy(error);
-        }, timeoutMs);
+        }, Math.max(1, deadlineAt - Date.now()));
         req.setTimeout(timeoutMs, () => {
             if (finished) return;
             const error = new Error('timeout');
@@ -409,58 +487,50 @@ function _uniqueUrls(urls) {
     return out;
 }
 
-function _pluginReleaseHistoryApiCandidates(page, perPage = 100) {
-    const api = `https://api.github.com/repos/${PLUGIN_REGISTRY_REPO}/releases?per_page=${perPage}&page=${page}`;
-    return _uniqueUrls([
-        api,
-        `https://mirror.ghproxy.com/${api}`,
-        `https://gh.llkk.cc/${api}`,
-        `https://hubp.llkk.cc/${api}`
-    ]);
+async function _fetchPublicGithubJson(urls, timeoutMs, validate) {
+    const mode = await _getPluginDownloadNetworkMode();
+    const candidates = _uniqueUrls(urls.flatMap(url => publicGithubCandidates(url, {}, mode)));
+    return raceGithubReads(candidates, async (url, controller) => {
+        const data = await _fetchJson(url, timeoutMs, { anonymous: true, noCache: true, signal: controller.signal });
+        return validate(data, url);
+    }, mode === 'cn' ? 0 : 600);
+}
+
+function _pluginReleaseHistoryApiCandidates(page, perPage = 100, mode = 'auto', repository = PLUGIN_REGISTRY_REPO) {
+    const api = `https://api.github.com/repos/${repository}/releases?per_page=${perPage}&page=${page}`;
+    return publicGithubCandidates(api, {}, mode);
 }
 
 async function _fetchPluginReleaseHistory(options = {}) {
     const forceRefresh = !!(options && options.forceRefresh);
+    const repository = options.repository || PLUGIN_REGISTRY_REPO;
+    const historyCache = repository === PLUGIN_REGISTRY_REPO ? pluginReleaseHistoryCache
+        : otherReleaseHistoryCaches.get(repository) || { data: null, time: 0 };
     const now = Date.now();
-    if (!forceRefresh && pluginReleaseHistoryCache.data &&
-        now - pluginReleaseHistoryCache.time < PLUGIN_INSTALL_COUNT_CACHE_TTL) {
-        return { releases: pluginReleaseHistoryCache.data, stale: false };
+    if (!forceRefresh && historyCache.data &&
+        now - historyCache.time < PLUGIN_INSTALL_COUNT_CACHE_TTL) {
+        return { releases: historyCache.data, stale: false };
     }
 
-    const previous = pluginReleaseHistoryCache.data;
+    const previous = historyCache.data;
     const perPage = 100;
     const maxPages = 10;
     try {
+        const mode = await _getPluginDownloadNetworkMode();
         const releases = [];
         for (let page = 1; page <= maxPages; page++) {
-            let pageItems = null;
-            const candidates = _pluginReleaseHistoryApiCandidates(page, perPage);
-            try {
-                const data = await _fetchJson(candidates[0], 4500, { noCache: forceRefresh });
+            const candidates = _pluginReleaseHistoryApiCandidates(page, perPage, mode, repository);
+            const pageItems = await raceGithubReads(candidates, async (url, controller) => {
+                const data = await _fetchJson(url, 9000, { noCache: true, anonymous: true, signal: controller.signal });
                 if (!Array.isArray(data)) throw new Error('Invalid GitHub releases response');
-                pageItems = data;
-            } catch (directError) {
-                console.log('[PLUGIN-STATS] Direct release history failed:', candidates[0], directError.message);
-                try {
-                    pageItems = await _firstSuccessful(candidates.slice(1).map(async (url) => {
-                        try {
-                            const data = await _fetchJson(url, 9000, { noCache: forceRefresh });
-                            if (!Array.isArray(data)) throw new Error('Invalid GitHub releases response');
-                            return data;
-                        } catch (e) {
-                            console.log('[PLUGIN-STATS] Release history fallback failed:', url, e.message);
-                            throw e;
-                        }
-                    }));
-                } catch (fallbackError) {
-                    throw fallbackError || directError;
-                }
-            }
+                return data;
+            }, mode === 'cn' ? 0 : 600);
             releases.push(...pageItems);
             if (pageItems.length < perPage) break;
             if (page === maxPages) throw new Error('GitHub release history exceeds pagination limit');
         }
-        pluginReleaseHistoryCache = { data: releases, time: now };
+        if (repository === PLUGIN_REGISTRY_REPO) pluginReleaseHistoryCache = { data: releases, time: now };
+        else otherReleaseHistoryCaches.set(repository, { data: releases, time: now });
         return { releases, stale: false };
     } catch (e) {
         if (previous) {
@@ -564,19 +634,20 @@ function _pluginRegistryFreshness(registry) {
 }
 
 async function _fetchFirstPluginRegistryCandidate(urls, timeoutMs, sourceLabel) {
-    const candidates = _uniqueUrls(urls);
+    const mode = await _getPluginDownloadNetworkMode();
+    const candidates = _uniqueUrls(urls.flatMap(url => publicGithubCandidates(url, {}, mode)));
     if (!candidates.length) return null;
 
     try {
-        return await _firstSuccessful(candidates.map(async (url) => {
+        return await raceGithubReads(candidates, async (url, controller) => {
             try {
-                const data = await _fetchJson(url, timeoutMs, { noCache: true });
+                const data = await _fetchJson(url, timeoutMs, { noCache: true, anonymous: true, signal: controller.signal });
                 return { registry: _decodePluginRegistryPayload(data), source: url };
             } catch (e) {
-                console.log(`[PLUGIN-UPDATE] ${sourceLabel} failed:`, url, e.message);
+                if (e.name !== 'AbortError') console.log(`[PLUGIN-UPDATE] ${sourceLabel} failed:`, url, e.message);
                 throw e;
             }
-        }));
+        }, mode === 'cn' ? 0 : 600);
     } catch (e) {
         console.log(`[PLUGIN-UPDATE] ${sourceLabel} unavailable:`, e.message);
         return null;
@@ -626,8 +697,8 @@ function _splitRegistryCandidateSets(def) {
     const releaseAsset = _uniqueUrls([
         releaseAssetBase,
         ..._githubReleaseDownloadUrls(releaseAssetBase),
-        `https://mirror.ghproxy.com/${releaseAssetBase}`,
-        `https://gh.llkk.cc/${releaseAssetBase}`,
+        `https://eo.gh-proxy.cn/github/${releaseAssetBase}`,
+        `https://cf.gh-proxy.cn/github/${releaseAssetBase}`,
         `https://hubp.llkk.cc/${releaseAssetBase}`
     ]);
 
@@ -645,17 +716,17 @@ function _splitRegistryCandidateSets(def) {
             `https://fastly.jsdelivr.net/gh/${PLUGIN_REGISTRY_REPO}@master/${p}`,
             `https://gcore.jsdelivr.net/gh/${PLUGIN_REGISTRY_REPO}@main/${p}`,
             `https://gcore.jsdelivr.net/gh/${PLUGIN_REGISTRY_REPO}@master/${p}`,
-            `https://mirror.ghproxy.com/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/main/${p}`,
-            `https://mirror.ghproxy.com/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/master/${p}`,
-            `https://gh.llkk.cc/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/main/${p}`,
-            `https://gh.llkk.cc/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/master/${p}`,
+            `https://eo.gh-proxy.cn/github/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/main/${p}`,
+            `https://eo.gh-proxy.cn/github/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/master/${p}`,
+            `https://cf.gh-proxy.cn/github/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/main/${p}`,
+            `https://cf.gh-proxy.cn/github/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/master/${p}`,
             `https://hubp.llkk.cc/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/main/${p}`,
             `https://hubp.llkk.cc/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/master/${p}`
         ];
         const contentsGroup = [
             `https://api.github.com/repos/${PLUGIN_REGISTRY_REPO}/contents/${p}?ref=main`,
-            `https://mirror.ghproxy.com/https://api.github.com/repos/${PLUGIN_REGISTRY_REPO}/contents/${p}?ref=main`,
-            `https://gh.llkk.cc/https://api.github.com/repos/${PLUGIN_REGISTRY_REPO}/contents/${p}?ref=main`
+            `https://eo.gh-proxy.cn/github/https://api.github.com/repos/${PLUGIN_REGISTRY_REPO}/contents/${p}?ref=main`,
+            `https://cf.gh-proxy.cn/github/https://api.github.com/repos/${PLUGIN_REGISTRY_REPO}/contents/${p}?ref=main`
         ];
         raw.push(...rawGroup);
         contents.push(...contentsGroup);
@@ -699,10 +770,7 @@ async function _fetchNamedPluginRegistry(def, timeoutMs = 6500) {
         ? def.rawPaths
         : [def.fileName];
 
-    // Give authoritative GitHub main a short, bounded head start. Raw and Contents
-    // represent the same branch, so they may race each other safely. A blocked
-    // GitHub connection must not prevent users in restricted networks from
-    // reaching the CDN fallbacks.
+    // Read the same main-branch paths through GitHub and public accelerators.
     const githubMainRaw = rawPaths.map(p =>
         `https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/main/${p}`
     );
@@ -711,7 +779,7 @@ async function _fetchNamedPluginRegistry(def, timeoutMs = 6500) {
     );
     const githubCandidate = await _fetchFirstPluginRegistryCandidate(
         [...githubMainRaw, ...githubMainContents],
-        Math.min(timeoutMs, 3200),
+        timeoutMs,
         `${def.label} GitHub main`
     );
     if (githubCandidate) {
@@ -727,8 +795,8 @@ async function _fetchNamedPluginRegistry(def, timeoutMs = 6500) {
             `https://fastly.jsdelivr.net/gh/${PLUGIN_REGISTRY_REPO}@main/${p}`,
             `https://gcore.jsdelivr.net/gh/${PLUGIN_REGISTRY_REPO}@main/${p}`,
             `https://cdn.jsdelivr.net/gh/${PLUGIN_REGISTRY_REPO}@main/${p}`,
-            `https://mirror.ghproxy.com/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/main/${p}`,
-            `https://gh.llkk.cc/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/main/${p}`,
+            `https://eo.gh-proxy.cn/github/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/main/${p}`,
+            `https://cf.gh-proxy.cn/github/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/main/${p}`,
             `https://hubp.llkk.cc/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/main/${p}`
         );
     }
@@ -755,8 +823,8 @@ async function _fetchNamedPluginRegistry(def, timeoutMs = 6500) {
             const assetRegistry = await trySequentially(_uniqueUrls([
                 registryAsset.browser_download_url,
                 ..._githubReleaseDownloadUrls(registryAsset.browser_download_url),
-                `https://mirror.ghproxy.com/${registryAsset.browser_download_url}`,
-                `https://gh.llkk.cc/${registryAsset.browser_download_url}`,
+                `https://eo.gh-proxy.cn/github/${registryAsset.browser_download_url}`,
+                `https://cf.gh-proxy.cn/github/${registryAsset.browser_download_url}`,
                 `https://hubp.llkk.cc/${registryAsset.browser_download_url}`
             ]), 'release API asset');
             if (assetRegistry) return assetRegistry;
@@ -841,8 +909,8 @@ function _buildInstallerCandidates(asset) {
     return _uniqueUrls([
         base,
         ..._githubReleaseDownloadUrls(base),
-        `https://mirror.ghproxy.com/${base}`,
-        `https://gh.llkk.cc/${base}`,
+        `https://eo.gh-proxy.cn/github/${base}`,
+        `https://cf.gh-proxy.cn/github/${base}`,
         `https://hubp.llkk.cc/${base}`
     ]);
 }
@@ -1893,17 +1961,15 @@ async function _downloadInstallerInAppByMode(candidates, versionText, networkMod
 }
 
 async function _checkLatestReleaseViaMirrors() {
-    for (const apiUrl of UPDATE_MIRROR_RELEASE_API_CANDIDATES) {
-        try {
-            const data = await _fetchJson(apiUrl, 7000);
-            if (data && (data.tag_name || data.name)) {
-                return { data, apiUrl };
-            }
-        } catch (e) {
-            console.log('[UPDATER] mirror check failed:', apiUrl, e.message);
-        }
+    try {
+        return await _fetchPublicGithubJson(UPDATE_MIRROR_RELEASE_API_CANDIDATES, 7000, (data, apiUrl) => {
+            if (!data || !(data.tag_name || data.name)) throw new Error('Invalid GitHub release');
+            return { data, apiUrl };
+        });
+    } catch (error) {
+        console.log('[UPDATER] mirror check failed:', error.message);
+        return null;
     }
-    return null;
 }
 
 async function _emitMirrorFallbackUpdateIfNeeded(reason = 'fallback') {
@@ -2005,7 +2071,7 @@ function getSystemInfo() {
     const cpuTotal = os.cpus().length;
     let cpuVal = cpuTotal;
     let memVal = `${Math.round(os.totalmem() / 1024 / 1024 / 1024)} GB`;
-    
+
     try {
         const wslConfigPath = path.join(os.homedir(), '.wslconfig');
         if (fs.existsSync(wslConfigPath)) {
@@ -2056,7 +2122,7 @@ function getSystemInfo() {
     } catch (e) {
         console.log('[DEBUG] Error reading .wslconfig:', e.message);
     }
-    
+
     console.log('[DEBUG] Final memVal:', memVal);
     return `MAX CPU: ${cpuVal} | MAX RAM: ${memVal}`;
 }
@@ -2090,9 +2156,18 @@ function createWindow() {
             webviewTag: true // 允许内置浏览器使用 webview 标签
         }
     });
+    mainWindow.on('close', event => {
+        if (!runtimeQuitApproved) {
+            event.preventDefault();
+            requestRuntimeQuit();
+        }
+    });
     mainWindow.loadFile(path.join(__dirname, 'src/index.html'));
-    
+
     mainWindow.webContents.on('did-finish-load', () => {
+        // Startup can finish before the renderer subscribes; replay the latest
+        // state on every load, including window reloads.
+        for (const update of runtimeStates.values()) mainWindow.webContents.send('runtime-state', update);
         mainWindow.setTitle(`PrimiGenius v${app.getVersion()} - ${getSystemInfo()}`);
         mainWindow.focus();
         mainWindow.webContents.focus();
@@ -2125,7 +2200,7 @@ function createWindow() {
             mainWindow.webContents.toggleDevTools();
         }
     });
-    
+
     // 创建最精简的隐藏菜单，保留 Edit role 使 Ctrl+C/V/X/Z/A 在输入框内正常工作
     // 如果完全移除菜单 (Menu.setApplicationMenu(null))，Electron 在某些版本/平台
     // 下会导致输入框内的剪贴板快捷键及焦点行为异常。
@@ -2368,12 +2443,14 @@ ipcMain.handle('update-install-request', async () => {
     const installerPath = _isInstallerFileUsable(manualDownloadedInstallerPath)
         ? manualDownloadedInstallerPath
         : _getCachedInstaller(latestUpdatePayload && latestUpdatePayload.version);
+    if (!(await prepareRuntimeExit())) return { ok: false, reason: "Exit cancelled or work kept in background" };
     if (installerPath) {
         try {
             await _launchDownloadedInstaller(installerPath);
             // Return to the renderer first so the click gets immediate visual
             // feedback. Cleanup may synchronously wait for the backend process.
             setTimeout(() => {
+                runtimeQuitApproved = true;
                 cleanupBackendProcess();
                 app.quit();
             }, 250);
@@ -2386,14 +2463,82 @@ ipcMain.handle('update-install-request', async () => {
         }
     }
 
+    runtimeQuitApproved = true;
     cleanupBackendProcess();
     autoUpdater.quitAndInstall(false, true);
     return { ok: true };
 });
 
-function cleanupBackendProcess() {
-    stopPodmanOnQuit();
 
+function restoreRuntimeWindow() {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.setBackgroundThrottling(true);
+        mainWindow.show();
+        mainWindow.restore();
+        mainWindow.focus();
+    }
+}
+
+async function prepareRuntimeExit() {
+    if (!pyProc || !backendPort) return true;
+    const frontend = mainWindow && !mainWindow.isDestroyed()
+        ? await mainWindow.webContents.executeJavaScript('window.primigeniusRuntimeUI ? window.primigeniusRuntimeUI.status() : ({active: 0})')
+        : { active: 0 };
+    const status = await postBackendLifecycle('/podman/runtime-status', 5000);
+    if (status.status !== 'success') throw new Error(status.message || 'Runtime status unavailable');
+    const active = frontend.active || Object.values(status.active || {}).some(Number);
+    const zh = frontend.lang ? frontend.lang === 'zh' : app.getLocale().startsWith('zh');
+    if (active) {
+        const choice = await dialog.showMessageBox(mainWindow, {
+            type: 'question', title: 'PrimiGenius',
+            message: zh ? '仍有任务正在运行' : 'Tasks are still running',
+            detail: zh ? '后台继续将保留工作流，可通过托盘图标恢复窗口。' : 'Continue in the background to keep workflows running. Restore the window from the tray.',
+            buttons: zh ? ['后台继续', '停止任务并退出', '取消'] : ['Continue in background', 'Stop tasks and exit', 'Cancel'],
+            defaultId: 0, cancelId: 2, noLink: true
+        });
+        if (choice.response === 2) return false;
+        if (choice.response === 0) {
+            if (!runtimeTray) {
+                const iconPath = app.isPackaged ? path.join(process.resourcesPath, 'icon.ico') : path.join(__dirname, 'build', 'icon.ico');
+                runtimeTray = new Tray(iconPath);
+                runtimeTray.setToolTip('PrimiGenius');
+                runtimeTray.on('double-click', restoreRuntimeWindow);
+                runtimeTray.setContextMenu(Menu.buildFromTemplate([
+                    { label: zh ? '打开 PrimiGenius' : 'Open PrimiGenius', click: restoreRuntimeWindow },
+                    { label: zh ? '退出' : 'Exit', click: requestRuntimeQuit }
+                ]));
+            }
+            mainWindow.webContents.setBackgroundThrottling(false);
+            mainWindow.hide();
+            return false;
+        }
+    }
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        await mainWindow.webContents.executeJavaScript('window.primigeniusRuntimeUI && window.primigeniusRuntimeUI.stop()');
+    }
+    const result = await postBackendLifecycle('/podman/shutdown', 65000);
+    if (result.status !== 'success') throw new Error(result.message || 'Tasks could not be drained');
+    return true;
+}
+
+async function requestRuntimeQuit() {
+    if (runtimeQuitPending || runtimeQuitApproved) return;
+    runtimeQuitPending = true;
+    try {
+        if (!(await prepareRuntimeExit())) return;
+        runtimeQuitApproved = true;
+        if (runtimeTray) { runtimeTray.destroy(); runtimeTray = null; }
+        cleanupBackendProcess();
+        app.quit();
+    } catch (error) {
+        restoreRuntimeWindow();
+        dialog.showErrorBox('PrimiGenius', String(error.message || error));
+    } finally {
+        runtimeQuitPending = false;
+    }
+}
+
+function cleanupBackendProcess() {
     if (!pyProc) return;
 
     const pid = pyProc.pid;
@@ -2447,6 +2592,7 @@ function resolveWindowsProfileForGui() {
 function createBackendEnv() {
     const env = { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1' };
     env.PRIMIGENIUS_CHANNEL = app.isPackaged ? 'stable' : 'dev';
+    env.PRIMIGENIUS_DESKTOP_TOKEN = desktopApiToken;
     if (process.platform === 'win32') {
         const userHome = resolveWindowsProfileForGui();
         env.USERPROFILE = userHome;
@@ -2466,7 +2612,7 @@ function createPyProc() {
     return new Promise((resolve, reject) => {
     const isPackaged = app.isPackaged;
     let script;
-    
+
     if (isPackaged) {
         const fs = require('fs');
         const exePath = path.join(process.resourcesPath, 'backend', 'app.exe');
@@ -2516,6 +2662,7 @@ function createPyProc() {
             else stdoutBuf = buf;
             for (const line of parts) {
                 if (kind === 'stdout') {
+                    if (handleRuntimeStateLine(line)) continue;
                     const match = line.match(/^PRIMIGENIUS_API_PORT=(\d+)$/);
                     if (match) {
                         const reportedPort = Number(match[1]);
@@ -2549,6 +2696,10 @@ function createPyProc() {
         });
         pyProc.on('error', error => settleStartup(error));
         pyProc.on('exit', (code, signal) => {
+            handleRuntimeStateLine('PRIMIGENIUS_RUNTIME_STATE=' + JSON.stringify({
+                kind: 'engine', state: {state: 'attention', engine_ready: false,
+                    last_error: `Backend exited (code=${code}, signal=${signal || 'none'}).`}
+            }));
             if (!startupSettled) {
                 settleStartup(new Error(`Backend exited before startup (code=${code}, signal=${signal || 'none'}).`));
             }
@@ -2558,202 +2709,6 @@ function createPyProc() {
         reject(new Error('Failed to create the backend process.'));
     }
     });
-}
-
-// ---- Podman Machine 深度集成 (后台异步，不阻塞 UI) ----
-function getPodmanExePath() {
-    const projectRoot = app.isPackaged
-        ? path.dirname(process.execPath)
-        : path.join(__dirname, '..');
-
-    const candidates = [
-        path.join(projectRoot, 'podman', 'podman.exe'),
-        path.join(process.resourcesPath || '', 'podman', 'podman.exe'),
-        path.join(path.dirname(process.execPath), 'podman', 'podman.exe'),
-    ];
-    for (const p of candidates) {
-        try { if (fs.existsSync(p)) return p; } catch(e) {}
-    }
-    return 'podman';
-}
-
-function getPodmanDataDir() {
-    const projectRoot = app.isPackaged
-        ? path.dirname(process.execPath)
-        : path.join(__dirname, '..');
-    return path.join(projectRoot, 'podman-data');
-}
-
-function getPodmanConfigDir() {
-    const projectRoot = app.isPackaged
-        ? path.dirname(process.execPath)
-        : path.join(__dirname, '..');
-    return path.join(projectRoot, 'podman-config');
-}
-
-function prependPathOnce(pathValue, dir) {
-    if (!dir) return pathValue || '';
-    const delimiter = path.delimiter;
-    const normalizedDir = path.normalize(dir).toLowerCase();
-    const entries = String(pathValue || '').split(delimiter).filter(Boolean);
-    if (entries.some(entry => path.normalize(entry).toLowerCase() === normalizedDir)) {
-        return pathValue || '';
-    }
-    return dir + (pathValue ? delimiter + pathValue : '');
-}
-
-function createPodmanEnv() {
-    const env = Object.assign({}, process.env);
-    const configDir = getPodmanConfigDir();
-    const dataDir = getPodmanDataDir();
-    env.XDG_CONFIG_HOME = configDir;
-    env.XDG_DATA_HOME = dataDir;
-    env.PODMAN_CONFIG_DIR = configDir;
-    env.CONTAINERS_CONF_DIR = configDir;
-    env.CONTAINERS_STORAGE_CONF = path.join(configDir, 'storage.conf');
-    env.CONTAINERS_MACHINE_PROVIDER_DIR = path.join(dataDir, 'machine');
-    if (process.platform === 'win32') {
-        env.APPDATA = configDir;
-        env.USERPROFILE = configDir;
-        env.LOCALAPPDATA = dataDir;
-    }
-    const podmanExe = getPodmanExePath();
-    if (path.isAbsolute(podmanExe)) {
-        const podmanBinDir = path.dirname(podmanExe);
-        if (fs.existsSync(podmanBinDir)) {
-            env.PATH = prependPathOnce(env.PATH || '', podmanBinDir);
-        }
-    }
-    delete env.DOCKER_HOST;
-    return env;
-}
-
-function runPodmanCommand(args, timeout = 60000) {
-    const podmanExe = getPodmanExePath();
-    try {
-        return execFileSync(podmanExe, args, {
-            timeout,
-            encoding: 'utf-8',
-            env: createPodmanEnv(),
-            windowsHide: true,
-            stdio: ['pipe', 'pipe', 'pipe']
-        });
-    } catch (e) {
-        return null;
-    }
-}
-
-function ensurePodmanRunning() {
-    const { exec, spawn: spawnProc } = require('child_process');
-    let podmanReadyAnnounced = false;
-    let podmanReadyCheckTimer = null;
-
-    function sendPodmanLog(msg) {
-        console.log(msg);
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('sys-log', msg + '\n');
-        }
-    }
-
-    function scheduleBackendReadyCheck(retries, delay = 3000) {
-        if (podmanReadyAnnounced || retries <= 0 || podmanReadyCheckTimer) return;
-        podmanReadyCheckTimer = setTimeout(() => {
-            podmanReadyCheckTimer = null;
-            checkBackendReady(retries);
-        }, delay);
-    }
-
-    sendPodmanLog('[PODMAN] PrimiGenius deep-integrated Podman starting...');
-    sendPodmanLog('[PODMAN] Podman binary: ' + getPodmanExePath());
-    sendPodmanLog('[PODMAN] Data dir: ' + getPodmanDataDir());
-
-    const versionResult = runPodmanCommand(['--version'], 5000);
-    if (versionResult) {
-        sendPodmanLog('[PODMAN] ' + versionResult.trim());
-    } else {
-        sendPodmanLog('[PODMAN] Podman binary not found. Deep integration requires bundled Podman.');
-    }
-
-    sendPodmanLog('[PODMAN] Podman service will be managed by backend via WSL direct management.');
-    const podmanApiPort = app.isPackaged ? 8888 : 8889;
-    sendPodmanLog(`[PODMAN] Backend will auto-start Podman API service on port ${podmanApiPort}.`);
-
-    function checkBackendReady(retries) {
-        if (podmanReadyAnnounced) return;
-        if (retries <= 0) {
-            sendPodmanLog('[PODMAN] Backend Podman service did not become ready in time.');
-            return;
-        }
-        try {
-            const http = require('http');
-            let settled = false;
-            const retryOnce = () => {
-                if (settled || podmanReadyAnnounced) return;
-                settled = true;
-                scheduleBackendReadyCheck(retries - 1);
-            };
-            const req = http.request({
-                hostname: '127.0.0.1',
-                port: backendPort,
-                path: '/podman/info',
-                method: 'GET',
-                timeout: 5000
-            }, (res) => {
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => {
-                    if (settled || podmanReadyAnnounced) return;
-                    settled = true;
-                    try {
-                        const json = JSON.parse(data);
-                        if (json.status === 'success' && !json.loading) {
-                            if (podmanReadyCheckTimer) {
-                                clearTimeout(podmanReadyCheckTimer);
-                                podmanReadyCheckTimer = null;
-                            }
-                            sendPodmanLog('[PODMAN] Podman engine is ready!');
-                            podmanReadyAnnounced = true;
-                        } else {
-                            scheduleBackendReadyCheck(retries - 1);
-                        }
-                    } catch(e) {
-                        scheduleBackendReadyCheck(retries - 1);
-                    }
-                });
-            });
-            req.on('error', retryOnce);
-            req.on('timeout', () => {
-                req.destroy();
-                retryOnce();
-            });
-            req.end();
-        } catch(e) {
-            scheduleBackendReadyCheck(retries - 1);
-        }
-    }
-
-    setTimeout(() => checkBackendReady(60), 2000);
-}
-
-function stopPodmanOnQuit() {
-    try {
-        const http = require('http');
-        const postData = JSON.stringify({ stop_machine: true });
-        const req = http.request({
-            hostname: '127.0.0.1',
-            port: backendPort,
-            path: '/podman/shutdown',
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(postData)
-            },
-            timeout: 8000
-        }, () => {});
-        req.on('error', () => {});
-        req.write(postData);
-        req.end();
-    } catch(e) {}
 }
 
 function postBackendLifecycle(pathname, timeout) {
@@ -2794,32 +2749,32 @@ function setupPowerLifecycle() {
             clearTimeout(resumeRecoveryTimer);
             resumeRecoveryTimer = null;
         }
-        emitPowerLifecycleLog('[PODMAN] Windows is suspending; preparing the container environment...');
+        emitPowerLifecycleLog('[RUNTIME] Windows is suspending; preparing the container environment...');
         postBackendLifecycle('/podman/suspend', 15000).then(result => {
             if (result.status === 'busy') {
-                emitPowerLifecycleLog('[PODMAN] Active work detected; the container environment was kept running.');
+                emitPowerLifecycleLog('[RUNTIME] Active work detected; the container environment was kept running.');
             } else if (result.status === 'success') {
-                emitPowerLifecycleLog('[PODMAN] Container environment stopped safely before suspend.');
+                emitPowerLifecycleLog('[RUNTIME] Container environment stopped safely before suspend.');
             } else {
-                emitPowerLifecycleLog(`[PODMAN] Suspend preparation failed: ${result.message || 'unknown error'}`);
+                emitPowerLifecycleLog(`[RUNTIME] Suspend preparation failed: ${result.message || 'unknown error'}`);
             }
-        }).catch(error => emitPowerLifecycleLog(`[PODMAN] Suspend preparation did not complete: ${error.message}`));
+        }).catch(error => emitPowerLifecycleLog(`[RUNTIME] Suspend preparation did not complete: ${error.message}`));
     });
 
     powerMonitor.on('resume', () => {
         if (resumeRecoveryTimer) clearTimeout(resumeRecoveryTimer);
-        emitPowerLifecycleLog('[PODMAN] Windows resumed; waiting for networking and virtualization...');
+        emitPowerLifecycleLog('[RUNTIME] Windows resumed; waiting for networking and virtualization...');
         resumeRecoveryTimer = setTimeout(() => {
             resumeRecoveryTimer = null;
             postBackendLifecycle('/podman/resume', 120000).then(result => {
                 if (result.status === 'busy') {
-                    emitPowerLifecycleLog('[PODMAN] Active work detected; automatic recovery was skipped.');
+                    emitPowerLifecycleLog('[RUNTIME] Active work detected; automatic recovery was skipped.');
                 } else if (result.status === 'success') {
-                    emitPowerLifecycleLog('[PODMAN] Container environment recovered after resume.');
+                    emitPowerLifecycleLog('[RUNTIME] Container environment recovered after resume.');
                 } else {
-                    emitPowerLifecycleLog(`[PODMAN] Resume recovery failed: ${result.message || 'restart Windows and try again'}`);
+                    emitPowerLifecycleLog(`[RUNTIME] Resume recovery failed: ${result.message || 'restart Windows and try again'}`);
                 }
-            }).catch(error => emitPowerLifecycleLog(`[PODMAN] Resume recovery did not complete: ${error.message}`));
+            }).catch(error => emitPowerLifecycleLog(`[RUNTIME] Resume recovery did not complete: ${error.message}`));
         }, 15000);
     });
 }
@@ -2964,7 +2919,7 @@ async function _getLocalPlugins() {
     });
 }
 
-// 拉取远程插件清单：短时尝试 GitHub main；不可达时立即选择最新的 CDN/代理结果。
+// 拉取远程插件清单：GitHub main 与公开加速源择快，再选择最新的 CDN 备用结果。
 async function _fetchPluginRegistry() {
     const cacheNow = Date.now();
     if (pluginRegistryCache.data && cacheNow - pluginRegistryCache.time < PLUGIN_UPDATE_CACHE_TTL) {
@@ -3006,7 +2961,7 @@ async function _fetchPluginRegistry() {
     const githubCandidate = await _fetchFirstPluginRegistryCandidate([
         `https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/main/plugins-registry.json`,
         `https://api.github.com/repos/${PLUGIN_REGISTRY_REPO}/contents/plugins-registry.json?ref=main`
-    ], 3200, 'combined registry GitHub main');
+    ], 6500, 'combined registry GitHub main');
     if (githubCandidate) {
         return acceptRegistry(githubCandidate.registry, `GitHub main: ${githubCandidate.source}`);
     }
@@ -3015,8 +2970,8 @@ async function _fetchPluginRegistry() {
         `https://fastly.jsdelivr.net/gh/${PLUGIN_REGISTRY_REPO}@main/plugins-registry.json`,
         `https://gcore.jsdelivr.net/gh/${PLUGIN_REGISTRY_REPO}@main/plugins-registry.json`,
         `https://cdn.jsdelivr.net/gh/${PLUGIN_REGISTRY_REPO}@main/plugins-registry.json`,
-        `https://mirror.ghproxy.com/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/main/plugins-registry.json`,
-        `https://gh.llkk.cc/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/main/plugins-registry.json`,
+        `https://eo.gh-proxy.cn/github/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/main/plugins-registry.json`,
+        `https://cf.gh-proxy.cn/github/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/main/plugins-registry.json`,
         `https://hubp.llkk.cc/https://raw.githubusercontent.com/${PLUGIN_REGISTRY_REPO}/main/plugins-registry.json`
     ];
     const cdnCandidate = await _fetchFreshestPluginRegistryCandidate(
@@ -3045,8 +3000,8 @@ async function _fetchPluginRegistry() {
             const assetRegistry = await trySequentially(_uniqueUrls([
                 registryAsset.browser_download_url,
                 ..._githubReleaseDownloadUrls(registryAsset.browser_download_url),
-                `https://mirror.ghproxy.com/${registryAsset.browser_download_url}`,
-                `https://gh.llkk.cc/${registryAsset.browser_download_url}`,
+                `https://eo.gh-proxy.cn/github/${registryAsset.browser_download_url}`,
+                `https://cf.gh-proxy.cn/github/${registryAsset.browser_download_url}`,
                 `https://hubp.llkk.cc/${registryAsset.browser_download_url}`
             ]), 'release API asset');
             if (assetRegistry) return assetRegistry;
@@ -3078,18 +3033,15 @@ function _computeSHA256(buffer) {
 
 // 从 GitHub Release API 获取 Release 描述（best-effort，限流时跳过）
 async function _fetchReleaseNotes() {
-    for (const url of PLUGIN_RELEASE_API_CANDIDATES) {
-        try {
-            const data = await _fetchJson(url, 8000);
-            if (data && typeof data.body === 'string') {
-                console.log('[PLUGIN-UPDATE] Release notes fetched from API');
-                return data.body;
-            }
-        } catch (e) {
-            console.log('[PLUGIN-UPDATE] Release API failed:', url, e.message);
-        }
+    try {
+        return await _fetchPublicGithubJson(PLUGIN_RELEASE_API_CANDIDATES, 8000, data => {
+            if (!data || typeof data.body !== 'string') throw new Error('Invalid release notes');
+            return data.body;
+        });
+    } catch (error) {
+        console.log('[PLUGIN-UPDATE] Release API failed:', error.message);
+        return '';
     }
-    return '';
 }
 
 // 检查插件更新
@@ -3155,25 +3107,22 @@ function _pluginReleaseApiCandidates(tag) {
     const api = `https://api.github.com/repos/jianbai-design/PrimiGenius-plugins/releases/tags/${encodedTag}`;
     return _uniqueUrls([
         api,
-        `https://mirror.ghproxy.com/${api}`,
-        `https://gh.llkk.cc/${api}`,
+        `https://eo.gh-proxy.cn/github/${api}`,
+        `https://cf.gh-proxy.cn/github/${api}`,
         `https://hubp.llkk.cc/${api}`
     ]);
 }
 
 async function _fetchReleaseNotesForTag(tag) {
-    for (const url of _pluginReleaseApiCandidates(tag)) {
-        try {
-            const data = await _fetchJson(url, 8000);
-            if (data && typeof data.body === 'string' && data.body.trim()) {
-                console.log('[PLUGIN-UPDATE] Release notes fetched for tag:', tag);
-                return data.body;
-            }
-        } catch (e) {
-            console.log('[PLUGIN-UPDATE] Release tag API failed:', tag, url, e.message);
-        }
+    try {
+        return await _fetchPublicGithubJson(_pluginReleaseApiCandidates(tag), 8000, data => {
+            if (!data || typeof data.body !== 'string' || !data.body.trim()) throw new Error('Invalid release notes');
+            return data.body;
+        });
+    } catch (error) {
+        console.log('[PLUGIN-UPDATE] Release tag API failed:', tag, error.message);
+        return '';
     }
-    return '';
 }
 
 function _releaseNotesFromUpdates(updates) {
@@ -3385,7 +3334,7 @@ ipcMain.handle('plugin-update-download', async (event, updateInfo) => {
 
         let signatureBase64 = null;
         let signatureSourceLabel = '';
-        if (sigCandidates.length) {
+        if (updateInfo.signature_url) {
             try {
                 const sigResult = await _downloadCandidateByRace(sigCandidates, sigPath, {
                     kind: 'signature',
@@ -3410,8 +3359,9 @@ ipcMain.handle('plugin-update-download', async (event, updateInfo) => {
                 signatureSourceLabel = sigResult.candidate ? sigResult.candidate.label : '';
             } catch (e) {
                 if (mainWindow && !mainWindow.isDestroyed()) {
-                    mainWindow.webContents.send('sys-log', `[PLUGIN-UPDATE] Warning: signature download/verification failed: ${e.message || e}\n`);
+                    mainWindow.webContents.send('sys-log', `[PLUGIN-UPDATE] Signature download/verification failed: ${e.message || e}\n`);
                 }
+                throw new Error(`Signature download/verification failed: ${e.message || e}`);
             }
         }
 
@@ -3516,6 +3466,19 @@ ipcMain.handle('record-plugin-install-history', (event, payload = {}) => {
     );
 });
 
+ipcMain.handle('plugin-store-install-counts', async (event, options = {}) => {
+    try {
+        const history = await _fetchPluginReleaseHistory({ forceRefresh: !!options.forceRefresh });
+        return {
+            ok: true,
+            counts: _pluginInstallCountsFromReleases((pluginRegistryCache.data && pluginRegistryCache.data.plugins) || [], history.releases),
+            stale: !!history.stale
+        };
+    } catch (error) {
+        return { ok: false, reason: error.message || String(error) };
+    }
+});
+
 ipcMain.handle('plugin-store-list', async (event, options = {}) => {
     try {
         let cachePurge = null;
@@ -3524,19 +3487,17 @@ ipcMain.handle('plugin-store-list', async (event, options = {}) => {
             localPluginCache = { data: null, time: 0 };
             cachePurge = await _purgePluginRegistryCdnCache();
         }
-        const releaseHistoryPromise = _fetchPluginReleaseHistory({
-            forceRefresh: !!(options && options.forceRefresh)
-        }).then(value => ({ ok: true, ...value })).catch(error => ({
-            ok: false,
-            releases: [],
-            stale: false,
-            reason: error.message || String(error)
-        }));
-        const [registry, localPlugins, releaseHistory] = await Promise.all([
+        const [registry, localPlugins] = await Promise.all([
             _fetchPluginRegistry(),
-            _getLocalPlugins(),
-            releaseHistoryPromise
+            _getLocalPlugins()
         ]);
+        // Optional download statistics must not delay plugin cards.
+        const releaseHistory = {
+            ok: !!pluginReleaseHistoryCache.data,
+            releases: pluginReleaseHistoryCache.data || [],
+            stale: Date.now() - pluginReleaseHistoryCache.time >= PLUGIN_INSTALL_COUNT_CACHE_TTL,
+            reason: 'Download counts pending'
+        };
         const installCounts = releaseHistory.ok
             ? _pluginInstallCountsFromReleases((registry && registry.plugins) || [], releaseHistory.releases)
             : {};
@@ -3616,8 +3577,6 @@ app.whenReady().then(async () => {
     // Once the newly installed version has started successfully, remove the
     // installer downloaded by the previous version and its pending-state file.
     setTimeout(() => _cleanupInstalledUpdateArtifacts(), 3000);
-    // Podman 异步启动（窗口创建后日志可直接推送到前端）
-    ensurePodmanRunning();
     // electron-updater 自动更新
     setupAutoUpdater();
 
@@ -3644,11 +3603,13 @@ app.whenReady().then(async () => {
     });
 });
 
-app.on('before-quit', cleanupBackendProcess);
-app.on('before-quit-for-update', cleanupBackendProcess);
-app.on('will-quit', cleanupBackendProcess);
-
+app.on('before-quit', event => {
+    if (!runtimeQuitApproved) {
+        event.preventDefault();
+        requestRuntimeQuit();
+    }
+});
 app.on('window-all-closed', () => {
-    cleanupBackendProcess();
-    app.quit();
+    if (runtimeQuitApproved) app.quit();
+    else requestRuntimeQuit();
 });

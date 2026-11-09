@@ -14,8 +14,8 @@ PrimiGenius is a Windows desktop application for bioinformatics. It brings comma
 | --- | --- |
 | CLI and R tools | Find installed tools and configure inputs, parameters, and output directories. |
 | Workflow Builder | Connect tools into workflows and manage execution. |
-| Plugin management | Browse the plugin store or install packages locally. |
-| Runtime management | Manage Podman images and machines and prepare R dependencies. |
+| Plugin management | Browse the plugin store, use the community market, or install packages locally. |
+| Runtime management | Manage the embedded WSL/container runtime and prepare the offline R environment. |
 | Results and editing | Browse output files, preview supported formats, and edit SVG figures. |
 | Desktop utilities | Chinese and English interfaces, execution logs, updates, and a built-in browser. |
 
@@ -30,160 +30,81 @@ Download `PrimiGenius-Setup-<version>.exe` from [Releases](https://github.com/ji
 
 Initial downloads of plugins, images, and R packages require network access. Offline availability depends on resources already installed. Analysis files remain in the selected local locations.
 
-## Architecture
+## Architecture in 1.2.0
 
-### Application processes and communication
+![PrimiGenius 1.2.0 runtime architecture](docs/release-notes/v1.2.0/architecture-1.2.0.png)
 
-```mermaid
-flowchart TB
-    UI["Renderer · src/renderer.js<br/>CLI / R forms · workflow orchestration<br/>Results / SVG editor · store / runtime panels"]
-    MAIN["Electron · main.js<br/>Native windows / dialogs · IPC<br/>Backend startup · updates / plugin downloads"]
-    subgraph BACKEND["Python backend · backend/app.py"]
-        API["Flask API<br/>127.0.0.1 · dynamic port"]
-        CONFIG["Plugin discovery<br/>Configuration loading"]
-        RUN["Task dispatch<br/>File / output APIs"]
-        RPKG["R package installation<br/>Dependency preparation"]
-    end
-    PM["PodmanManager<br/>backend/podman_manager.py<br/>Machine lifecycle · WSL recovery · API connection"]
-    UI <-->|IPC| MAIN
-    MAIN -->|start Python / port handoff| API
-    UI -->|local HTTP| API
-    API -.->|SSE logs / status| UI
-    API --> CONFIG
-    API --> RUN
-    API --> RPKG
-    RUN --> PM
-    RPKG --> PM
-    class UI,MAIN ui
-    class API,CONFIG,RUN,RPKG,PM backend
-    classDef ui fill:#eaf2ff,stroke:#5684c4,color:#18324f
-    classDef backend fill:#e9f7f3,stroke:#469d86,color:#194e40
-    classDef runtime fill:#fff4df,stroke:#c19b48,color:#624a20
-```
+The renderer uses Electron IPC for desktop integration and local HTTP/SSE for backend requests and logs. The Python backend manages tasks, persistent state, plugins and shared R libraries. Its container API runs through an owned Windows named pipe, the bundled Windows/Linux bridge, a multiplexed WSL standard-input/output channel and a dedicated Unix socket to the embedded Libpod engine. Native and Java GUI tools run as local processes.
 
-### Task execution and local data
+The runtime is built from the pinned upstream source and the integration code under `runtime/engine` and `runtime/bridge`. The installer supplies the runtime and a fixed R 4.6.1 / Bioconductor 3.23 offline environment. Plugin, image, package and update downloads use their respective external services.
 
-```mermaid
-flowchart TB
-    TASK["Backend task dispatch"]
-    PM["PodmanManager<br/>Docker-compatible API / Podman client"]
-    MACHINE["WSL 2 + Podman machine"]
-    CLI["CLI tool containers"]
-    R["Shared R runtime container"]
-    HOST["Windows host<br/>Native GUI / Java processes"]
-    DATA["Local input / output directories"]
-    LIB["Persistent R package library"]
-    STATE["Machine configuration / runtime state"]
-    TASK --> PM
-    TASK --> HOST
-    PM --> MACHINE
-    PM <-->|read / update| STATE
-    MACHINE --> CLI
-    MACHINE --> R
-    CLI <-->|bind mounts| DATA
-    R <-->|bind mounts| DATA
-    R <-->|library mount| LIB
-    HOST <-->|file access| DATA
-    TASK <-->|file / result APIs| DATA
-    class TASK,PM backend
-    class MACHINE,CLI,R,HOST runtime
-    classDef ui fill:#eaf2ff,stroke:#5684c4,color:#18324f
-    classDef backend fill:#e9f7f3,stroke:#469d86,color:#194e40
-    classDef runtime fill:#fff4df,stroke:#c19b48,color:#624a20
-```
-
-### Plugin and runtime distribution
-
-```mermaid
-flowchart TB
-    STORE["Plugin store / update interface"]
-    MAIN["Electron main process<br/>Download / signature verification"]
-    REGISTRY["Plugin registry<br/>Signed plugin packages"]
-    RELEASE["GitHub application releases"]
-    INSTALL["Backend plugin installation API"]
-    PLUGINS["Local installed plugins<br/>Configuration / scripts"]
-    RUNTIME["Podman / R runtime preparation"]
-    IMAGES["Container image registries"]
-    RREPO["R package repositories"]
-    STORE <-->|IPC| MAIN
-    MAIN <-->|HTTPS| REGISTRY
-    MAIN <-->|HTTPS| RELEASE
-    MAIN -->|install API| INSTALL
-    INSTALL --> PLUGINS
-    PLUGINS -->|declared dependencies| RUNTIME
-    RUNTIME <-->|pull images| IMAGES
-    RUNTIME <-->|install packages| RREPO
-    class STORE,MAIN ui
-    class INSTALL,RUNTIME backend
-    classDef ui fill:#eaf2ff,stroke:#5684c4,color:#18324f
-    classDef backend fill:#e9f7f3,stroke:#469d86,color:#194e40
-    classDef runtime fill:#fff4df,stroke:#c19b48,color:#624a20
-```
-
-The interface uses Electron IPC for native windows, file dialogs, updates, and plugin downloads, and local HTTP APIs to submit analysis tasks. SSE carries logs and status back to the interface. Workflow orchestration lives in the renderer. The main process starts Python and passes its dynamically assigned port to the interface.
-
-The backend reads plugin configuration, dispatches CLI, R, or native GUI/Java tasks, and provides file and result APIs. PodmanManager manages the WSL/Podman machine and service connections. Containers access input and output directories through bind mounts; R installation and execution use the shared R runtime. Plugins, images, R packages, and application updates come from the external distribution services shown above.
+The GitHub-backed community market supports plugin submission, collaboration, review and signed installation. Its client and backend integration are included here; `marketplace/github` contains the workflow and processing sources used by the separate market repository. Private signing keys and account sessions are not part of the source.
 
 ## Run from source
 
-Use Windows x64 with Node.js/npm and Python on `PATH`. This publication was prepared with Node.js 24.14.0 and Python 3.14.3; compatibility with other versions has not been established. Container tasks require WSL 2 and Podman, either installed on the system or supplied under `podman/`.
+Use Windows x64 with Node.js/npm and Python on `PATH`. This publication was prepared with Node.js 24.14.0 and Python 3.14.3; compatibility with other versions has not been established. Container tasks require WSL 2 and the matching bundled runtime resources described below. The application uses its embedded engine rather than a Windows Podman client.
 
 ```powershell
 git clone https://github.com/jianbai-design/PrimiGenius.git
 cd PrimiGenius
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r backend/requirements.txt
+python -m pip install -r backend/requirements.txt pywin32==311
 npm ci
 npm start
 ```
 
-The development launcher uses `python` from the active environment. The direct Python dependencies are pinned; transitive dependencies are not fully locked. The optional native Podman Python client is not required for the Docker SDK connection path. No analysis plugins are included in this checkout.
+The development launcher uses `python` from the active environment. The direct Python dependencies are pinned; transitive dependencies are not fully locked. The Docker SDK talks to the owned local bridge; a separate native Podman Python client is not required. No analysis plugins are included in this checkout.
 
 ## Build a Windows installer
 
-The build uses PyInstaller and electron-builder/NSIS. The current packaging configuration also requires external resources that are not stored in this source repository:
+The maintained entry point compiles the UI, validates runtime resources, freezes Python and builds a Windows x64 NSIS installer. Supply the following external build inputs first:
 
 | Path | Resource |
 | --- | --- |
-| `podman/podman.exe`, `podman/win-sshproxy.exe` | Windows binaries from [Podman releases](https://github.com/containers/podman/releases). |
-| `build/wsl.2.7.3.0.x64.msi` | Matching x64 MSI from [WSL releases](https://github.com/microsoft/WSL/releases). |
-| `build/jre8.zip` | A redistributable Java 8 runtime archive compatible with the application's Java runtime layout. |
+| `runtime/release/` | Embedded engine, Windows/Linux bridge, rootfs, sources/licenses and checksum manifest, produced by `runtime/build.py` and `runtime/bundle.py`. |
+| `runtime/r-environment/` | Matching offline R archive in `stage/`, license bundle and manifest metadata. Build/export tooling is in `build/build_r_environment.py`; the checked-in recipe and manifest describe the 1.2.0 resource contract. |
+| `build/wsl.2.7.3.0.x64.msi` | Corresponding Windows x64 WSL installer. |
+| `build/jre8.zip` | Redistributable Java 8 runtime archive, delivered as the complete `java/jre` tree. |
 
-Supply these resources and review their individual redistribution terms before packaging. The source checkout alone is insufficient to reproduce the bundled installer. The icon and NSIS hook are included; the build wrapper downloads or reuses electron-builder's `winCodeSign` tooling.
+Runtime and R builds require an explicitly selected Linux/WSL build environment with the prerequisites declared in their recipes. Start with `python -B runtime/build.py --help` and `python -B build/build_r_environment.py --help`. Those recipes download or use external upstream inputs; this source checkout does not include built images or third-party runtime binaries. Resource licenses retain their own terms.
 
 ```powershell
 npm ci
 python -m pip install -r backend/requirements-build.txt
-cd backend
-python -m PyInstaller app.spec --noconfirm
-cd ..
+python -B build/build_installer.py --check
 npm run dist
 ```
 
-The output is written to `dist_output/`. Alternatively, `build_installer.bat` runs the build sequence; it deletes old build output and stops processes that may hold files open. Save your work before using it. Packaging and first-run analysis require separate verification.
+`build_installer.bat` invokes the same Python build entry point. Each build uses its own scratch directory and a new output directory under `dist_output/`; existing builds and user processes are preserved. `npm run dist:release` additionally requires matching recorded acceptance files; it never publishes a release. Building successfully does not establish full installation or upgrade compatibility.
 
-`backend/init_podman.py` is a maintenance helper that forcibly removes a Podman machine. It is **not a normal setup command**; do not run it against an environment whose data you need to retain.
+`backend/init_podman.py` initializes or diagnoses the owned environment through the normal setup path and does not forcibly delete the existing machine.
 
 ## Source layout and checks
 
 ```text
-main.js                 Electron main process and desktop integration
-src/                    Interface, styles, and bundled frontend assets
-backend/                Python API, Podman management, and dependency lists
-backend/tests/          Backend regression checks
-build/                  Installer hook, build wrapper, and application icon
-.docker/                R runtime image recipe
-docs/images/            README illustration
+main.js                 Electron process and desktop integration
+src/                    UI, preview/editor modules and licensed browser assets
+backend/                Python API, runtime, tasks, logs and dependencies
+build/                  Installer/build scripts and application icon
+runtime/engine/         Embedded Libpod integration, built inside pinned upstream
+runtime/bridge/         Windows/Linux transport source and Go module checksums
+runtime/                Runtime recipes, build tools and regression checks
+runtime/r-environment/  Offline R recipe and manifest metadata, without images
+marketplace/            Community market workflow, processing and checks
+.docker/                Maintained R environment recipe
+docs/                   README artwork and architecture diagrams
 ```
 
 ```powershell
 node --check main.js
 node --check src/renderer.js
-python -B -m unittest discover -s backend/tests -p "test_*.py"
+python -B runtime/run_core_checks.py --output build/core-regression.json
+node runtime/test_vector_runtime.cjs
+node marketplace/test_market.cjs
 ```
 
-These checks cover selected backend contracts and syntax. They do not replace Windows GUI, WSL/container, or installer testing.
+Tests use disposable fixtures where appropriate. GUI, WSL and complete installer acceptance require their own runtime inputs and environment; the quick checks do not replace those checks. Runtime binaries, private keys, local session/state files, downloaded plugins, build caches and generated validation reports are excluded from the repository.
 
 ## License and scope
 

@@ -1,6 +1,15 @@
 import sys
-import io
 import os
+
+# Uninstall must not initialize logs, workers, or the runtime manager. The
+# executable is still present here: NSIS calls this before deleting resources.
+if __name__ == '__main__' and '--uninstall-runtime' in sys.argv:
+    from wsl_uninstall import main as uninstall_runtime
+    install_dir = (os.path.abspath(os.path.join(os.path.dirname(sys.executable), '..', '..'))
+                   if getattr(sys, 'frozen', False) else os.path.dirname(os.path.dirname(__file__)))
+    sys.exit(uninstall_runtime(install_dir))
+
+import io
 import time
 import tarfile
 import json
@@ -31,8 +40,12 @@ import urllib.parse
 import contextlib
 import hashlib
 import functools
+import gzip
+import secrets
+from plugin_archive import inspect_archive, replace_plugin, pack_source, package_upload
 from podman_manager import (
     PodmanManager,
+    DEFAULT_DOCKERHUB_MIRRORS,
     PODMAN_API_HOST,
     PODMAN_API_PORT,
     DOCKER_API_VERSION,
@@ -90,8 +103,8 @@ class _FrontendLogHandler(logging.Handler):
     def emit(self, record):
         try:
             msg = self.format(record)
-            if not msg.startswith('[PodmanManager]'):
-                msg = f'[PodmanManager] {msg}'
+            if not msg.startswith('[RuntimeManager]'):
+                msg = f'[RuntimeManager] {msg}'
             if 'log' in globals():
                 log(msg)
             else:
@@ -108,23 +121,46 @@ _frontend_log_handler.setFormatter(logging.Formatter('%(message)s'))
 RUNNING_CONTAINERS = {}
 _LOG_CONTEXT = threading.local()
 _LOG_EVENT_COND = threading.Condition()
-_LOG_EVENT_SEQ = 0
-_LOG_EVENTS = deque(maxlen=20000)
+from log_journal import LogJournal
+from resource_state import StateDatabase, PersistentRegistry, BoundedWorkers, ExpiringCache, StreamQueue, path_lock
+from container_metrics import container_metrics
+from library_compat import resolve_library
+import atexit
+_LOG_JOURNAL = LogJournal(os.path.join(os.environ.get('PRIMIGENIUS_LOG_DIR') or os.path.join(APP_INSTALL_DIR, 'logs'), 'events.sqlite3'),
+                          fresh_session=__name__ == '__main__')
+atexit.register(_LOG_JOURNAL.close)
+_STATE_DATABASE = StateDatabase(os.path.join(os.path.dirname(_LOG_JOURNAL.path), 'state.sqlite3'))
+atexit.register(_STATE_DATABASE.close)
+_R_INSTALL_WORKERS = BoundedWorkers('r-package-install', capacity=32)
+_BINARY_INSTALL_WORKERS = BoundedWorkers('plugin-binary-install', workers=2, capacity=16)
 _IPV4_PATCH_LOCK = threading.Lock()
 _NETWORK_PROFILE_LOCK = threading.Lock()
 _PULL_SOURCE_STATS_LOCK = threading.Lock()
-_PULL_SOURCE_STATS = {}  # registry_host -> {'ok': bool, 'latency_ms': int, 'failures': int, 'ts': float}
+_PULL_SOURCE_STATS = ExpiringCache(capacity=256, ttl=24 * 3600)
 _IMAGE_PULL_LOCK = threading.Lock()
 _REGISTRY_PROBE_CACHE_LOCK = threading.Lock()
-_REGISTRY_PROBE_CACHE = {}  # registry_host -> {'latency_ms': int|None, 'ts': float}
+_REGISTRY_PROBE_CACHE = ExpiringCache(capacity=256, ttl=300)
 _HUB_MANIFEST_CHECK_CACHE_LOCK = threading.Lock()
-_HUB_MANIFEST_CHECK_CACHE = {}  # key: namespace/repo:tag -> {'ok': bool, 'reason': str, 'ts': float}
+_HUB_MANIFEST_CHECK_CACHE = ExpiringCache(capacity=1024, ttl=6 * 3600)
 _BINARY_INSTALL_JOBS_LOCK = threading.Lock()
-_BINARY_INSTALL_JOBS = {}
+_BINARY_INSTALL_JOBS = PersistentRegistry(_STATE_DATABASE, 'binary-install', jobs=True)
 _ACTIVE_ANALYSIS_LOCK = threading.Lock()
 _ACTIVE_ANALYSIS_REQUESTS = 0
+_SHUTDOWN_REQUESTED = threading.Event()
+_NATIVE_PROCESSES = {}
+_NATIVE_PROCESSES_LOCK = threading.Lock()
 _CONTAINER_LAST_STATS_LOCK = threading.Lock()
-_CONTAINER_LAST_STATS = {}  # container_id -> {'stats': {...}, 'ts': float}
+_CONTAINER_LAST_STATS = ExpiringCache()  # container_id -> {'stats': {...}, 'ts': float}
+
+
+def _native_process_snapshot(register=None):
+    with _NATIVE_PROCESSES_LOCK:
+        for pid, proc in list(_NATIVE_PROCESSES.items()):
+            if proc.poll() is not None:
+                _NATIVE_PROCESSES.pop(pid, None)
+        if register is not None:
+            _NATIVE_PROCESSES[register.pid] = register
+        return list(_NATIVE_PROCESSES.values())
 
 
 def _track_analysis_request(func):
@@ -145,19 +181,14 @@ def _podman_suspend_busy_state():
     with _ACTIVE_ANALYSIS_LOCK:
         analyses = _ACTIVE_ANALYSIS_REQUESTS
     manager = globals().get('_podman_mgr')
-    r_installs = sum(
-        1 for job in globals().get('INSTALL_JOBS', {}).values()
-        if job.get('status') in ('pending', 'running')
-    )
+    r_installs = INSTALL_JOBS.active_count()
     with _BINARY_INSTALL_JOBS_LOCK:
-        binary_installs = sum(
-            1 for job in _BINARY_INSTALL_JOBS.values()
-            if job.get('status') in ('pending', 'running')
-        )
+        binary_installs = _BINARY_INSTALL_JOBS.active_count()
     return {
         'analyses': analyses,
+        'native_processes': len(_native_process_snapshot()),
         'image_pulls': 1 if globals().get('_pull_in_progress') and _pull_in_progress.is_set() else 0,
-        'r_installs': r_installs,
+        'r_installs': r_installs + int(bool(globals().get('_OFFLINE_R_ENV') and _OFFLINE_R_ENV.snapshot()['state']=='preparing')),
         'binary_installs': binary_installs,
         'podman_setup': 1 if (
             globals().get('_podman_async_running') or getattr(manager, '_setup_running', False)
@@ -166,22 +197,6 @@ def _podman_suspend_busy_state():
 
 _CUSTOM_MIRRORS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.primigenius_custom_mirrors.json')
 _CUSTOM_MIRRORS_LOCK = threading.Lock()
-
-DEFAULT_DOCKERHUB_MIRRORS = [
-    'docker.1ms.run',
-    'docker.m.daocloud.io',
-    'dockerproxy.link',
-    'dockerproxy.com',
-    'docker.1panel.live',
-    'proxy.vvvv.ee',
-    'docker.jiaxin.site',
-    'registry.cyou',
-    'docker.xuanyuan.me',
-    'hub.rat.dev',
-    'docker.nju.edu.cn',
-    'docker.mirrors.sjtug.sjtu.edu.cn',
-    '05f073ad3c0010ea0f4bc00b7105ec20.mirror.swr.myhuaweicloud.com',
-]
 
 DEFAULT_REGISTRY_PROXIES = {
     'quay.io': [
@@ -211,7 +226,8 @@ DEFAULT_REGISTRY_PROXIES = {
 }
 
 HIDDEN_DOCKER_ACCEL_PREFIXES = [
-    'docker.gh-proxy.cn',
+    'eo.gh-proxy.cn',
+    'gh-proxy.com/docker',
     'gh-proxy.org/docker',
     'v4.gh-proxy.org/docker',
     'v6.gh-proxy.org/docker',
@@ -373,9 +389,8 @@ def log(msg):
     run_prefix = f"[RUN:{run_id}] " if run_id else ""
     text = str(msg)
     for line in text.splitlines() or ['']:
+        _publish_run_log_event(str(run_id or '__system__'), str(channel), line)
         print(f"{run_prefix}[{channel}] {line}", flush=True)
-        if run_id:
-            _publish_run_log_event(str(run_id), str(channel), line)
 
 
 logging.getLogger('podman_manager').addHandler(_frontend_log_handler)
@@ -384,20 +399,49 @@ logging.getLogger('podman_manager').propagate = False
 
 
 def _publish_run_log_event(run_id, channel, msg):
-    global _LOG_EVENT_SEQ
     if not run_id:
         return
+    _LOG_JOURNAL.append(str(run_id), channel or 'Linux', str(msg).splitlines() or [''])
     with _LOG_EVENT_COND:
-        for line in str(msg).splitlines() or ['']:
-            _LOG_EVENT_SEQ += 1
-            _LOG_EVENTS.append({
-                'seq': _LOG_EVENT_SEQ,
-                'runId': run_id,
-                'channel': channel or 'Linux',
-                'line': f'[{channel or "Linux"}] {line}',
-                'ts': time.time()
-            })
         _LOG_EVENT_COND.notify_all()
+
+
+@app.route('/logs/history', methods=['GET'])
+def log_history():
+    run_id = str(request.args.get('runId') or '').strip()
+    if not run_id:
+        return jsonify({'status': 'error', 'message': 'runId required'}), 400
+    try:
+        after = max(0, int(request.args.get('afterSeq', 0)))
+        limit = max(1, min(1000, int(request.args.get('limit', 500))))
+    except ValueError:
+        return jsonify({'status': 'error', 'message': 'Invalid log cursor'}), 400
+    if request.args.get('scope') == 'session':
+        after = max(after, _LOG_JOURNAL.session_start_seq)
+    latest = _LOG_JOURNAL.latest(run_id)
+    events = _LOG_JOURNAL.read(run_id, after, limit, until=latest)
+    next_seq = events[-1]['seq'] if events else after
+    return jsonify({'status': 'success', 'events': events, 'nextSeq': next_seq,
+                    'latestSeq': latest, 'has_more': next_seq < latest})
+
+
+@app.route('/logs/download', methods=['GET'])
+def download_run_logs():
+    run_id = str(request.args.get('runId') or '').strip()
+    if not run_id:
+        return jsonify({'status': 'error', 'message': 'runId required'}), 400
+    start_seq = _LOG_JOURNAL.session_start_seq if request.args.get('scope') == 'session' else 0
+    latest = _LOG_JOURNAL.latest(run_id)
+    def chunks():
+        after = start_seq
+        while True:
+            batch = _LOG_JOURNAL.read(run_id, after, until=latest)
+            if not batch:
+                return
+            yield ''.join((f"[RUN:{event['runId']}] " if run_id == '*' else '') + event['line'] + '\n' for event in batch)
+            after = batch[-1]['seq']
+    return Response(chunks(), content_type='text/plain; charset=utf-8',
+                    headers={'Content-Disposition': 'attachment; filename="primigenius-log.txt"'})
 
 
 @app.route('/logs/stream', methods=['GET'])
@@ -406,7 +450,7 @@ def stream_run_logs():
     if not run_id:
         return jsonify({'status': 'error', 'message': 'runId is required'}), 400
     try:
-        last_seq = int(request.args.get('lastSeq') or 0)
+        last_seq = max(0, int(request.headers.get('Last-Event-ID') or request.args.get('lastSeq') or 0))
     except Exception:
         last_seq = 0
 
@@ -414,16 +458,11 @@ def stream_run_logs():
         nonlocal last_seq
         yield f"data: {json.dumps({'type': 'hello', 'runId': run_id})}\n\n"
         while True:
-            batch = []
-            with _LOG_EVENT_COND:
-                for event in list(_LOG_EVENTS):
-                    if event.get('runId') == run_id and int(event.get('seq') or 0) > last_seq:
-                        batch.append(event)
-                if not batch:
+            batch = _LOG_JOURNAL.read(run_id, last_seq)
+            if not batch:
+                with _LOG_EVENT_COND:
                     _LOG_EVENT_COND.wait(timeout=3)
-                    for event in list(_LOG_EVENTS):
-                        if event.get('runId') == run_id and int(event.get('seq') or 0) > last_seq:
-                            batch.append(event)
+                batch = _LOG_JOURNAL.read(run_id, last_seq)
 
             if not batch:
                 yield f"data: {json.dumps({'type': 'heartbeat', 'runId': run_id})}\n\n"
@@ -438,7 +477,7 @@ def stream_run_logs():
                     'channel': event.get('channel') or 'Linux',
                     'line': event.get('line') or ''
                 }
-                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                yield f"id: {last_seq}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     return Response(
         generate(),
@@ -573,7 +612,7 @@ def _hidden_docker_accel_candidates(image_ref):
                 add(f'{prefix}/{repo_path}')
             else:
                 add(f'{prefix}/docker.io/{repo_path}')
-        else:
+        elif not host_style:
             full_ref = _image_ref_with_default_tag(image_ref)
             if full_ref:
                 add(f'{prefix}/{full_ref}')
@@ -602,23 +641,28 @@ def _get_pull_mirrors():
     def clean(m):
         return str(m or '').strip().rstrip('/').removeprefix('https://').removeprefix('http://')
 
+    def include_builtins(mirrors):
+        if _effective_network_mode() == 'cn':
+            return list(dict.fromkeys(mirrors + DEFAULT_DOCKERHUB_MIRRORS))
+        return mirrors
+
     custom = _load_custom_mirrors()
     custom = [clean(x) for x in custom if clean(x)]
     if custom:
-        return custom
+        return include_builtins(custom)
 
     raw = os.environ.get('PRIMIGENIUS_DOCKER_MIRRORS', '')
     env_mirrors = [clean(x) for x in raw.split(',') if clean(x)]
     if env_mirrors:
-        return env_mirrors
+        return include_builtins(env_mirrors)
 
     try:
         configured = _get_podman_manager()._get_configured_mirrors()
         configured = [clean(x) for x in configured if clean(x)]
         if configured:
-            return configured
+            return include_builtins(configured)
     except Exception as e:
-        log(f'[WARN] Failed to read configured Podman mirrors: {e}')
+        log(f'[WARN] Failed to read configured Runtime mirrors: {e}')
 
     return list(_mode_strategy().get('pull_mirrors', DEFAULT_DOCKERHUB_MIRRORS))
 
@@ -864,7 +908,7 @@ def _configured_pull_mirror_hosts():
 
 
 def _local_image_ref_variants(image_ref):
-    """Generate refs Podman may use locally for one Docker Hub image."""
+    """Generate refs Runtime may use locally for one Docker Hub image."""
     refs = []
 
     def add(ref):
@@ -1189,6 +1233,7 @@ def _note_pull_candidate_result(image_ref, ok, elapsed_ms):
 
 
 def _pull_single_ref_with_progress(client, target_ref, *, display_name=None, cancel_event=None, source_label=None):
+    cancel_event = cancel_event or _SHUTDOWN_REQUESTED
     """Pull one concrete image ref, streaming native output directly. Prefers WSL CLI."""
     shown_name = display_name or target_ref
     src_tag = f'[{source_label}] ' if source_label else ''
@@ -1254,34 +1299,10 @@ def _pull_single_ref_with_progress(client, target_ref, *, display_name=None, can
             if _pull_registry_host(target_ref) == 'registry.hub.docker.com':
                 libpod_timeout = max(libpod_timeout, 60)
 
-            podman_ver = _podman_api_version(mgr)
-            import urllib.parse
-            ref_encoded = urllib.parse.quote(target_ref, safe='')
-            api_http_url = mgr.get_api_http_url() or f'http://{PODMAN_API_HOST}:{PODMAN_API_PORT}'
-            pull_url = f'{api_http_url}/{podman_ver}/libpod/images/pull?reference={ref_encoded}'
-            log(f'[DEBUG] {src_tag}Trying Libpod API pull ({libpod_timeout}s timeout)')
-            req = urllib.request.Request(pull_url, method='POST')
-            with urllib.request.urlopen(req, timeout=libpod_timeout) as resp:
-                buf = ''
-                for raw_chunk in iter(lambda: resp.read(4096), b''):
-                    if cancel_event and cancel_event.is_set():
-                        return
-                    buf += raw_chunk.decode('utf-8', errors='replace')
-                    while '\n' in buf:
-                        line, buf = buf.split('\n', 1)
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            chunk = json.loads(line)
-                        except Exception:
-                            continue
-                        error_msg = chunk.get('error', '')
-                        if error_msg:
-                            raise RuntimeError(error_msg)
-                        stream_msg = chunk.get('stream', '').strip()
-                        if stream_msg:
-                            log(f"📥 {src_tag}{stream_msg}")
+            for chunk in _embedded_pull_chunks(mgr, target_ref, libpod_timeout, cancel_event):
+                stream_msg = chunk.get('stream', '').strip()
+                if stream_msg:
+                    log(f"📥 {src_tag}{stream_msg}")
             pulled_ok = True
             log(f"📥 {src_tag}Pull complete {shown_name}")
         except RuntimeError:
@@ -1344,6 +1365,23 @@ def _cleanup_losing_mirror_tags(client, candidates, winner_ref, original_ref):
             pass
 
 
+def _embedded_pull_chunks(mgr, image_ref, timeout, cancel_event=None):
+    path = '/' + _podman_api_version(mgr) + '/libpod/images/pull'
+    response, api = mgr.runtime.request('POST', path, params={'reference': image_ref}, stream=True, timeout=timeout)
+    try:
+        for line in response.iter_lines():
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            if line:
+                chunk = json.loads(line.decode('utf-8'))
+                if chunk.get('error'):
+                    raise RuntimeError(chunk['error'])
+                yield chunk
+    finally:
+        response.close()
+        api.close()
+
+
 def _libpod_pull_image(image_ref, timeout=300):
     """Pull image preferring WSL podman pull, then Libpod API, then Docker API."""
     mgr = _get_podman_manager()
@@ -1357,28 +1395,8 @@ def _libpod_pull_image(image_ref, timeout=300):
     except Exception as wsl_err:
         log(f'[DEBUG] WSL pull failed for {image_ref}: {wsl_err}, trying Libpod API')
     try:
-        podman_ver = _podman_api_version(mgr)
-        import urllib.parse
-        ref_encoded = urllib.parse.quote(image_ref, safe='')
-        api_http_url = mgr.get_api_http_url() or f'http://{PODMAN_API_HOST}:{PODMAN_API_PORT}'
-        pull_url = f'{api_http_url}/{podman_ver}/libpod/images/pull?reference={ref_encoded}'
-        req = urllib.request.Request(pull_url, method='POST')
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            buf = ''
-            for raw_chunk in iter(lambda: resp.read(4096), b''):
-                buf += raw_chunk.decode('utf-8', errors='replace')
-                while '\n' in buf:
-                    line, buf = buf.split('\n', 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        chunk = json.loads(line)
-                    except Exception:
-                        continue
-                    error_msg = chunk.get('error', '')
-                    if error_msg:
-                        raise RuntimeError(error_msg)
+        for chunk in _embedded_pull_chunks(mgr, image_ref, timeout):
+            pass
         return True
     except RuntimeError:
         raise
@@ -1420,7 +1438,7 @@ def _retag_to_original_if_needed(client, pulled_ref, original_ref):
         img_obj = client.images.get(pulled_ref)
         img_obj.tag(fq_name, tag=tag_val)
     except Exception as e:
-        log(f"[WARN] SDK retag failed for {pulled_ref} -> {target_tag}: {e}; trying WSL podman tag")
+        log(f"[WARN] SDK retag failed for {pulled_ref} -> {target_tag}: {e}; trying the Linux image tagging helper")
         result = _get_podman_manager()._run_wsl(
             f'podman tag {shlex.quote(pulled_ref)} {shlex.quote(target_tag)}',
             timeout=60
@@ -1569,7 +1587,7 @@ def pull_image_with_progress(client, image_name):
     bandwidth, multiplied temporary storage usage, and required killing healthy
     transfers.  HTTPS preflight now orders sources and they are tried serially.
     A process-wide lock also prevents multiple UI/plugin pulls from competing for
-    Podman's image store.
+    Runtime's image store.
     """
     with _IMAGE_PULL_LOCK:
         _pull_in_progress.set()
@@ -1620,7 +1638,7 @@ def _pull_image_with_progress_locked(client, image_name):
 
         all_io_error = bool(errors) and all('input/output error' in err for err in errors)
         if all_io_error:
-            log('[WARN] All pull attempts failed with I/O error, restarting Podman and retrying...')
+            log('[WARN] All pull attempts failed with I/O error, restarting Runtime and retrying...')
             try:
                 mgr = _get_podman_manager()
                 mgr.machine_stop()
@@ -1628,7 +1646,7 @@ def _pull_image_with_progress_locked(client, image_name):
                 mgr.machine_start()
                 time.sleep(5)
                 if mgr.wait_for_engine(max_attempts=30, interval=2):
-                    log('[SYSTEM] Podman restarted, retrying pull...')
+                    log('[SYSTEM] Runtime restarted, retrying pull...')
                     global _docker_client
                     _docker_client = None
                     client = get_docker_client()
@@ -1643,7 +1661,7 @@ def _pull_image_with_progress_locked(client, image_name):
                             except Exception as e2:
                                 log(f"[DEBUG] Retry pull failed for {cand}: {e2}")
             except Exception as restart_err:
-                log(f'[ERROR] Podman restart failed: {restart_err}')
+                log(f'[ERROR] Runtime restart failed: {restart_err}')
 
 
         has_mirrors = bool(_get_pull_mirrors())
@@ -1685,18 +1703,18 @@ def _create_container_with_image_repair(client, create_kwargs, image_ref, *, pha
                 _image_exists_cache[img_ref] = True
             return client.containers.create(**create_kwargs)
         raise
-    except (ConnectionError, OSError) as e:
-        log(f"[WARN] Connection error during {phase} container create, retrying after reconnect...")
-        global _docker_client
-        _docker_client = None
-        time.sleep(2)
-        client = get_docker_client()
-        if not client:
-            raise
-        return client.containers.create(**create_kwargs)
+    except (ConnectionError, OSError):
+        name = create_kwargs.get('name')
+        if name:
+            try:
+                return client.containers.get(name)
+            except Exception:
+                pass
+        raise RuntimeError('Container creation response was lost; state must be checked before retrying. No duplicate task was started.')
 
 _docker_client = None
 _podman_mgr = None
+_podman_mgr_lock = threading.Lock()
 _podman_client_lock = threading.RLock()
 _containers_cache = {'data': None, 'time': 0}
 _images_cache = {'data': None, 'time': 0}
@@ -1709,11 +1727,19 @@ _podman_info_refresh_lock = threading.Lock()
 _cache_preload_done = False
 _cache_preload_lock = threading.Lock()
 
+def _publish_runtime_state(kind, state):
+    # Reuse the desktop startup pipe: no extra polling connection or web server.
+    print('PRIMIGENIUS_RUNTIME_STATE=' + json.dumps({'kind': kind, 'state': state}, ensure_ascii=True), flush=True)
+    if kind == 'engine' and state.get('engine_ready'):
+        log('[RUNTIME] Runtime engine is ready!')
+
 def _get_podman_manager():
     global _podman_mgr, _WSL_DISTRO_NAME
-    if _podman_mgr is None:
-        _podman_mgr = PodmanManager(APP_INSTALL_DIR)
-        _WSL_DISTRO_NAME = _podman_mgr.wsl_distro_name
+    with _podman_mgr_lock:
+        if _podman_mgr is None:
+            _podman_mgr = PodmanManager(APP_INSTALL_DIR)
+            _podman_mgr.on_state_change = lambda state: _publish_runtime_state('engine', state)
+            _WSL_DISTRO_NAME = _podman_mgr.wsl_distro_name
     return _podman_mgr
 
 def _get_podman_socket_path():
@@ -1740,7 +1766,7 @@ def _ensure_podman_running():
         return False
 
     if _podman_async_running:
-        log("[SETUP] Podman setup already in progress, waiting...")
+        log("[SETUP] Runtime setup already in progress, waiting...")
         for _ in range(60):
             time.sleep(1)
             if mgr.is_engine_ready():
@@ -1755,23 +1781,24 @@ def _ensure_podman_running():
         _podman_start_fail_count = 0
 
     _podman_start_fail_count += 1
-    log(f"[SETUP] Starting Podman (attempt {_podman_start_fail_count}/{_PODMAN_MAX_START_RETRIES})...")
+    log(f"[SETUP] Starting Runtime (attempt {_podman_start_fail_count}/{_PODMAN_MAX_START_RETRIES})...")
 
     ok, msg = mgr.auto_setup()
     if not ok:
-        _podman_start_retry_after = time.monotonic() + min(60, 3 * (2 ** max(0, _podman_start_fail_count - 1)))
-        log(f"[SETUP] Podman start failed: {msg}")
+        _podman_start_retry_after = (float('inf') if getattr(mgr, '_wsl_storage_missing', False) else
+                                    time.monotonic() + min(60, 3 * (2 ** max(0, _podman_start_fail_count - 1))))
+        log(f"[SETUP] Runtime start failed: {msg}")
         return False
 
-    log("[SETUP] Waiting for Podman engine...")
+    log("[SETUP] Waiting for Container engine...")
     if mgr.wait_for_engine(max_attempts=30, interval=1):
         _podman_start_fail_count = 0
         _podman_permanently_failed = False
         _podman_start_retry_after = 0.0
-        log("[SYSTEM] OK Podman engine ready")
+        log("[SYSTEM] OK Container engine ready")
         return True
     else:
-        log("[SETUP] Podman engine did not become ready in time")
+        log("[SETUP] Container engine did not become ready in time")
         return False
 
 def _start_podman_async():
@@ -1788,13 +1815,16 @@ def _start_podman_async():
         try:
             mgr = _get_podman_manager()
             if mgr.is_engine_ready():
+                # An engine surviving a desktop restart still needs the same
+                # recovery owner as a newly started engine.
+                mgr._start_wsl_podman_service()
                 _podman_start_fail_count = 0
                 _podman_permanently_failed = False
                 _podman_start_retry_after = 0.0
                 get_docker_client()
-                log("[SYSTEM] OK Podman engine ready")
+                log("[SYSTEM] OK Container engine ready")
                 return
-            log("[SYSTEM] [SETUP] Running auto setup to ensure WSL distro and Podman service...")
+            log("[SYSTEM] [SETUP] Running auto setup to ensure WSL distro and Runtime service...")
             ok, msg = mgr.auto_setup()
             if ok:
                 _podman_start_fail_count = 0
@@ -1802,25 +1832,28 @@ def _start_podman_async():
                 _podman_start_retry_after = 0.0
                 if mgr.wait_for_engine(max_attempts=24, interval=0.5):
                     get_docker_client()
-                    log("[SYSTEM] OK Auto setup complete, Podman engine ready")
+                    log("[SYSTEM] OK Auto setup complete, Container engine ready")
                 else:
                     _podman_start_retry_after = time.monotonic() + 30.0
                     diag = getattr(mgr, '_last_start_diagnostics', '') or 'no diagnostics available'
-                    log(f"[ERROR] Auto setup completed but Podman API is not reachable: {diag}")
+                    log(f"[ERROR] Auto setup completed but Local engine connection is not reachable: {diag}")
             else:
-                _podman_start_retry_after = time.monotonic() + 30.0
+                _podman_start_retry_after = (float('inf') if getattr(mgr, '_wsl_storage_missing', False) else
+                                            time.monotonic() + 30.0)
                 log(f"[ERROR] Auto setup failed: {msg}")
         finally:
-            # Retry legacy-library retirement on every successful application
-            # startup, not only after a package job or plugin run.
+            # Prepare R separately so ordinary application features stay usable.
             try:
                 mgr = _get_podman_manager()
+                if getattr(mgr, '_wsl_storage_missing', False):
+                    _offline_r_environment()._set('attention', 'engine-storage-missing', mgr.runtime.last_error)
                 if mgr.is_engine_ready():
                     client = get_docker_client()
                     if client:
-                        _complete_r_runtime_migration(client)
+                        _offline_r_environment().start()
+                        threading.Thread(target=_cleanup_stale_containers, daemon=True, name='container-cleanup').start()
             except Exception as e:
-                log(f'[WARN] Startup R migration cleanup deferred: {e}')
+                log(f'[WARN] Offline R preparation deferred: {e}')
             with _podman_async_lock:
                 _podman_async_running = False
     t = threading.Thread(target=_worker, daemon=True)
@@ -1846,7 +1879,7 @@ def _ping_docker_client(client, timeout=3):
     try:
         return client.ping(timeout=timeout)
     except TypeError:
-        # Native Podman bindings do not accept Docker SDK's timeout keyword.
+        # Native Runtime bindings do not accept Docker SDK's timeout keyword.
         return client.ping()
 
 
@@ -1869,6 +1902,8 @@ def _invalidate_docker_client(expected=None):
     global _docker_client, _docker_client_last_ping, _api_client_cache
     client = None
     with _podman_client_lock:
+        if expected is not None and _docker_client is not expected:
+            return
         if expected is None or _docker_client is expected:
             client = _docker_client
             _docker_client = None
@@ -1902,8 +1937,12 @@ def get_docker_client():
         if _docker_reconnecting:
             return None
         if time.monotonic() < _docker_reconnect_after:
-            return None
+            # Recovery is owned by the manager. Once it has reconnected, an
+            # older SDK failure must not impose another independent backoff.
+            if _podman_mgr is None or _podman_mgr._connection_state != 'ready':
+                return None
         _docker_reconnecting = True
+    new_client = None
     try:
         mgr = _get_podman_manager()
         if not mgr.is_engine_ready():
@@ -1926,8 +1965,9 @@ def get_docker_client():
             _record_docker_reconnect_success()
             _trigger_cache_preload()
             return _docker_client
-        new_client = docker.DockerClient(
-            base_url=docker_host or os.environ.get('DOCKER_HOST'),
+        from embedded_runtime import OwnedDockerClient
+        new_client = OwnedDockerClient(
+            owner=mgr.runtime.identity, base_url=docker_host or os.environ.get('DOCKER_HOST'),
             version=DOCKER_API_VERSION,
             timeout=15
         )
@@ -1939,6 +1979,7 @@ def get_docker_client():
         _trigger_cache_preload()
         return _docker_client
     except Exception:
+        _close_docker_client(new_client)
         _record_docker_reconnect_failure()
         return None
     finally:
@@ -1962,42 +2003,35 @@ def _get_api_client(skip_ping=False):
     global _api_client_cache
     if _podman_permanently_failed:
         return None
-    now = time.time()
-    cached = _api_client_cache.get('client')
-    if cached and now - _api_client_cache.get('time', 0) < 30:
-        if skip_ping:
-            return cached
+    with _podman_client_lock:
+        cached = _api_client_cache.get('client')
+        if cached is not None:
+            try:
+                if not skip_ping and time.monotonic() - _api_client_cache.get('time', 0) >= 5:
+                    cached.ping()
+                    _api_client_cache['time'] = time.monotonic()
+                return cached
+            except Exception:
+                cached.close()
+                _api_client_cache = {'client': None, 'time': 0}
+        api_client = None
         try:
-            cached.ping(timeout=3)
-            return cached
-        except Exception:
-            _api_client_cache = {'client': None, 'time': 0}
-    mgr = _get_podman_manager()
-    url = mgr.get_api_service_url()
-    if not url:
-        return None
-    for attempt in range(2):
-        try:
-            api_client = docker.APIClient(
-                base_url=url,
-                version=DOCKER_API_VERSION,
-                timeout=5
-            )
-            api_client.ping(timeout=3)
-            _api_client_cache = {'client': api_client, 'time': time.time()}
+            api_client = docker.APIClient(base_url=_get_podman_manager().get_api_service_url(),
+                                          version=DOCKER_API_VERSION, timeout=5)
+            api_client.ping()
+            _api_client_cache = {'client': api_client, 'time': time.monotonic()}
             return api_client
         except Exception:
-            if attempt == 0:
-                os.environ['DOCKER_HOST'] = url
-                time.sleep(0.3)
-    return None
+            if api_client is not None:
+                api_client.close()
+            return None
 
 
 def _get_readonly_api_client(timeout=_READONLY_CLIENT_TIMEOUT):
     """Create a short-lived API client for UI reads so long jobs cannot monopolize it."""
     try:
         mgr = _get_podman_manager()
-        url = mgr.get_api_service_url() or os.environ.get('DOCKER_HOST', '')
+        url = mgr.runtime.control_url
         if not url:
             return None
         return docker.APIClient(
@@ -2032,325 +2066,58 @@ def _run_hidden_wsl(cmd_args, timeout=30, capture=True):
     return result
 
 def _robust_container_wait(container, timeout=None):
-    """Wait for container to finish, with WSL-based fallback if Docker API fails.
-
-    Args:
-        container: Docker/Podman container object.
-        timeout: Max seconds to wait. None or 0 means wait indefinitely
-                 until the container exits on its own or is manually stopped.
-    """
-    container_id = container.id
-    indefinite = timeout is None or timeout <= 0
-
-    # Phase 1: try Docker SDK wait (only with timeout if specified)
-    try:
-        if indefinite:
-            # Docker SDK wait(None) may block forever; use a very large value
-            result = container.wait(timeout=86400)
-        else:
-            result = container.wait(timeout=timeout)
-        return result
-    except Exception as e:
-        log(f'[WARN] Docker API wait failed ({e}), falling back to WSL poll...')
-
-    # Phase 2: WSL poll loop — indefinite if timeout is None/0
-    start_time = time.time()
-    poll_interval = 5
-    while True:
-        elapsed = time.time() - start_time
-        if not indefinite and elapsed >= timeout:
-            log(f'[WARN] WSL poll timeout for container {container_id[:12]} after {timeout}s')
-            break
+    """Reconcile an interrupted read without restarting the task or a WSL process."""
+    deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
+    failures = 0
+    while deadline is None or time.monotonic() < deadline:
+        remaining = max(0.1, deadline - time.monotonic()) if deadline else 86400
         try:
-            proc = _run_hidden_wsl(
-                ['wsl', '-d', _active_wsl_distro_name(), '-u', 'root', '--',
-                 'podman', 'inspect', container_id, '--format', '{{.State.Status}}'],
-                timeout=10, capture=True
-            )
-            status = (proc.stdout or '').strip() if proc else ''
-            if status in ('exited', 'dead', 'stopped'):
-                try:
-                    exit_proc = _run_hidden_wsl(
-                        ['wsl', '-d', _active_wsl_distro_name(), '-u', 'root', '--',
-                         'podman', 'inspect', container_id, '--format', '{{.State.ExitCode}}'],
-                        timeout=10, capture=True
-                    )
-                    exit_code = int((exit_proc.stdout or '').strip() or '-1') if exit_proc else -1
-                except Exception:
-                    exit_code = -1
-                log(f'[INFO] WSL poll: container {container_id[:12]} status={status}, exit_code={exit_code}')
-                return {'StatusCode': exit_code}
-            if status == 'running':
-                pass
-            elif not status:
-                log(f'[DEBUG] WSL poll: container {container_id[:12]} inspect returned empty, retrying...')
-            else:
-                log(f'[DEBUG] WSL poll: container {container_id[:12]} status={status}, continuing to wait...')
-        except Exception:
-            pass
-        time.sleep(poll_interval)
+            container.reload()
+            state = container.attrs.get('State', {})
+            if state.get('Status') in ('exited', 'dead', 'stopped'):
+                return {'StatusCode': state.get('ExitCode', -1)}
+            return container.wait(timeout=remaining)
+        except Exception as exc:
+            failures += 1
+            if failures >= 20:
+                raise RuntimeError('Container state is unknown after connection loss; output and task were preserved') from exc
+            _get_podman_manager()._start_wsl_podman_service()
+            time.sleep(min(0.25 * failures, 3))
+    raise TimeoutError('Container wait deadline exceeded; task was not restarted')
 
-    # Phase 3: only reached when a finite timeout was exceeded
-    try:
-        final_proc = _run_hidden_wsl(
-            ['wsl', '-d', _active_wsl_distro_name(), '-u', 'root', '--',
-             'podman', 'inspect', container_id, '--format', '{{.State.Status}}'],
-            timeout=10, capture=True
-        )
-        final_status = (final_proc.stdout or '').strip() if final_proc else ''
-        if final_status == 'running':
-            log(f'[WARN] Container {container_id[:12]} is still running after timeout, extending wait...')
-            extra_start = time.time()
-            while time.time() - extra_start < 600:
-                try:
-                    proc2 = _run_hidden_wsl(
-                        ['wsl', '-d', _active_wsl_distro_name(), '-u', 'root', '--',
-                         'podman', 'inspect', container_id, '--format', '{{.State.Status}}'],
-                        timeout=10, capture=True
-                    )
-                    s2 = (proc2.stdout or '').strip() if proc2 else ''
-                    if s2 in ('exited', 'dead', 'stopped'):
-                        try:
-                            ec_proc = _run_hidden_wsl(
-                                ['wsl', '-d', _active_wsl_distro_name(), '-u', 'root', '--',
-                                 'podman', 'inspect', container_id, '--format', '{{.State.ExitCode}}'],
-                                timeout=10, capture=True
-                            )
-                            ec = int((ec_proc.stdout or '').strip() or '-1') if ec_proc else -1
-                        except Exception:
-                            ec = -1
-                        log(f'[INFO] WSL poll (extended): container {container_id[:12]} status={s2}, exit_code={ec}')
-                        return {'StatusCode': ec}
-                except Exception:
-                    pass
-                time.sleep(5)
-            log(f'[WARN] Container {container_id[:12]} still running after extended wait, returning -1')
-        else:
-            log(f'[INFO] WSL poll: container {container_id[:12]} final status={final_status}')
-    except Exception:
-        pass
-    return {'StatusCode': -1}
 
-def _wsl_stream_logs(container, stop_event, seen_set, on_line):
-    import queue as _queue
-    si = _HIDDEN_SUBPROCESS_KWARGS.get('startupinfo')
-    proc = None
-    try:
-        proc = subprocess.Popen(
-            ['wsl', '-d', _active_wsl_distro_name(), '-u', 'root', '--', 'podman', 'logs', '-f', container.id],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            bufsize=1,
-            creationflags=0x08000000 | 0x00000200,
-            startupinfo=si
-        )
-    except Exception:
-        pass
 
-    if proc is None or proc.poll() is not None:
-        if proc:
-            first_line = ''
-            try:
-                first_line = proc.stdout.readline() if proc.stdout else ''
-            except Exception:
-                pass
-            try:
-                proc.terminate()
-                proc.wait(timeout=2)
-            except Exception:
-                pass
-            if first_line and ('journald' in first_line.lower() or 'not supported' in first_line.lower()):
-                log('[DEBUG] podman logs -f not supported (journald driver), falling back to polling')
-            return _wsl_poll_logs(container, stop_event, seen_set, on_line)
-        return False
 
-    line_queue = _queue.Queue()
-    journald_error = [False]
-
-    def _reader():
-        while True:
-            try:
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                line = line.rstrip('\n\r')
-                if 'journald' in line.lower() and 'not supported' in line.lower():
-                    journald_error[0] = True
-                    break
-                line_queue.put(line)
-            except Exception:
-                break
-
-    reader = threading.Thread(target=_reader, daemon=True)
-    reader.start()
-
-    while not stop_event.is_set():
-        try:
-            line = line_queue.get(timeout=0.5)
-            _emit_live_container_log(line, seen_set, on_line)
-        except _queue.Empty:
-            if not reader.is_alive() and line_queue.empty():
-                break
-
-    try:
-        proc.terminate()
-        proc.wait(timeout=3)
-    except Exception:
-        pass
-
-    if journald_error[0]:
-        return _wsl_poll_logs(container, stop_event, seen_set, on_line)
-    return True
-
-def _wsl_poll_logs(container, stop_event, seen_set, on_line):
-    seen = 0
-    container_id = container.id
-    while not stop_event.is_set():
-        try:
-            proc = _run_hidden_wsl(
-                ['wsl', '-d', _active_wsl_distro_name(), '-u', 'root', '--', 'podman', 'logs', container_id],
-                timeout=10, capture=True
-            )
-            if proc and proc.stdout:
-                lines = proc.stdout.replace('\r\n', '\n').replace('\r', '\n').split('\n')
-                for line in lines[seen:]:
-                    line = line.rstrip('\r')
-                    if line:
-                        _emit_live_container_log(line, seen_set, on_line)
-                seen = len(lines)
-        except Exception:
-            pass
-        try:
-            status_proc = _run_hidden_wsl(
-                ['wsl', '-d', _active_wsl_distro_name(), '-u', 'root', '--',
-                 'podman', 'inspect', container_id, '--format', '{{.State.Status}}'],
-                timeout=5, capture=True
-            )
-            actual_status = (status_proc.stdout or '').strip() if status_proc else ''
-            if actual_status != 'running':
-                break
-        except Exception:
-            break
-        time.sleep(1)
-    try:
-        proc = _run_hidden_wsl(
-            ['wsl', '-d', _active_wsl_distro_name(), '-u', 'root', '--', 'podman', 'logs', container_id],
-            timeout=10, capture=True
-        )
-        if proc and proc.stdout:
-            lines = proc.stdout.replace('\r\n', '\n').replace('\r', '\n').split('\n')
-            for line in lines[seen:]:
-                line = line.rstrip('\r')
-                if line:
-                    _emit_live_container_log(line, seen_set, on_line)
-    except Exception:
-        pass
-    return True
-
-def _emit_live_container_log(line, seen_set, on_line):
-    if not line:
-        return
-    if isinstance(seen_set, dict):
-        seen_set[line] = int(seen_set.get(line, 0)) + 1
-        on_line(line)
-        return
-    if line not in seen_set:
-        seen_set.add(line)
-        on_line(line)
-
-def _emit_replayed_container_log(line, seen_set, on_line):
-    if not line:
-        return
-    if isinstance(seen_set, dict):
-        already_emitted = int(seen_set.get(line, 0))
-        if already_emitted > 0:
-            seen_set[line] = already_emitted - 1
-            return
-        on_line(line)
-        return
-    if line not in seen_set:
-        seen_set.add(line)
-        on_line(line)
 
 def _stream_container_logs_thread(container, stop_event, seen_set, on_line, stream_ref_list=None):
-    if platform.system() == 'Windows':
-        _wsl_stream_logs(container, stop_event, seen_set, on_line)
-        return
-    _got_any = False
-    try:
-        stream = container.attach(stream=True, logs=True, stdout=True, stderr=True)
-        if stream_ref_list is not None:
-            stream_ref_list[0] = stream
-        for raw_chunk in stream:
+    from runtime_logs import LogCursor
+    cursor = getattr(container, '_primigenius_log_cursor', None) or LogCursor()
+    container._primigenius_log_cursor = cursor
+    failures = 0
+    while not stop_event.is_set():
+        try:
+            cursor.read(container, on_line, follow=True, stop=stop_event, stream_ref=stream_ref_list)
             if stop_event.is_set():
-                break
-            text = raw_chunk.decode('utf-8', errors='replace') if isinstance(raw_chunk, bytes) else str(raw_chunk)
-            for line in text.splitlines():
-                line = line.rstrip('\r')
-                if line:
-                    _got_any = True
-                    _emit_live_container_log(line, seen_set, on_line)
-    except Exception:
-        pass
-    finally:
-        if stream_ref_list is not None:
-            stream_ref_list[0] = None
-
-    if _got_any:
-        return
-    if stop_event.is_set():
-        return
+                return
+            container.reload()
+            if container.status in ('exited', 'dead', 'stopped'):
+                cursor.read(container, on_line)
+                return
+            failures = 0
+        except Exception as exc:
+            if stop_event.is_set():
+                return
+            failures += 1
+            if failures == 1:
+                log('[WARN] Log transport interrupted; resuming from timestamp cursor: ' + str(exc))
+            _get_podman_manager()._start_wsl_podman_service()
+        stop_event.wait(min(0.25 * max(1, failures), 3))
 
 def _collect_final_logs(container, seen_set, on_line):
-    try:
-        raw = container.attach(stdout=True, stderr=True, stream=False, logs=True)
-        if isinstance(raw, bytes):
-            raw_text = raw.decode('utf-8', errors='replace')
-        else:
-            raw_text = str(raw)
-        replayed_any = False
-        for raw_line in raw_text.splitlines():
-            l = raw_line.rstrip('\n')
-            if l:
-                replayed_any = True
-            _emit_replayed_container_log(l, seen_set, on_line)
-        if replayed_any:
-            return
-    except Exception:
-        pass
-
-    if platform.system() == 'Windows':
-        try:
-            proc = _run_hidden_wsl(
-                ['wsl', '-d', _active_wsl_distro_name(), '-u', 'root', '--', 'podman', 'logs', container.id],
-                timeout=10, capture=True
-            )
-            if proc is None:
-                return
-            replayed_any = False
-            for line in (proc.stdout or '').splitlines():
-                l = line.rstrip('\n\r')
-                if l:
-                    replayed_any = True
-                _emit_replayed_container_log(l, seen_set, on_line)
-            if replayed_any:
-                return
-        except Exception:
-            pass
-    try:
-        raw = container.logs(stdout=True, stderr=True)
-        if isinstance(raw, bytes):
-            raw_text = raw.decode('utf-8', errors='replace')
-        else:
-            raw_text = str(raw)
-        for raw_line in raw_text.splitlines():
-            l = raw_line.rstrip('\n')
-            _emit_replayed_container_log(l, seen_set, on_line)
-    except Exception:
-        pass
+    from runtime_logs import LogCursor
+    cursor = getattr(container, '_primigenius_log_cursor', None) or LogCursor()
+    container._primigenius_log_cursor = cursor
+    cursor.read(container, on_line)
 
 # 默认输出目录和R包目录放在主程序安装目录下
 USER_DOCS = os.path.join(APP_INSTALL_DIR, 'outputs')
@@ -2625,80 +2392,84 @@ def _load_json_file(path):
     with open(path, 'r', encoding='utf-8-sig', errors='replace') as f:
         return json.load(f)
 
+_plugin_cache_lock = threading.RLock()
+
 def load_all_plugins():
     """Load all plugin configs with a short TTL cache to avoid redundant disk I/O."""
-    now = time.time()
-    if hasattr(load_all_plugins, '_cache') and hasattr(load_all_plugins, '_cache_time'):
-        if now - load_all_plugins._cache_time < 5:  # 5-second TTL
-            return load_all_plugins._cache
+    with _plugin_cache_lock:
+        now = time.time()
+        if hasattr(load_all_plugins, '_cache') and hasattr(load_all_plugins, '_cache_time'):
+            if now - load_all_plugins._cache_time < 5:  # 5-second TTL
+                return load_all_plugins._cache
 
-    plugins = {}
-    if not os.path.exists(PLUGINS_DIR):
-        load_all_plugins._cache = plugins
-        load_all_plugins._cache_time = now
-        return {}
-    # Support both flat structure and categorized structure (linux/, r/ subdirs)
-    search_dirs = [PLUGINS_DIR]
-    for subcat in ['linux', 'r']:
-        subdir = os.path.join(PLUGINS_DIR, subcat)
-        if os.path.isdir(subdir):
-            search_dirs.append(subdir)
+        plugins = {}
+        if not os.path.exists(PLUGINS_DIR):
+            load_all_plugins._cache = plugins
+            load_all_plugins._cache_time = time.time()
+            return {}
+        # Support both flat structure and categorized structure (linux/, r/ subdirs)
+        search_dirs = [PLUGINS_DIR]
+        for subcat in ['linux', 'r']:
+            subdir = os.path.join(PLUGINS_DIR, subcat)
+            if os.path.isdir(subdir):
+                search_dirs.append(subdir)
     
-    for search_dir in search_dirs:
-        for pid in os.listdir(search_dir):
-            # Skip category subdirectories when scanning root
-            if search_dir == PLUGINS_DIR and pid in ['linux', 'r']:
-                continue
-            ppath = os.path.join(search_dir, pid)
-            cpath = os.path.join(ppath, 'config.json')
-            if os.path.exists(cpath):
-                try:
-                    cfg = _load_json_file(cpath)
-                    cfg['plugin_dir'] = ppath
-                    if str(cfg.get('type') or '').strip().lower().startswith('r'):
-                        cfg['configured_docker_image'] = cfg.get('docker_image')
-                        cfg['docker_image'] = R_DOCKER_IMAGE
-                    if cfg.get('local_binary'):
-                        full, rel = find_binary_path(ppath, cfg['binary_name'])
-                        cfg['is_installed'] = bool(full)
-                        if full: cfg['binary_subdir'] = rel
-                    elif cfg.get('run_mode') == 'native_gui':
-                        if cfg.get('java_app'):
+        for search_dir in search_dirs:
+            for pid in os.listdir(search_dir):
+                # Skip category subdirectories when scanning root
+                if search_dir == PLUGINS_DIR and pid in ['linux', 'r']:
+                    continue
+                ppath = os.path.join(search_dir, pid)
+                cpath = os.path.join(ppath, 'config.json')
+                if os.path.exists(cpath):
+                    try:
+                        cfg = _load_json_file(cpath)
+                        cfg['plugin_dir'] = ppath
+                        if str(cfg.get('type') or '').strip().lower().startswith('r'):
+                            cfg['configured_docker_image'] = cfg.get('docker_image')
+                            cfg['docker_image'] = R_DOCKER_IMAGE
+                        if cfg.get('local_binary'):
+                            full, rel = find_binary_path(ppath, cfg['binary_name'])
+                            cfg['is_installed'] = bool(full)
+                            if full: cfg['binary_subdir'] = rel
+                        elif cfg.get('run_mode') == 'native_gui':
+                            if cfg.get('java_app'):
+                                main_jar = cfg.get('main_jar', '')
+                                jar_path = os.path.join(ppath, 'bin', main_jar)
+                                cfg['is_installed'] = os.path.isfile(jar_path)
+                            else:
+                                launch_command = cfg.get('launch_command', '')
+                                if launch_command:
+                                    launch_path = launch_command if os.path.isabs(launch_command) else os.path.join(ppath, cfg.get('working_dir', ''), launch_command)
+                                    cfg['is_installed'] = os.path.isfile(launch_path)
+                                else:
+                                    cfg['is_installed'] = True
+                        elif cfg.get('run_mode') == 'native_java_cli':
                             main_jar = cfg.get('main_jar', '')
                             jar_path = os.path.join(ppath, 'bin', main_jar)
                             cfg['is_installed'] = os.path.isfile(jar_path)
-                        else:
-                            launch_command = cfg.get('launch_command', '')
-                            if launch_command:
-                                launch_path = launch_command if os.path.isabs(launch_command) else os.path.join(ppath, cfg.get('working_dir', ''), launch_command)
-                                cfg['is_installed'] = os.path.isfile(launch_path)
-                            else:
-                                cfg['is_installed'] = True
-                    elif cfg.get('run_mode') == 'native_java_cli':
-                        main_jar = cfg.get('main_jar', '')
-                        jar_path = os.path.join(ppath, 'bin', main_jar)
-                        cfg['is_installed'] = os.path.isfile(jar_path)
-                    elif cfg.get('run_mode') == 'webapp':
-                        entry = cfg.get('webapp_entry', 'index.html')
-                        entry_path = os.path.join(ppath, entry)
-                        cfg['is_installed'] = os.path.isfile(entry_path)
-                    else: cfg['is_installed'] = True
+                        elif cfg.get('run_mode') == 'webapp':
+                            entry = cfg.get('webapp_entry', 'index.html')
+                            entry_path = os.path.join(ppath, entry)
+                            cfg['is_installed'] = os.path.isfile(entry_path)
+                        else: cfg['is_installed'] = True
 
-                    if 'category' not in cfg: cfg['category'] = "默认分类"
-                    plugins[cfg['id']] = cfg
-                except Exception as e:
-                    log(f"[WARN] Skip invalid plugin config: {cpath} ({e})")
+                        if 'category' not in cfg: cfg['category'] = "默认分类"
+                        plugins[cfg['id']] = cfg
+                    except Exception as e:
+                        log(f"[WARN] Skip invalid plugin config: {cpath} ({e})")
 
-    load_all_plugins._cache = plugins
-    load_all_plugins._cache_time = now
-    return plugins
+        load_all_plugins._cache = plugins
+        load_all_plugins._cache_time = time.time()
+        return plugins
 
 def invalidate_plugin_cache():
     """Clear plugin config cache so newly installed binaries are detected immediately."""
-    if hasattr(load_all_plugins, '_cache'):
-        delattr(load_all_plugins, '_cache')
-    if hasattr(load_all_plugins, '_cache_time'):
-        delattr(load_all_plugins, '_cache_time')
+    with _plugin_cache_lock:
+        if hasattr(load_all_plugins, '_cache'):
+            delattr(load_all_plugins, '_cache')
+        if hasattr(load_all_plugins, '_cache_time'):
+            delattr(load_all_plugins, '_cache_time')
 
 def extract_sample_name(file_obj):
     filename = file_obj
@@ -2751,18 +2522,19 @@ R_IMAGE_ARCHIVE_ACCELERATORS = (
     'https://v6.gh-proxy.org/',
     'https://cdn.gh-proxy.org/',
     'https://ghproxy.net/',
-    'https://gh-proxy.cn/',
-    'https://mirror.ghproxy.com/',
-    'https://gh.llkk.cc/',
+    'https://eo.gh-proxy.cn/github/',
+    'https://z2.gh-proxy.cn/github/',
+    'https://cf.gh-proxy.cn/github/',
     'https://hubp.llkk.cc/',
 )
 R_LEGACY_DOCKER_IMAGE = f'{R_DOCKER_IMAGE_REPOSITORY}:latest'
-R_CUSTOM_RECIPE_VERSION = 5
+R_CUSTOM_RECIPE_VERSION = 6
 R_CUSTOM_IMAGE = f'primigenius-r-base:r{R_VERSION}-bioc{BIOCONDUCTOR_VERSION}-v{R_CUSTOM_RECIPE_VERSION}'
 R_LEGACY_CUSTOM_IMAGES = (
     'primigenius-r-base:install-v2',
     f'primigenius-r-base:r{R_VERSION}-bioc{BIOCONDUCTOR_VERSION}-v3',
     f'primigenius-r-base:r{R_VERSION}-bioc{BIOCONDUCTOR_VERSION}-v4',
+    f'primigenius-r-base:r{R_VERSION}-bioc{BIOCONDUCTOR_VERSION}-v5',
 )
 R_LIBRARY_GENERATION = f'r{R_VERSION}-bioc{BIOCONDUCTOR_VERSION}'
 R_LEGACY_LIBS_DIR = os.path.join(APP_INSTALL_DIR, 'r_libs')
@@ -2770,6 +2542,8 @@ R_LEGACY_BACKEND_LIBS_DIR = os.path.join(BASE_DIR, 'r_libs')
 R_LIBS_DIR = os.path.join(APP_INSTALL_DIR, f'r_libs_{R_LIBRARY_GENERATION.replace(".", "_")}')
 R_RUNTIME_STATE_FILE = os.path.join(APP_INSTALL_DIR, '.primigenius_r_runtime.json')
 R_PACKAGE_LOCK_FILE = os.path.join(APP_INSTALL_DIR, '.primigenius_r_package.lock')
+R_LIBS_DIR = resolve_library(R_LIBS_DIR, (R_LEGACY_LIBS_DIR, R_LEGACY_BACKEND_LIBS_DIR),
+                             R_RUNTIME_STATE_FILE, R_VERSION, BIOCONDUCTOR_VERSION)
 os.makedirs(R_LIBS_DIR, exist_ok=True)
 R_LIBS_ENV = {'R_LIBS': '/r_libs:/usr/local/lib/R/site-library:/usr/lib/R/library', 'LANG': 'en_US.UTF-8', 'LC_ALL': 'en_US.UTF-8'}
 # Use Ubuntu's supported versioned toolchain; unversioned Noble Rust is too old.
@@ -2780,6 +2554,7 @@ R_SYSTEM_DEPS = (
     'libuv1-dev libgdal-dev libproj-dev libgeos-dev libudunits2-dev '
     'libharfbuzz-dev libfribidi-dev libfontconfig1-dev libfreetype-dev '
     'libpng-dev libtiff-dev libjpeg-dev libcairo2-dev libxt-dev '
+    'libtcl8.6 libtk8.6 tcl8.6-dev tk8.6-dev tcl-dev tk-dev '
     'libcurl4-openssl-dev libxml2-dev libssl-dev libgit2-dev '
     'zlib1g-dev libbz2-dev liblzma-dev libsqlite3-dev'
 )
@@ -2788,6 +2563,10 @@ _R_RUST_CHECK = (
     f'dpkg --compare-versions "$(rustc --version | cut -d \' \' -f2)" ge {R_RUST_MIN_VERSION} && '
     f'dpkg --compare-versions "$(cargo --version | cut -d \' \' -f2)" ge {R_RUST_MIN_VERSION} '
     f'|| {{ echo "[SYS-DEPS] Rust/Cargo >= {R_RUST_MIN_VERSION} required; R installation stopped." >&2; exit 1; }}; '
+)
+R_TCLTK_CHECK = (
+    'suppressWarnings(library(tcltk)); '
+    'stopifnot(tclvalue(tcl("expr", "1+1")) == "2"); '
 )
 _R_RUST_SETUP = (
     f'ln -sf /usr/bin/rustc-{R_RUST_SERIES} /usr/local/bin/rustc && '
@@ -2934,7 +2713,7 @@ def _install_pinned_r_image_archive(client):
             result = mgr._run_wsl(f'podman load -i {shlex.quote(wsl_path)}', timeout=24 * 60 * 60)
             if result is None or result.returncode != 0:
                 detail = ((getattr(result, 'stderr', '') or '') or (getattr(result, 'stdout', '') or '')).strip()
-                raise RuntimeError(detail or 'podman load failed')
+                raise RuntimeError(detail or 'Image archive import failed')
         log('[ARCHIVE_STATUS] Verifying')
         client = get_docker_client() or client
         image = client.images.get(R_DOCKER_IMAGE_TAGGED)
@@ -3212,7 +2991,7 @@ def _looks_like_app_internal_home(path_value):
 def _resolve_windows_gui_home():
     """Return a real Windows profile dir for native Swing apps.
 
-    Podman integration can leave USERPROFILE/HOME pointing at the app-local
+    Runtime integration can leave USERPROFILE/HOME pointing at the app-local
     podman-config directory. Java 8's Windows file chooser then asks the Shell
     API for Desktop and can crash before showing the open-file dialog.
     """
@@ -3407,32 +3186,13 @@ _R_PACKAGE_RW_LOCK = _RPackageRWLock()
 
 
 def _r_system_deps_prefix():
-    """Prepare and verify the complete build environment before running any R installer."""
-    return (
-        'set -e; '
-        'r_deps_ready=1; '
-        f'for r_dep in locales {R_SYSTEM_DEPS}; do '
-        '  if [ "$(dpkg-query -W -f=\'${Status}\' "$r_dep" 2>/dev/null)" != "install ok installed" ]; then '
-        '    r_deps_ready=0; break; '
-        '  fi; '
-        'done; '
-        'if [ "$r_deps_ready" != 1 ]; then '
-        '  echo "[SYS-DEPS] Installing R system dependencies..."; '
-        + _R_APT_HTTPS_SETUP + ' '
-        '  apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=30 update && '
-        f'  DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=30 install -y --no-install-recommends locales {R_SYSTEM_DEPS} '
-        '  || { echo "[SYS-DEPS] System dependency installation failed; R installation stopped." >&2; exit 1; }; '
-        '  sed -i \'/en_US.UTF-8/s/^# //g\' /etc/locale.gen; '
-        '  locale-gen en_US.UTF-8; '
-        'fi; '
-        + _R_RUST_SETUP
-        + 'export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8; '
-    )
+    """Compatibility preflight only; user machines never build the R environment."""
+    return 'set -e; ' + _R_RUST_CHECK + 'export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8; '
 
 
 def _r_custom_recipe_text():
     lines = [
-        f'FROM {R_DOCKER_IMAGE}',
+        f'FROM docker.io/{R_DOCKER_IMAGE}',
         f'LABEL org.primigenius.r-version="{R_VERSION}"',
         f'LABEL org.primigenius.bioconductor-version="{BIOCONDUCTOR_VERSION}"',
         f'LABEL org.primigenius.base-digest="{R_DOCKER_IMAGE_DIGEST}"',
@@ -3541,154 +3301,113 @@ def _custom_r_image_matches_contract(image):
 
 
 def _ensure_pinned_r_base_image(client=None, progress_cb=None):
-    """Ensure the immutable R base image through the common resilient pull path."""
-    client = client or get_docker_client()
-    if not client:
-        raise RuntimeError('Podman is not running')
-    if _image_exists_locally(client, R_DOCKER_IMAGE):
-        _image_exists_cache[R_DOCKER_IMAGE] = True
-        return True
-    if progress_cb:
-        progress_cb(f'[SYSTEM] Pulling pinned R image: {R_DOCKER_IMAGE}')
-    pull_image_with_progress(client, R_DOCKER_IMAGE)
-    _ensure_image_exists_after_pull(client, R_DOCKER_IMAGE, R_DOCKER_IMAGE)
+    _offline_r_environment().ensure()
     _image_exists_cache[R_DOCKER_IMAGE] = True
     return True
 
+
 def _get_r_image():
-    """Return the best available R image: custom image with system deps if built, else base image."""
-    if R_CUSTOM_IMAGE in _image_exists_cache:
-        return R_CUSTOM_IMAGE
-    client = get_docker_client()
-    if client:
-        try:
-            image = client.images.get(R_CUSTOM_IMAGE)
-            if _custom_r_image_matches_contract(image):
-                _image_exists_cache[R_CUSTOM_IMAGE] = True
-                return R_CUSTOM_IMAGE
-        except Exception:
-            pass
-    return R_DOCKER_IMAGE
+    # Pin every task to the validated immutable identity, never a moving tag.
+    image_id = _offline_r_environment().ensure()
+    _image_exists_cache[image_id] = True
+    return image_id
+
 
 def _ensure_custom_r_image(client=None, silent=False, progress_cb=None):
-    """Build custom R image with system deps pre-installed if it doesn't exist.
-    Only called when R base image is already available.
-    silent: if True, suppress SSE log output (build logs go to backend console only)."""
-    if R_CUSTOM_IMAGE in _image_exists_cache:
+    try:
+        _offline_r_environment().ensure()
         return True
-    if not client:
-        client = get_docker_client()
-    if not client:
-        return False
-    try:
-        image = client.images.get(R_CUSTOM_IMAGE)
-        if _custom_r_image_matches_contract(image):
-            _image_exists_cache[R_CUSTOM_IMAGE] = True
-            return True
-    except docker.errors.ImageNotFound:
-        pass
-    except Exception:
-        pass
-    _saved_run_id = getattr(_LOG_CONTEXT, 'run_id', None)
-    _saved_channel = getattr(_LOG_CONTEXT, 'channel', None)
-    if silent:
-        _LOG_CONTEXT.run_id = None
-        _LOG_CONTEXT.channel = None
-    try:
-        try:
-            _ensure_pinned_r_base_image(client, progress_cb=progress_cb)
-        except docker.errors.ImageNotFound:
-            return False
-        except Exception as e:
-            log(f'[WARN] Pinned R base image unavailable: {e}')
-            return False
-        dockerfile_dir = os.path.join(APP_INSTALL_DIR, '.docker')
-        os.makedirs(dockerfile_dir, exist_ok=True)
-        dockerfile_path = os.path.join(dockerfile_dir, 'Dockerfile.r_base')
-        with open(dockerfile_path, 'w', encoding='utf-8') as f:
-            f.write(_r_custom_recipe_text())
-        msg = f'[SYSTEM] Building custom R image {R_CUSTOM_IMAGE} with system deps...'
-        log(msg)
+    except Exception as exc:
         if progress_cb:
-            progress_cb(msg)
-        apt_mirrors = _ordered_r_apt_mirrors()
-        build_errors = []
-        for attempt, apt_mirror in enumerate(apt_mirrors, start=1):
-            msg = f'[R-APT] Build source {attempt}/{len(apt_mirrors)}: {apt_mirror}'
-            log(msg)
-            if progress_cb:
-                progress_cb(msg)
-            try:
-                stream = client.api.build(
-                    path=dockerfile_dir,
-                    dockerfile=dockerfile_path,
-                    tag=R_CUSTOM_IMAGE,
-                    rm=True,
-                    forcerm=True,
-                    decode=True,
-                    pull=False,
-                    buildargs={'APT_MIRROR': apt_mirror},
-                )
-                for chunk in stream:
-                    if not isinstance(chunk, dict):
-                        continue
-                    if chunk.get('stream'):
-                        line = str(chunk.get('stream')).strip()
-                        if line:
-                            msg = f'[BUILD] {line}'
-                            log(msg)
-                            if progress_cb:
-                                progress_cb(msg)
-                    if chunk.get('error'):
-                        raise RuntimeError(str(chunk.get('error')))
-                break
-            except Exception as build_error:
-                build_errors.append(f'{apt_mirror}: {build_error}')
-                if attempt >= len(apt_mirrors):
-                    raise RuntimeError('all APT build sources failed: ' + '; '.join(build_errors))
-                msg = f'[R-APT] Source failed, switching mirror: {build_error}'
-                log(msg)
-                if progress_cb:
-                    progress_cb(msg)
-        built_image = client.images.get(R_CUSTOM_IMAGE)
-        if not _custom_r_image_matches_contract(built_image):
-            raise RuntimeError('custom R image labels do not match the pinned runtime contract')
-        validation_container = None
+            progress_cb('[R-ENV] ' + str(exc))
+        return False
+
+
+_OFFLINE_R_ENV = None
+_OFFLINE_R_ENV_LOCK = threading.Lock()
+
+
+def _validate_offline_r_environment(client, image_id):
+    # Read-only mount; installation jobs prepare the environment before taking
+    # the package writer lock, so validation cannot deadlock against them.
+    with _R_PACKAGE_RW_LOCK.read():
+        script = (
+            '.libPaths(c("/r_libs", .libPaths())); '
+            'stopifnot(as.character(getRversion()) == "' + R_VERSION + '"); '
+            + R_TCLTK_CHECK +
+            'p <- installed.packages(lib.loc="/r_libs"); '
+            'bad <- p[,"Package"][!vapply(p[,"Package"], requireNamespace, logical(1), quietly=TRUE)]; '
+            'if(length(bad)) stop(paste("Existing packages cannot load:", paste(bad,collapse=", "))); '
+            'cat("R_ENV_VALIDATED\\n")'
+        )
+        deps = 'set -e; for dep in locales ' + R_SYSTEM_DEPS + '; do '
+        deps += 'dpkg-query -W -f=\'${Status}\' "$dep" | grep -qx "install ok installed"; done; '
+        command = deps + _R_RUST_CHECK + shlex.join(['Rscript', '-e', script])
+        container = None
         try:
-            validation_container = client.containers.run(
-                image=R_CUSTOM_IMAGE,
-                command=['bash', '-ec', _R_RUST_CHECK + shlex.join(['Rscript', '-e', f'stopifnot(as.character(getRversion()) == "{R_VERSION}")'])],
-                detach=True,
-                platform='linux/amd64',
-                log_config={'type': 'json-file'},
-            )
-            validation_result = _robust_container_wait(validation_container, timeout=120)
-            validation_exit = int(validation_result.get('StatusCode', -1)) if isinstance(validation_result, dict) else -1
-            if validation_exit != 0:
-                raise RuntimeError(f'custom R image failed the R/Rust/Cargo smoke test (exit {validation_exit})')
+            container = client.containers.run(image_id, ['bash', '-ec', command],
+                mounts=[Mount(target='/r_libs', source=R_LIBS_DIR, type='bind', read_only=True)],
+                environment=R_LIBS_ENV, network_mode='none', detach=True,
+                platform='linux/amd64', log_config={'type':'json-file'})
+            result = _robust_container_wait(container, timeout=600)
+            output = container.logs().decode('utf-8', errors='replace')
+            if int(result.get('StatusCode', -1)) != 0 or 'R_ENV_VALIDATED' not in output:
+                raise RuntimeError('R environment compatibility validation failed: ' + output[-8000:])
         finally:
-            if validation_container is not None:
+            if container is not None:
                 try:
-                    validation_container.remove(force=True)
-                except Exception:
-                    pass
-        _image_exists_cache[R_CUSTOM_IMAGE] = True
-        msg = f'[SYSTEM] Custom R image {R_CUSTOM_IMAGE} built successfully'
-        log(msg)
-        if progress_cb:
-            progress_cb(msg)
-        return True
-    except Exception as e:
-        msg = f'[WARN] Failed to build custom R image: {e}'
-        log(msg)
-        if progress_cb:
-            progress_cb(msg)
-        _image_exists_cache.pop(R_CUSTOM_IMAGE, None)
-        return False
-    finally:
-        if silent:
-            _LOG_CONTEXT.run_id = _saved_run_id
-            _LOG_CONTEXT.channel = _saved_channel
+                    # Persist diagnostic output before removing the owned fixture.
+                    for line in container.logs().decode('utf-8', errors='replace').splitlines():
+                        log('[R-ENV-VERIFY] ' + line)
+                finally:
+                    container.remove(force=True)
+
+
+def _check_offline_r_space(manifest):
+    mgr = _get_podman_manager()
+    required = manifest['required_free_bytes']
+    # Archive is imported in place; no second decompressed host tar is created.
+    existing = mgr.podman_data_dir
+    while not os.path.exists(existing):
+        existing = os.path.dirname(existing)
+    if shutil.disk_usage(existing).free < required:
+        raise RuntimeError(f'R environment needs at least {required // (1024*1024)} MiB free on the runtime disk')
+    result = mgr._run_wsl("df -Pk /var/lib/containers/storage | tail -1", timeout=10)
+    if result is None or result.returncode != 0:
+        raise RuntimeError('Cannot verify free space in the runtime filesystem')
+    try:
+        available = int(result.stdout.splitlines()[-1].split()[3]) * 1024
+    except (ValueError, IndexError):
+        raise RuntimeError('Invalid runtime free-space response')
+    if available < required:
+        raise RuntimeError('Insufficient free space inside the runtime filesystem')
+
+
+def _offline_r_client():
+    from embedded_runtime import OwnedDockerClient
+    mgr = _get_podman_manager()
+    if getattr(mgr, '_wsl_storage_missing', False):
+        raise RuntimeError(mgr.runtime.last_error)
+    return OwnedDockerClient(owner=mgr.runtime.identity, base_url=mgr.runtime.url,
+                             version=DOCKER_API_VERSION, timeout=1800)
+
+
+def _offline_r_environment():
+    global _OFFLINE_R_ENV
+    if _OFFLINE_R_ENV is None:
+        with _OFFLINE_R_ENV_LOCK:
+            if _OFFLINE_R_ENV is None:
+                from offline_r import OfflineR
+                default_bundle = os.path.join(APP_INSTALL_DIR, 'resources', 'r-environment') if IS_FROZEN else os.path.join(APP_INSTALL_DIR, 'runtime', 'r-environment')
+                _OFFLINE_R_ENV = OfflineR(
+                    os.environ.get('PRIMIGENIUS_R_BUNDLE') or default_bundle,
+                    os.path.join(_get_podman_manager().podman_config_dir, 'r-environment'),
+                    R_CUSTOM_RECIPE_SHA256, R_CUSTOM_IMAGE, _custom_r_image_matches_contract,
+                    _validate_offline_r_environment, _offline_r_client, _check_offline_r_space, log,
+                    consume_archive=IS_FROZEN,
+                    on_state_change=lambda state: _publish_runtime_state('r', state))
+    return _OFFLINE_R_ENV
+
 
 R_REPOSITORY_BUNDLES = (
     ('tuna', 'https://mirrors.tuna.tsinghua.edu.cn/CRAN', 'https://mirrors.tuna.tsinghua.edu.cn/bioconductor'),
@@ -3700,6 +3419,7 @@ R_REPOSITORY_BUNDLES = (
 R_RUNTIME = {'repos': 'auto'}
 _R_REPO_AUTO_CACHE = {'selection': None, 'time': 0.0}
 _R_REPO_AUTO_LOCK = threading.Lock()
+_R_REPO_PROBE_LOCK = threading.Lock()
 
 
 def _normalize_cran_repo_url(url):
@@ -3734,6 +3454,23 @@ def _resolve_r_repo_bundle(repo_url):
     cran_repo = _normalize_cran_repo_url(repo_url)
     bioc_mirror = _resolve_bioc_mirror_from_cran(cran_repo)
     return cran_repo, bioc_mirror
+
+
+def _schedule_r_repo_probe():
+    if not _R_REPO_PROBE_LOCK.acquire(blocking=False):
+        return
+    def worker():
+        try:
+            _select_auto_r_repo_bundle()
+        except Exception as exc:
+            log(f'[WARN] Repository probe failed: {exc}')
+        finally:
+            _R_REPO_PROBE_LOCK.release()
+    try:
+        threading.Thread(target=worker, name='r-repository-probe', daemon=True).start()
+    except Exception:
+        _R_REPO_PROBE_LOCK.release()
+        raise
 
 
 def _probe_r_repo_bundle(name, cran_repo, bioc_mirror, timeout=4.0):
@@ -3835,6 +3572,7 @@ def _save_r_runtime_state(**updates):
         'recipe_version': R_CUSTOM_RECIPE_VERSION,
         'recipe_sha256': R_CUSTOM_RECIPE_SHA256,
         'library_generation': R_LIBRARY_GENERATION,
+        'library_path': R_LIBS_DIR,
         'updated_at': int(time.time()),
     })
     tmp_path = R_RUNTIME_STATE_FILE + '.tmp'
@@ -3850,156 +3588,24 @@ R_RUNTIME['repos'] = _saved_repo_mode if _saved_repo_mode else 'auto'
 
 
 def _complete_r_runtime_migration(client=None, lock_held=False):
-    """Retire legacy R state only after the pinned runtime has succeeded."""
-    if not lock_held:
-        with _R_PACKAGE_RW_LOCK.write():
-            return _complete_r_runtime_migration(client, lock_held=True)
-    current_library = os.path.normcase(os.path.abspath(R_LIBS_DIR))
-    legacy_libraries = []
-    for candidate in (R_LEGACY_LIBS_DIR, R_LEGACY_BACKEND_LIBS_DIR):
-        path = os.path.abspath(candidate)
-        key = os.path.normcase(path)
-        if (key != current_library and os.path.basename(path).lower() == 'r_libs' and
-                all(os.path.normcase(existing) != key for existing in legacy_libraries)):
-            legacy_libraries.append(path)
-
-    state = _load_r_runtime_state()
-    if (state.get('migration_complete') and state.get('cleanup_complete') and
-            state.get('library_generation') == R_LIBRARY_GENERATION and
-            state.get('recipe_sha256') == R_CUSTOM_RECIPE_SHA256 and
-            not any(os.path.isdir(path) for path in legacy_libraries)):
-        return
-    client = client or get_docker_client()
-    if not client or not _image_exists_locally(client, R_DOCKER_IMAGE):
-        return
-    try:
-        image = client.images.get(R_CUSTOM_IMAGE)
-        if not _custom_r_image_matches_contract(image):
-            return
-    except Exception:
-        return
-
-    validation_container = None
-    try:
-        validation_code = (
-            '.libPaths(c("/r_libs", .libPaths())); '
-            'stopifnot(as.character(getRversion()) == "' + R_VERSION + '"); '
-            'stopifnot(requireNamespace("BiocManager", quietly=TRUE)); '
-            'stopifnot(as.character(BiocManager::version()) == "' + BIOCONDUCTOR_VERSION + '")'
-        )
-        validation_container = client.containers.run(
-            image=R_CUSTOM_IMAGE,
-            command=['Rscript', '-e', validation_code],
-            mounts=[Mount(target='/r_libs', source=R_LIBS_DIR, type='bind', read_only=True)],
-            environment=R_LIBS_ENV,
-            detach=True,
-            platform='linux/amd64',
-            log_config={'type': 'json-file'},
-        )
-        validation_result = _robust_container_wait(validation_container, timeout=120)
-        validation_exit = int(validation_result.get('StatusCode', -1)) if isinstance(validation_result, dict) else -1
-        if validation_exit != 0:
-            log(f'[WARN] R migration validation exited with code {validation_exit}')
-            return
-    except Exception as e:
-        log(f'[WARN] R migration validation not yet ready: {e}')
-        return
-    finally:
-        if validation_container is not None:
-            try:
-                validation_container.remove(force=True)
-            except Exception:
-                pass
-
-    cleanup = {
-        'legacy_library_removed': False,
-        'legacy_libraries_removed': [],
-        'legacy_libraries_pending': [],
-        'legacy_tags_removed': [],
-        'legacy_tags_pending': [],
-    }
-    for legacy_library in legacy_libraries:
-        if not os.path.isdir(legacy_library):
-            continue
-        try:
-            shutil.rmtree(legacy_library)
-            cleanup['legacy_library_removed'] = True
-            cleanup['legacy_libraries_removed'].append(legacy_library)
-            log(f'[SYSTEM] Removed legacy R library after successful migration: {legacy_library}')
-        except Exception as e:
-            cleanup['legacy_libraries_pending'].append(legacy_library)
-            log(f'[WARN] Legacy R library cleanup pending for {legacy_library}: {e}')
-
-    for old_ref in (R_LEGACY_DOCKER_IMAGE,) + tuple(R_LEGACY_CUSTOM_IMAGES):
-        try:
-            client.images.remove(image=old_ref, force=False, noprune=True)
-            cleanup['legacy_tags_removed'].append(old_ref)
-            log(f'[SYSTEM] Removed legacy R image tag after successful migration: {old_ref}')
-        except Exception:
-            try:
-                client.images.get(old_ref)
-                cleanup['legacy_tags_pending'].append(old_ref)
-            except Exception:
-                pass
-    cleanup_complete = (
-        not any(os.path.isdir(path) for path in legacy_libraries) and
-        not cleanup['legacy_tags_pending']
-    )
-    try:
-        _save_r_runtime_state(
-            migration_complete=True,
-            cleanup_complete=cleanup_complete,
-            migrated_at=int(time.time()),
-            cleanup=cleanup,
-            repo_mode=R_RUNTIME.get('repos', 'auto'),
-        )
-    except Exception as e:
-        log(f'[WARN] Failed to save R migration cleanup state: {e}')
-
-
-
-
-
-
+    """Legacy compatibility hook: never retire user libraries or images automatically."""
+    return
 
 
 # install jobs: job_id -> {'status': 'pending/running/done/failed', 'log': deque([...]), 'exit_code': int}
-INSTALL_JOBS = {}
+INSTALL_JOBS = PersistentRegistry(_STATE_DATABASE, 'r-install', jobs=True)
 
 
 def ensure_r_docker_image():
-    r_img = _get_r_image()
-    if r_img in _image_exists_cache:
-        return True, 'R available'
-    client = get_docker_client()
-    if not client:
-        return False, 'Docker is not running'
     try:
-        if r_img == R_DOCKER_IMAGE:
-            _ensure_pinned_r_base_image(client)
-        else:
-            client.images.get(r_img)
-        _image_exists_cache[r_img] = True
+        _offline_r_environment().ensure()
         return True, 'R available'
-    except docker.errors.ImageNotFound:
-        pass
-    except Exception as e:
-        return False, f'Docker error: {e}'
-    if r_img != R_DOCKER_IMAGE:
-        try:
-            client.images.get(R_DOCKER_IMAGE)
-            _image_exists_cache[R_DOCKER_IMAGE] = True
-            return True, 'R available'
-        except docker.errors.ImageNotFound:
-            pass
-        except Exception as e:
-            return False, f'Docker error: {e}'
-    return False, 'image_not_found'
+    except Exception as exc:
+        return False, str(exc)
 
 
 def _run_r_container_with_realtime_logs(client, command, mounts, environment, line_handler=None, poll_seconds=0.5, install_system_deps=False):
-    """Run an R container in detached mode and stream logs without Docker logs follow.
-    If install_system_deps is True, prepend apt-get install for common R system dependencies."""
+    """Run the validated offline environment with existing log/cancel semantics."""
     container = None
     collected = []
 
@@ -4015,7 +3621,7 @@ def _run_r_container_with_realtime_logs(client, command, mounts, environment, li
         r_image = _get_r_image()
         if r_image != R_CUSTOM_IMAGE and install_system_deps:
             if _ensure_custom_r_image(client, silent=True):
-                r_image = R_CUSTOM_IMAGE
+                r_image = _get_r_image()
         needs_deps_prefix = install_system_deps and r_image != R_CUSTOM_IMAGE
         if needs_deps_prefix:
             deps_check = _r_system_deps_prefix()
@@ -4132,14 +3738,12 @@ def _ensure_svglite_installed(client):
 def _enqueue_job_log(job_id, line):
     job = INSTALL_JOBS.get(job_id)
     if not job: return
-    dq = job['log']
-    dq.append(line)
-    if len(dq) > 1000:
-        while len(dq) > 800:
-            dq.popleft()
     run_id = job.get('sse_run_id')
     if run_id:
         _publish_run_log_event(run_id, 'R', line)
+    else:
+        job['log'].append(line)
+
 
 
 def _create_r_script_mount(r_code, prefix='r_job'):
@@ -4161,72 +3765,7 @@ def _create_r_script_mount(r_code, prefix='r_job'):
 
 
 def _stream_container_logs_realtime(container, line_handler, poll_seconds=0.5):
-    pending = ''
-
-    def _emit_text(text):
-        nonlocal pending
-        clean = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]+', '', str(text or ''))
-        pending += clean.replace('\r\n', '\n').replace('\r', '\n')
-        parts = pending.split('\n')
-        pending = parts.pop() if parts else ''
-        for line in parts:
-            line = line.rstrip('\r')
-            if line.strip():
-                line_handler(line)
-
-    # Preferred path: attach stream with demux to avoid docker multiplexed binary framing noise.
-    try:
-        stream = container.attach(stream=True, logs=True, stdout=True, stderr=True, demux=True)
-        for chunk in stream:
-            if isinstance(chunk, tuple):
-                stdout_chunk, stderr_chunk = chunk
-                if stdout_chunk:
-                    _emit_text(stdout_chunk.decode('utf-8', errors='replace'))
-                if stderr_chunk:
-                    _emit_text(stderr_chunk.decode('utf-8', errors='replace'))
-            else:
-                text = chunk.decode('utf-8', errors='replace') if isinstance(chunk, bytes) else str(chunk)
-                _emit_text(text)
-        if pending.strip():
-            line_handler(pending.strip())
-        return
-    except TypeError:
-        pass
-    except Exception:
-        pass
-
-    # Fallback path: polling full logs and emitting only incremental lines.
-    seen = 0
-    warned = False
-
-    def _read_once():
-        nonlocal seen, warned
-        try:
-            out = container.logs(stdout=True, stderr=True)
-        except Exception:
-            if not warned:
-                warned = True
-            return
-        if not out:
-            return
-        text = out.decode('utf-8', errors='replace') if isinstance(out, bytes) else str(out)
-        lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
-        for line in lines[seen:]:
-            line = line.rstrip('\r')
-            if line.strip():
-                line_handler(line)
-        seen = len(lines)
-
-    while True:
-        _read_once()
-        try:
-            container.reload()
-            if container.status != 'running':
-                break
-        except Exception:
-            break
-        time.sleep(poll_seconds)
-    _read_once()
+    _stream_container_logs_thread(container, threading.Event(), {}, line_handler)
 
 
 
@@ -4234,7 +3773,23 @@ def _stream_container_logs_realtime(container, line_handler, poll_seconds=0.5):
 
 
 def _run_r_install_job(job_id, pkgs, repo=None, local_path=None, skip_repair=False):
+    try:
+        return _execute_r_install_job(job_id, pkgs, repo, local_path, skip_repair)
+    except Exception as exc:
+        # Keep the worker and old status API usable after an unexpected failure.
+        INSTALL_JOBS[job_id].update(status='failed', exit_code=-1, error=str(exc))
+        _enqueue_job_log(job_id, '[ERROR] ' + str(exc))
+
+
+def _execute_r_install_job(job_id, pkgs, repo=None, local_path=None, skip_repair=False):
     job = INSTALL_JOBS[job_id]
+    try:
+        _offline_r_environment().ensure()
+    except Exception as exc:
+        _enqueue_job_log(job_id, '[ERROR] ' + str(exc))
+        _LOG_JOURNAL.flush()
+        job.update(status='failed', exit_code=-1)
+        return
     _enqueue_job_log(job_id, '[SYSTEM] Waiting for exclusive R package-library lock...')
     with _R_PACKAGE_RW_LOCK.write():
         _enqueue_job_log(job_id, '[SYSTEM] Acquired exclusive R package-library lock; dependencies will be rechecked.')
@@ -4249,10 +3804,11 @@ def _run_r_install_job_locked(job_id, pkgs, repo=None, local_path=None, skip_rep
     job['status'] = 'running'
     client = get_docker_client()
     if not client:
-        job['status'] = 'failed'
         job['exit_code'] = -1
-        _enqueue_job_log(job_id, 'Docker is not running')
-        log('Docker is not running')
+        _enqueue_job_log(job_id, 'Runtime is not running')
+        _LOG_JOURNAL.flush()
+        job['status'] = 'failed'
+        log('Runtime is not running')
         return
 
     repos, bioc_mirror = _resolve_r_repo_bundle(repo or R_RUNTIME.get('repos'))
@@ -4494,7 +4050,7 @@ def _run_r_install_job_locked(job_id, pkgs, repo=None, local_path=None, skip_rep
         if r_image != R_CUSTOM_IMAGE:
             _enqueue_job_log(job_id, '[SYSTEM] Preparing R build environment...')
             if _ensure_custom_r_image(client, silent=True, progress_cb=lambda line: _enqueue_job_log(job_id, line)):
-                r_image = R_CUSTOM_IMAGE
+                r_image = _get_r_image()
         if r_image == R_CUSTOM_IMAGE:
             deps_prefix = ''
         else:
@@ -4516,20 +4072,26 @@ def _run_r_install_job_locked(job_id, pkgs, repo=None, local_path=None, skip_rep
         result = _robust_container_wait(container, timeout=None)
         exit_code = result.get('StatusCode', -1)
         job['exit_code'] = exit_code
-        job['status'] = 'done' if exit_code == 0 else 'failed'
         _enqueue_job_log(job_id, f'Process exited with code {exit_code}')
+        _LOG_JOURNAL.flush()
         log(f'Process exited with code {exit_code}')
+        # A failed batch can still install or replace some packages.
+        _bump_r_libs_revision('install-job-finished')
         if exit_code == 0:
-            _bump_r_libs_revision('install-job-success')
             _complete_r_runtime_migration(client, lock_held=True)
         try:
             container.remove()
         except:
             pass
+        job['status'] = 'done' if exit_code == 0 else 'failed'
     except Exception as e:
-        job['status'] = 'failed'
         job['exit_code'] = -2
-        _enqueue_job_log(job_id, f'Exception: {str(e)}')
+        try:
+            _bump_r_libs_revision('install-job-interrupted')
+            _enqueue_job_log(job_id, f'Exception: {str(e)}')
+            _LOG_JOURNAL.flush()
+        finally:
+            job['status'] = 'failed'
         log(f'Exception: {str(e)}')
     finally:
         if script_host_path:
@@ -4748,7 +4310,7 @@ def _run_rscript_docker(script_path, params, out_dir, plugin_dir, extra_mounts=N
                         preflight_r_image = _get_r_image()
                         if preflight_r_image != R_CUSTOM_IMAGE:
                             if _ensure_custom_r_image(client, silent=True):
-                                preflight_r_image = R_CUSTOM_IMAGE
+                                preflight_r_image = _get_r_image()
                         preflight_container = client.containers.run(
                             image=preflight_r_image,
                             command=["bash", "-c", ('' if preflight_r_image == R_CUSTOM_IMAGE else _r_system_deps_prefix()) + shlex.join(['Rscript', preflight_script_path])],
@@ -4764,6 +4326,7 @@ def _run_rscript_docker(script_path, params, out_dir, plugin_dir, extra_mounts=N
                         result = _robust_container_wait(preflight_container, timeout=300)
                         exit_code = result.get('StatusCode', -1)
                         if exit_code != 0:
+                            _bump_r_libs_revision('r-preflight-partial-install')
                             _drop_cached_r_preflight(preflight_cache_key)
                             preflight_error = f'R package pre-flight repair failed with exit code {exit_code}'
                             log(f'[ERROR] {preflight_error}')
@@ -4843,7 +4406,7 @@ def _run_rscript_docker(script_path, params, out_dir, plugin_dir, extra_mounts=N
     r_image = _get_r_image()
     if r_image != R_CUSTOM_IMAGE:
         if _ensure_custom_r_image(client, silent=True):
-            r_image = R_CUSTOM_IMAGE
+            r_image = _get_r_image()
     if r_image == R_CUSTOM_IMAGE:
         deps_prefix = ''
     else:
@@ -4968,7 +4531,7 @@ def serve_plugin_webapp(plugin_id, filename):
     return send_from_directory(directory, fname, mimetype=mimetype)
 
 
-_WEBAPP_FILE_TOKENS = {}
+_WEBAPP_FILE_TOKENS = PersistentRegistry(_STATE_DATABASE, 'webapp-file')
 _WEBAPP_FILE_TOKENS_LOCK = threading.Lock()
 
 
@@ -5722,31 +5285,64 @@ def update_plugin_category():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
 
+@app.route('/preview-plugin-archive', methods=['POST'])
+def preview_plugin_archive():
+    token = os.environ.get('PRIMIGENIUS_DESKTOP_TOKEN', '')
+    if not token or not secrets.compare_digest(token.encode(), request.headers.get('X-PrimiGenius-Desktop', '').encode()):
+        return jsonify(error='需要有效的桌面程序会话'), 403
+    try:
+        data = request.get_json() or {}
+        with zipfile.ZipFile(data['zipPath']) as archive:
+            _, prefix, _ = inspect_archive(archive)
+            file = str(data.get('file', ''))
+            info = archive.getinfo(prefix + file)
+            if info.file_size > 512 * 1024:
+                raise ValueError('文件超过 512 KiB 文本预览限制')
+            raw = archive.read(info)
+            if b'\0' in raw:
+                raise ValueError('二进制文件不能作为文本预览')
+            return jsonify(text=raw.decode('utf-8', errors='replace'))
+    except Exception as exc:
+        return jsonify(error=str(exc)), 400
+
+
+@app.route('/package-plugin-source', methods=['POST'])
+@app.route('/prepare-plugin-upload', methods=['POST'])
+def package_plugin_source():
+    token = os.environ.get('PRIMIGENIUS_DESKTOP_TOKEN', '')
+    if not token or not secrets.compare_digest(token.encode(), request.headers.get('X-PrimiGenius-Desktop', '').encode()):
+        return jsonify(error='需要有效的桌面程序会话'), 403
+    destination = None
+    try:
+        data = request.get_json() or {}
+        # The desktop main process supplies a native-dialog selection and owns cleanup.
+        descriptor, destination = tempfile.mkstemp(prefix='primigenius-market-', suffix='.zip')
+        os.close(descriptor)
+        if request.path == '/prepare-plugin-upload':
+            config, count = package_upload(data['zipPath'], destination, data.get('version'))
+        else:
+            config, count = pack_source(data['directory'], destination)
+        return jsonify(status='success', zipPath=destination, config=config, file_count=count)
+    except Exception as exc:
+        if destination:
+            try: os.unlink(destination)
+            except OSError: pass
+        return jsonify(status='error', message=str(exc)), 400
+
+
 @app.route('/install-plugin-panel', methods=['POST'])
 def install_plugin_panel():
     data = request.json
-    temp = tempfile.mkdtemp(prefix='primigenius_install_')
     try:
-
-        # extract uploaded zip
         with zipfile.ZipFile(data['zipPath'], 'r') as z:
-            z.extractall(temp)
-
-        # find config.json inside extracted tree
-        cfg_path = None
-        for r, d, f in os.walk(temp):
-            if 'config.json' in f:
-                cfg_path = os.path.join(r, 'config.json')
-                break
-
-        if not cfg_path:
-            try: shutil.rmtree(temp, ignore_errors=True)
-            except: pass
-            return jsonify({"status": "error", "message": "无法在压缩包中找到 config.json"})
-
-        cfg = _load_json_file(cfg_path)
-
-        # Check if plugin already exists (may have different folder name than id)
+            cfg, _, _ = inspect_archive(z)
+        expected = data.get('expected')
+        if expected:
+            origin = cfg.get('marketplace') or {}
+            if (cfg.get('id') != expected.get('id') or cfg.get('version') != expected.get('version') or
+                    origin.get('source') != expected.get('source') or
+                    origin.get('owner_github_id') != expected.get('owner_github_id')):
+                raise ValueError('插件内容与已验证的安装清单不一致')
         existing_cfg = find_config_by_id(cfg.get('id', ''))
         if existing_cfg:
             dest = os.path.dirname(existing_cfg)
@@ -5757,21 +5353,9 @@ def install_plugin_panel():
                 dest = os.path.join(PLUGINS_DIR, 'r', cfg['id'])
             else:
                 dest = os.path.join(PLUGINS_DIR, 'linux', cfg['id'])
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        if os.path.exists(dest):
-            try: shutil.rmtree(dest, ignore_errors=True)
-            except: pass
-
-        shutil.move(os.path.dirname(cfg_path), dest)
-
-        # Refresh plugin cache so new version is reflected
+        with path_lock(dest):
+            cfg = replace_plugin(data['zipPath'], dest)
         invalidate_plugin_cache()
-
-        # best-effort cleanup; do not treat cleanup failure as install failure
-        try:
-            shutil.rmtree(temp, ignore_errors=True)
-        except Exception as e:
-            log(f"[WARN] Failed to remove temp_install: {e}")
 
         return jsonify({
             "status": "success",
@@ -5779,8 +5363,6 @@ def install_plugin_panel():
             "version": cfg.get("version", "")
         })
     except Exception as e:
-        try: shutil.rmtree(temp, ignore_errors=True)
-        except: pass
         return jsonify({"status": "error", "message": str(e)})
 
 @app.route('/uninstall-plugin', methods=['POST'])
@@ -5881,7 +5463,7 @@ def _extract_plugin_payload_with_progress(src_path, target, progress_cb=None):
             try:
                 import gzip as _gzip
                 import tempfile as _tf
-                _tmp = os.path.join(_tf.gettempdir(), '_primigenius_extract_tmp.tar')
+                _tmp = target + '.decompressed.tar'
                 with _gzip.open(src_path, 'rb') as gz_in:
                     with open(_tmp, 'wb') as f_out:
                         shutil.copyfileobj(gz_in, f_out)
@@ -5995,7 +5577,7 @@ def _extract_plugin_payload_with_progress(src_path, target, progress_cb=None):
                 except tarfile.TarError:
                     try:
                         import gzip as _gzip2
-                        _tmp2 = os.path.join(tempfile.gettempdir(), '_primigenius_nested_tmp.tar')
+                        _tmp2 = tmp_extract + '.decompressed.tar'
                         with _gzip2.open(nested, 'rb') as gz2:
                             with open(_tmp2, 'wb') as fo2:
                                 shutil.copyfileobj(gz2, fo2)
@@ -6068,6 +5650,41 @@ def _extract_plugin_payload_with_progress(src_path, target, progress_cb=None):
 
 
 def _install_plugin_binary_impl(cfg, src_path, target, progress_cb=None):
+    # Extract beside the existing binary tree. A failed download/extraction must
+    # never delete the user's working plugin before the replacement is ready.
+    parent = os.path.dirname(os.path.abspath(target))
+    with path_lock(target):
+        staged = tempfile.mkdtemp(prefix='.bin-install-', dir=parent)
+        previous = staged + '.previous'
+        published = False
+        try:
+            _populate_plugin_binary(cfg, src_path, staged, progress_cb)
+            with os.scandir(staged) as entries:
+                if not any(entries):
+                    raise RuntimeError('The plugin package contains no files')
+            if os.path.lexists(target):
+                os.rename(target, previous)
+            try:
+                os.rename(staged, target)
+                published = True
+            except Exception:
+                if os.path.lexists(previous):
+                    os.rename(previous, target)
+                raise
+            invalidate_plugin_cache()
+            if progress_cb:
+                progress_cb(100, 'Installation complete')
+        finally:
+            if os.path.isdir(staged):
+                shutil.rmtree(staged)
+            if published and os.path.isdir(previous):
+                try:
+                    shutil.rmtree(previous)
+                except OSError as exc:
+                    log(f'[WARN] Previous plugin binary retained at {previous}: {exc}')
+
+
+def _populate_plugin_binary(cfg, src_path, target, progress_cb=None):
     if progress_cb:
         progress_cb(2, 'Preparing installation...')
 
@@ -6102,12 +5719,7 @@ def _install_plugin_binary_impl(cfg, src_path, target, progress_cb=None):
                 progress_cb(min(95, max(80, pct)), 'Applying permissions...')
 
     if progress_cb:
-        progress_cb(98, 'Refreshing plugin cache...')
-
-    invalidate_plugin_cache()
-
-    if progress_cb:
-        progress_cb(100, 'Installation complete')
+        progress_cb(98, 'Publishing verified plugin files...')
 
 
 @app.route('/setup-plugin-binary-start', methods=['POST'])
@@ -6137,8 +5749,11 @@ def setup_plugin_binary_start():
             log(f"[ERROR] setup-plugin-binary-start failed: {e}")
             _set_binary_install_job(job_id, status='failed', message='Installation failed', error=str(e))
 
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
+    try:
+        _BINARY_INSTALL_WORKERS.submit(_worker)
+    except queue.Full:
+        _set_binary_install_job(job_id, status='failed', message='Installation queue is full; retry after a running job completes')
+        return jsonify({'status': 'error', 'message': 'Installation queue is full; retry later', 'job_id': job_id})
     return jsonify({"status": "success", "job_id": job_id})
 
 
@@ -6449,6 +6064,7 @@ def _run_native_gui_plugin(cfg, data):
                     startupinfo=si,
                     creationflags=subprocess.CREATE_NEW_CONSOLE | subprocess.CREATE_NEW_PROCESS_GROUP,
                 )
+                _native_process_snapshot(proc)
                 log(f"[SYSTEM] Java process PID: {proc.pid}")
             else:
                 bat_path = os.path.join(java_dir, 'launch_gui.bat')
@@ -6546,6 +6162,7 @@ def _run_native_gui_plugin(cfg, data):
                 startupinfo=si,
                 creationflags=creationflags,
             )
+            _native_process_snapshot(proc)
             log(f"[SYSTEM] Native process PID: {proc.pid}")
             return jsonify({"status": "success", "message": f"{plugin_name} 已启动"})
         except Exception as e:
@@ -6556,6 +6173,7 @@ def _run_native_gui_plugin(cfg, data):
 
 
 def _run_native_java_cli_plugin(cfg, data):
+    run_start = datetime.datetime.now()
     _LOG_CONTEXT.channel = 'Linux'
     plugin_name = _get_plugin_name(cfg)
     log(f"[SYSTEM] Native Java CLI launch: {plugin_name}")
@@ -6580,6 +6198,8 @@ def _run_native_java_cli_plugin(cfg, data):
     if not host_out_dir:
         return jsonify({"status": "error", "message": "缺少输出目录"})
     os.makedirs(host_out_dir, exist_ok=True)
+
+    log_path = os.path.join(host_out_dir, f"PrimiGenius.{run_start:%Y-%m-%d_%H-%M-%S}.log")
 
     params = dict(data.get('params') or {})
     visible_file_set = set(data.get('_visibleFileParams') or [])
@@ -6705,13 +6325,11 @@ def _run_native_java_cli_plugin(cfg, data):
         start_dt = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         app_args = _build_app_args(task['params'], task['sample'])
         cmd_list = [java_exe] + jvm_args + ['-jar', jar_path] + app_args
-        safe_plugin_id = (cfg.get('id') or 'unknown').replace(' ', '_')
-        log_path = os.path.join(host_out_dir, f"{safe_plugin_id}.{task['sample']}.primigenius.log")
 
         log(f"[SYSTEM] === Running Native Java Task {idx + 1}/{len(tasks)}: {task['sample']} ===")
         log(f"[CMD] {' '.join(cmd_list)}")
 
-        with open(log_path, 'w', encoding='utf-8', buffering=1, errors='replace') as lf:
+        with open(log_path, 'a', encoding='utf-8', buffering=1, errors='replace') as lf:
             lf.write("============================================================\n")
             lf.write(" PrimiGenius Native Java Execution Log\n")
             lf.write("============================================================\n")
@@ -6738,6 +6356,7 @@ def _run_native_java_cli_plugin(cfg, data):
                     encoding='utf-8',
                     errors='replace',
                 )
+                _native_process_snapshot(proc)
                 for line in proc.stdout:
                     line = line.rstrip()
                     log(line)
@@ -6764,12 +6383,13 @@ def _run_native_java_cli_plugin(cfg, data):
             lf.write("============================================================\n")
 
     if failed_tasks:
-        return jsonify({"status": "error", "message": f"{len(failed_tasks)}/{len(tasks)} 个任务失败: {', '.join(failed_tasks[:5])}\n请查看输出目录中的 .primigenius.log 日志文件了解详情。"})
+        return jsonify({"status": "error", "message": f"{len(failed_tasks)}/{len(tasks)} 个任务失败: {', '.join(failed_tasks[:5])}\n请查看输出目录中的 {os.path.basename(log_path)} 日志文件了解详情。"})
     return jsonify({"status": "success"})
 
 @app.route('/run-plugin', methods=['POST'])
 @_track_analysis_request
 def run_plugin():
+    run_start = datetime.datetime.now()
     data = request.json or {}
     _linux_textarea_temp_files = []
     _prev_run_id = getattr(_LOG_CONTEXT, 'run_id', None)
@@ -6808,7 +6428,7 @@ def run_plugin():
             cfg['docker_image'] = _get_r_image()
             if cfg['docker_image'] == R_DOCKER_IMAGE:
                 if _ensure_custom_r_image(client, silent=True):
-                    cfg['docker_image'] = R_CUSTOM_IMAGE
+                    cfg['docker_image'] = _get_r_image()
 
         log(f"[SYSTEM] Task received: {data['pluginId']}")
         img = cfg['docker_image']
@@ -6875,6 +6495,8 @@ def run_plugin():
         
         host_out_dir = os.path.normpath(os.path.abspath(data['outDir']))
         if not os.path.exists(host_out_dir): os.makedirs(host_out_dir, exist_ok=True)
+
+        log_path = os.path.join(host_out_dir, f"PrimiGenius.{run_start:%Y-%m-%d_%H-%M-%S}.log")
         
         internal_out_dir = "/workspace"
         execution_mode = cfg.get('execution_mode', 'loop')
@@ -7221,6 +6843,9 @@ def run_plugin():
             internal_outfile = f"{internal_out_dir}/{outfile_name}"
             host_outfile = os.path.join(host_out_dir, outfile_name)
 
+            # Only remove a new output explicitly owned by this command; never
+            # infer ownership from the sample name or delete a previous result.
+            cleanup_outfile = '{output_file}' in cmd and not os.path.lexists(host_outfile)
             cmd = cmd.replace("{output_file}", internal_outfile)
 
             # Determine thread count: client top-level → plugin param → config default → host CPU
@@ -7265,7 +6890,7 @@ def run_plugin():
                     network_path_warnings.append(f"  - {_host_f} (UNC/网络路径)")
 
             # === Inject pre-flight file accessibility check inside container ===
-            # If Podman hasn't shared the drive, the mount dir will be empty
+            # If Runtime hasn't shared the drive, the mount dir will be empty
             preflight_file_count = 0
             if path_mapping:
                 checks = []
@@ -7279,19 +6904,16 @@ def run_plugin():
                         f"echo '  容器路径: {_cont_f}' >&2; "
                         f"echo '  宿主路径: {_host_f}' >&2; "
                         f"echo '  挂载目录内容:' >&2; ls -la $(dirname '{_cont_f}')/ 2>&1 >&2 | head -3; "
-                        f"echo '  提示: 请确认 Podman Machine 可访问 {_drive} 盘' >&2; "
+                        f"echo '  提示: 请确认 运行环境可访问 {_drive} 盘' >&2; "
                         f"echo '  提示: 网络盘/USB盘/移动硬盘无法被容器直接挂载，请复制到本地磁盘' >&2; "
                         f"exit 1; fi"
                     )
                 cmd = " && ".join(checks) + " && " + cmd
 
-            # Log file naming: plugin_id.sample_name.primigenius.log
-            safe_plugin_id = (cfg.get('id') or 'unknown').replace(' ', '_')
-            log_path = os.path.join(host_out_dir, f"{safe_plugin_id}.{task['sample']}.primigenius.log")
-            
             c = None
+            task_failure_recorded = False
             try:
-                with open(log_path, 'w', encoding='utf-8', buffering=1) as lf:
+                with open(log_path, 'a', encoding='utf-8', buffering=1) as lf:
                     lf.write("============================================================\n")
                     lf.write(f" PrimiGenius Execution Log\n")
                     lf.write("============================================================\n")
@@ -7311,7 +6933,7 @@ def run_plugin():
                         lf.write(f"⚠ 网络路径警告:\n")
                         for _w in network_path_warnings:
                             lf.write(f"{_w}\n")
-                        lf.write(f"Podman Machine 无法挂载网络映射盘(UNC路径)，建议复制到本地磁盘。\n")
+                        lf.write(f"运行环境无法挂载网络映射盘(UNC路径)，建议复制到本地磁盘。\n")
                     lf.write("------------------------------------------------------------\n\n")
                     
                     # Inject popular thread-related environment variables so many libraries respect the setting
@@ -7422,7 +7044,8 @@ def run_plugin():
                         lf.write("============================================================\n")
                         log(f"[ERROR] Task {task['sample']} failed. ❌")
                         failed_tasks.append(task['sample'])
-                        if os.path.exists(host_outfile):
+                        task_failure_recorded = True
+                        if cleanup_outfile and os.path.isfile(host_outfile):
                             try:
                                 log(f"[SYSTEM] Cleaning up failed output: {host_outfile}")
                                 os.remove(host_outfile)
@@ -7457,7 +7080,7 @@ def run_plugin():
                                     continue
                                 if fext not in TEXT_EXTS and not fname.endswith('.primigenius.log'):
                                     continue
-                                if fname.endswith('.primigenius.log'):
+                                if fname.endswith('.primigenius.log') or re.fullmatch(r'PrimiGenius\.\d{4}-\d{2}-\d{2}(?:_\d{2}-\d{2}-\d{2})?\.log', fname, re.IGNORECASE):
                                     continue  # don't touch log files
                                 try:
                                     with open(fpath, 'r', encoding='utf-8', errors='replace') as rf:
@@ -7473,13 +7096,16 @@ def run_plugin():
                             log(f"[WARN] Post-processing path cleanup failed: {post_err}")
                         
             except Exception as e:
+                if not task_failure_recorded:
+                    failed_tasks.append(task['sample'])
                 err_msg = f"\n[CRITICAL ERROR] {traceback.format_exc()}"
                 log(err_msg)
                 try: 
                     with open(log_path, 'a', encoding='utf-8') as lf_err: 
                         lf_err.write(err_msg)
+                        lf_err.write("\nStatus       : FAILED ❌\n")
                 except: pass
-                if os.path.exists(host_outfile):
+                if cleanup_outfile and os.path.isfile(host_outfile):
                     try: os.remove(host_outfile)
                     except: pass
             
@@ -7500,7 +7126,7 @@ def run_plugin():
                     _schedule_container_cleanup(c.id)
 
         if failed_tasks:
-            return jsonify({"status": "error", "message": f"{len(failed_tasks)}/{len(tasks)} 个任务失败: {', '.join(failed_tasks[:5])}\n请查看输出目录中的 .primigenius.log 日志文件了解详情。"})
+            return jsonify({"status": "error", "message": f"{len(failed_tasks)}/{len(tasks)} 个任务失败: {', '.join(failed_tasks[:5])}\n请查看输出目录中的 {os.path.basename(log_path)} 日志文件了解详情。"})
         return jsonify({"status":"success"})
     except Exception as e:
         log(f"[ERROR] {str(e)}"); return jsonify({"status":"error", "message":str(e)})
@@ -7568,7 +7194,7 @@ def cleanup_exited_containers():
     if not client:
         return jsonify({'status': 'error', 'message': 'Docker not running'})
     try:
-        containers = client.containers.list(all=True)
+        containers = client.containers.list(all=True, filters={'label': 'primigenius.owner=' + _get_podman_manager().runtime.identity})
         removed = []
         for c in containers:
             try:
@@ -7616,8 +7242,6 @@ def check():
     mgr = _get_podman_manager()
     if mgr.is_engine_ready():
         return jsonify({"status": "success"})
-    if get_docker_client():
-        return jsonify({"status": "success"})
     return jsonify({"status": "error"})
 
 
@@ -7635,19 +7259,8 @@ def _fetch_containers_data():
             return True
         except Exception:
             _close_readonly_api_client(api)
-    if _pull_in_progress.is_set():
-        return False
-    client = get_docker_client()
-    if client:
-        try:
-            raw_containers = client.api.containers(all=True, quiet=False)
-            result = _parse_containers(raw_containers)
-            resp_data = {'status': 'success', 'containers': result}
-            _containers_cache = {'data': resp_data, 'time': now}
-            return True
-        except Exception:
-            pass
     return False
+
 
 def _refresh_containers_cache():
     if not _containers_refresh_lock.acquire(blocking=False):
@@ -7665,20 +7278,10 @@ def _refresh_containers_cache_sync():
 
 @app.route('/podman/containers', methods=['GET'])
 def list_containers():
-    global _containers_cache
-    now = time.time()
-    fresh = request.args.get('fresh', '0') == '1'
-    if fresh:
-        if _fetch_containers_data() and _containers_cache['data']:
-            return jsonify(_containers_cache['data'])
-        return jsonify(_containers_cache['data'] or {'status': 'success', 'containers': []})
-    if _containers_cache['data'] and now - _containers_cache['time'] < _CACHE_TTL:
+    # Running tasks are live state: never present a stale snapshot as success.
+    if _fetch_containers_data() and _containers_cache['data']:
         return jsonify(_containers_cache['data'])
-    if _containers_cache['data']:
-        threading.Thread(target=_refresh_containers_cache, daemon=True).start()
-        return jsonify(_containers_cache['data'])
-    threading.Thread(target=_refresh_containers_cache, daemon=True).start()
-    return jsonify({'status': 'success', 'containers': []})
+    return jsonify({'status': 'error', 'message': 'Runtime connection unavailable; container state could not be read'})
 
 def _auto_remove_containers_by_ids(short_ids):
     client = get_docker_client()
@@ -7715,7 +7318,6 @@ def _auto_remove_single_container(container_id):
 
 def _parse_containers(raw_containers):
     result = []
-    _auto_removed = []
     for c_data in raw_containers:
         try:
             cid = c_data.get('Id', '')
@@ -7730,7 +7332,6 @@ def _parse_containers(raw_containers):
             created = c_data.get('Created', '')
             is_stopped = status in ('exited', 'dead', 'created')
             if is_stopped:
-                _auto_removed.append(cid[:12])
                 continue
             run_id = None
             for k, v in RUNNING_CONTAINERS.items():
@@ -7757,8 +7358,7 @@ def _parse_containers(raw_containers):
                 'run_id': None,
                 'error': str(e)
             })
-    if _auto_removed:
-        threading.Thread(target=_auto_remove_containers_by_ids, args=(_auto_removed,), daemon=True).start()
+    # Listing must never remove containers: task owners collect logs before cleanup.
     return result
 
 
@@ -7796,26 +7396,27 @@ def container_logs_stream(container_id):
 
     def generate():
         stop_event = threading.Event()
-        queue_items = queue.Queue()
+        queue_items = StreamQueue(stop_event)
         seen_lines = {}
         stream_ref = [None]
 
         def _emit_initial_logs():
+            from runtime_logs import LogCursor
             try:
-                raw = container.logs(stdout=True, stderr=True, tail=tail)
-                raw_text = raw.decode('utf-8', errors='replace') if isinstance(raw, bytes) else str(raw)
-                for raw_line in raw_text.splitlines():
-                    line = raw_line.rstrip('\r')
-                    if not line:
-                        continue
-                    seen_lines[line] = int(seen_lines.get(line, 0)) + 1
-                    queue_items.put({'type': 'log', 'line': line})
+                cursor = LogCursor()
+                container._primigenius_log_cursor = cursor
+                cursor.read(container, lambda line: queue_items.put({'type': 'log', 'line': line}),
+                            tail=tail, stop=stop_event, stream_ref=stream_ref)
+            except InterruptedError:
+                raise
             except Exception as e:
                 queue_items.put({'type': 'status', 'line': f'log preload failed: {e}'})
 
         def _worker():
             try:
                 _emit_initial_logs()
+                if stop_event.is_set():
+                    return
                 container.reload()
                 if str(getattr(container, 'status', '') or '').lower() == 'running':
                     _stream_container_logs_thread(
@@ -7825,12 +7426,22 @@ def container_logs_stream(container_id):
                         lambda line: queue_items.put({'type': 'log', 'line': line}),
                         stream_ref
                     )
+                if stop_event.is_set():
+                    return
                 _collect_final_logs(container, seen_lines, lambda line: queue_items.put({'type': 'log', 'line': line}))
                 queue_items.put({'type': 'summary', 'summary': _container_detail_payload(container)['container']['runtime']})
+            except InterruptedError:
+                pass
             except Exception as e:
-                queue_items.put({'type': 'error', 'message': str(e)})
+                try:
+                    queue_items.put({'type': 'error', 'message': str(e)})
+                except InterruptedError:
+                    pass
             finally:
-                queue_items.put({'type': 'done'})
+                try:
+                    queue_items.put({'type': 'done'})
+                except InterruptedError:
+                    pass
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -7865,48 +7476,7 @@ def container_stats(container_id):
     try:
         container = client.containers.get(container_id)
         stats = container.stats(stream=False)
-        cpu_delta = stats.get('cpu_stats', {}).get('cpu_usage', {}).get('total_usage', 0) - \
-                    stats.get('precpu_stats', {}).get('cpu_usage', {}).get('total_usage', 0)
-        system_delta = stats.get('cpu_stats', {}).get('system_cpu_usage', 0) - \
-                       stats.get('precpu_stats', {}).get('system_cpu_usage', 0)
-        cpu_percent = 0.0
-        num_cpus = stats.get('cpu_stats', {}).get('online_cpus', 1) or 1
-        if system_delta > 0 and cpu_delta > 0:
-            cpu_percent = round((cpu_delta / system_delta) * num_cpus * 100.0, 1)
-        mem_usage = stats.get('memory_stats', {}).get('usage', 0)
-        mem_limit = stats.get('memory_stats', {}).get('limit', 0)
-        mem_percent = round((mem_usage / mem_limit) * 100.0, 1) if mem_limit > 0 else 0.0
-        mem_usage_mb = round(mem_usage / (1024 * 1024), 1) if mem_usage else 0
-        mem_limit_mb = round(mem_limit / (1024 * 1024), 1) if mem_limit else 0
-        net_rx = 0
-        net_tx = 0
-        networks = stats.get('networks', {})
-        if isinstance(networks, dict):
-            for iface, vals in networks.items():
-                net_rx += vals.get('rx_bytes', 0)
-                net_tx += vals.get('tx_bytes', 0)
-        blk_read = 0
-        blk_write = 0
-        blkio = stats.get('blkio_stats', {}).get('io_service_bytes_recursive', [])
-        if isinstance(blkio, list):
-            for entry in blkio:
-                if entry.get('op') == 'read':
-                    blk_read += entry.get('value', 0)
-                elif entry.get('op') == 'write':
-                    blk_write += entry.get('value', 0)
-        pids = stats.get('pids_stats', {}).get('current', 0)
-        payload = {
-            'cpu_percent': cpu_percent,
-            'mem_usage_mb': mem_usage_mb,
-            'mem_limit_mb': mem_limit_mb,
-            'mem_percent': mem_percent,
-            'net_rx_bytes': net_rx,
-            'net_tx_bytes': net_tx,
-            'blk_read_bytes': blk_read,
-            'blk_write_bytes': blk_write,
-            'pids': pids,
-            'num_cpus': num_cpus,
-        }
+        payload = container_metrics(stats)
         with _CONTAINER_LAST_STATS_LOCK:
             _CONTAINER_LAST_STATS[container.id] = {'stats': payload, 'ts': time.time()}
         return jsonify({
@@ -7930,52 +7500,12 @@ def container_stats_stream(container_id):
         return jsonify({'status': 'error', 'message': 'Container not found'})
 
     def generate():
+        stream = container.stats(stream=True, decode=True)
         try:
-            for raw_stats in container.stats(stream=True, decode=True):
+            for raw_stats in stream:
                 if not isinstance(raw_stats, dict):
                     continue
-                cpu_delta = raw_stats.get('cpu_stats', {}).get('cpu_usage', {}).get('total_usage', 0) - \
-                            raw_stats.get('precpu_stats', {}).get('cpu_usage', {}).get('total_usage', 0)
-                system_delta = raw_stats.get('cpu_stats', {}).get('system_cpu_usage', 0) - \
-                               raw_stats.get('precpu_stats', {}).get('system_cpu_usage', 0)
-                cpu_percent = 0.0
-                num_cpus = raw_stats.get('cpu_stats', {}).get('online_cpus', 1) or 1
-                if system_delta > 0 and cpu_delta > 0:
-                    cpu_percent = round((cpu_delta / system_delta) * num_cpus * 100.0, 1)
-                mem_usage = raw_stats.get('memory_stats', {}).get('usage', 0)
-                mem_limit = raw_stats.get('memory_stats', {}).get('limit', 0)
-                mem_percent = round((mem_usage / mem_limit) * 100.0, 1) if mem_limit > 0 else 0.0
-                mem_usage_mb = round(mem_usage / (1024 * 1024), 1) if mem_usage else 0
-                mem_limit_mb = round(mem_limit / (1024 * 1024), 1) if mem_limit else 0
-                net_rx = 0
-                net_tx = 0
-                networks = raw_stats.get('networks', {})
-                if isinstance(networks, dict):
-                    for iface, vals in networks.items():
-                        net_rx += vals.get('rx_bytes', 0)
-                        net_tx += vals.get('tx_bytes', 0)
-                blk_read = 0
-                blk_write = 0
-                blkio = raw_stats.get('blkio_stats', {}).get('io_service_bytes_recursive', [])
-                if isinstance(blkio, list):
-                    for entry in blkio:
-                        if entry.get('op') == 'read':
-                            blk_read += entry.get('value', 0)
-                        elif entry.get('op') == 'write':
-                            blk_write += entry.get('value', 0)
-                pids = raw_stats.get('pids_stats', {}).get('current', 0)
-                payload = {
-                    'cpu_percent': cpu_percent,
-                    'mem_usage_mb': mem_usage_mb,
-                    'mem_limit_mb': mem_limit_mb,
-                    'mem_percent': mem_percent,
-                    'net_rx_bytes': net_rx,
-                    'net_tx_bytes': net_tx,
-                    'blk_read_bytes': blk_read,
-                    'blk_write_bytes': blk_write,
-                    'pids': pids,
-                    'num_cpus': num_cpus,
-                }
+                payload = container_metrics(raw_stats)
                 with _CONTAINER_LAST_STATS_LOCK:
                     _CONTAINER_LAST_STATS[container.id] = {'stats': payload, 'ts': time.time()}
                 yield f"data: {json.dumps({'type': 'stats', 'stats': payload})}\n\n"
@@ -7983,6 +7513,8 @@ def container_stats_stream(container_id):
             pass
         except Exception:
             pass
+        finally:
+            stream.close()
 
     return Response(generate(), mimetype='text/event-stream', headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 
@@ -7991,6 +7523,8 @@ _DOCKER_EVENTS_CLIENTS = []
 _DOCKER_EVENTS_LOCK = threading.Lock()
 _DOCKER_EVENTS_COND = threading.Condition(_DOCKER_EVENTS_LOCK)
 _DOCKER_EVENTS_THREAD_STARTED = False
+_DOCKER_EVENTS_STREAM = None
+_DOCKER_EVENTS_GENERATION = 0
 
 def _push_docker_event(event_dict):
     global _containers_cache, _images_cache
@@ -8001,24 +7535,28 @@ def _push_docker_event(event_dict):
         if _images_cache['data']:
             _images_cache = {'data': _images_cache['data'], 'time': 0}
     with _DOCKER_EVENTS_LOCK:
-        dead = []
-        for i, q in enumerate(_DOCKER_EVENTS_CLIENTS):
+        for q in _DOCKER_EVENTS_CLIENTS:
             try:
                 q.put_nowait(json.dumps(event_dict, ensure_ascii=False))
-            except Exception:
-                dead.append(i)
-        for i in reversed(dead):
-            _DOCKER_EVENTS_CLIENTS.pop(i)
+            except queue.Full:
+                # Retain the subscriber and request a full snapshot after overflow.
+                try:
+                    q.get_nowait()
+                    q.put_nowait(json.dumps({'Type': event_dict.get('Type', 'container'), 'Action': 'resync'}))
+                except (queue.Empty, queue.Full):
+                    pass
 
 def _docker_events_broadcaster():
-    global _DOCKER_EVENTS_THREAD_STARTED
+    global _DOCKER_EVENTS_STREAM
     retry_delay = 3.0
     while True:
         with _DOCKER_EVENTS_COND:
             while not _DOCKER_EVENTS_CLIENTS:
                 _DOCKER_EVENTS_COND.wait()
+            generation = _DOCKER_EVENTS_GENERATION
+        stream = None
+        client = None
         try:
-            client = None
             client = get_docker_client()
             if not client:
                 with _DOCKER_EVENTS_COND:
@@ -8026,45 +7564,48 @@ def _docker_events_broadcaster():
                 retry_delay = min(60.0, retry_delay * 2)
                 continue
             retry_delay = 3.0
-            for event in client.events(decode=True):
+            _push_docker_event({'Type': 'container', 'Action': 'resync'})
+            stream = client.events(decode=True, since=int(time.time()) - 1)
+            with _DOCKER_EVENTS_COND:
+                if not _DOCKER_EVENTS_CLIENTS:
+                    continue
+                _DOCKER_EVENTS_STREAM = stream
+            for event in stream:
+                with _DOCKER_EVENTS_COND:
+                    if not _DOCKER_EVENTS_CLIENTS:
+                        break
                 if not isinstance(event, dict):
                     continue
-                evt_action = event.get('Action', '')
-                evt_type = event.get('Type', '')
-                evt_id = event.get('id', '')
-                if evt_type == 'container' and evt_action in ('die', 'stop') and evt_id:
-                    try:
-                        c = client.containers.get(evt_id)
-                        c_status = c.status
-                        if c_status in ('exited', 'dead', 'created'):
-                            threading.Thread(target=lambda cid=evt_id: _auto_remove_single_container(cid), daemon=True).start()
-                    except Exception:
-                        pass
-                msg = json.dumps(event, ensure_ascii=False)
-                with _DOCKER_EVENTS_LOCK:
-                    dead = []
-                    for i, q in enumerate(_DOCKER_EVENTS_CLIENTS):
-                        try:
-                            q.put_nowait(msg)
-                        except Exception:
-                            dead.append(i)
-                    for i in reversed(dead):
-                        _DOCKER_EVENTS_CLIENTS.pop(i)
-        except Exception:
-            _invalidate_docker_client(client if 'client' in locals() else None)
-            _record_docker_reconnect_failure()
+                _push_docker_event(event)
             with _DOCKER_EVENTS_COND:
-                _DOCKER_EVENTS_COND.wait(timeout=retry_delay)
+                if _DOCKER_EVENTS_CLIENTS and generation == _DOCKER_EVENTS_GENERATION:
+                    _DOCKER_EVENTS_COND.wait(timeout=retry_delay)
+        except Exception:
+            with _DOCKER_EVENTS_COND:
+                needed = bool(_DOCKER_EVENTS_CLIENTS) and generation == _DOCKER_EVENTS_GENERATION
+            if needed:
+                _invalidate_docker_client(client)
+                _record_docker_reconnect_failure()
+                with _DOCKER_EVENTS_COND:
+                    _DOCKER_EVENTS_COND.wait(timeout=retry_delay)
             retry_delay = min(60.0, retry_delay * 2)
+        finally:
+            with _DOCKER_EVENTS_COND:
+                if _DOCKER_EVENTS_STREAM is stream:
+                    _DOCKER_EVENTS_STREAM = None
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
 
 
 def _ensure_docker_events_thread():
     global _DOCKER_EVENTS_THREAD_STARTED
-    if _DOCKER_EVENTS_THREAD_STARTED:
-        return
-    _DOCKER_EVENTS_THREAD_STARTED = True
-    t = threading.Thread(target=_docker_events_broadcaster, daemon=True)
-    t.start()
+    with _DOCKER_EVENTS_COND:
+        if not _DOCKER_EVENTS_THREAD_STARTED:
+            threading.Thread(target=_docker_events_broadcaster, daemon=True, name='container-events').start()
+            _DOCKER_EVENTS_THREAD_STARTED = True
 
 
 @app.route('/podman/events', methods=['GET'])
@@ -8074,6 +7615,22 @@ def podman_events_stream():
     with _DOCKER_EVENTS_COND:
         _DOCKER_EVENTS_CLIENTS.append(q)
         _DOCKER_EVENTS_COND.notify_all()
+
+    def unsubscribe():
+        global _DOCKER_EVENTS_GENERATION
+        with _DOCKER_EVENTS_COND:
+            removed = q in _DOCKER_EVENTS_CLIENTS
+            if removed:
+                _DOCKER_EVENTS_CLIENTS.remove(q)
+            stream = _DOCKER_EVENTS_STREAM if removed and not _DOCKER_EVENTS_CLIENTS else None
+            if stream is not None:
+                _DOCKER_EVENTS_GENERATION += 1
+            _DOCKER_EVENTS_COND.notify_all()
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
 
     def generate():
         try:
@@ -8087,22 +7644,20 @@ def podman_events_stream():
         except GeneratorExit:
             pass
         finally:
-            with _DOCKER_EVENTS_LOCK:
-                try:
-                    _DOCKER_EVENTS_CLIENTS.remove(q)
-                except ValueError:
-                    pass
+            unsubscribe()
 
-    return Response(generate(), mimetype='text/event-stream', headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+    response = Response(generate(), mimetype='text/event-stream', headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+    response.call_on_close(unsubscribe)
+    return response
 
 
 @app.route('/podman/diagnostics', methods=['GET'])
 def podman_diagnostics():
-    """Return diagnostics about Podman client, version, and basic network connectivity."""
+    """Return diagnostics about Runtime client, version, and basic network connectivity."""
     client = get_docker_client()
     out = { 'podman_available': False }
     if not client:
-        out['error'] = 'Podman client unavailable or not running'
+        out['error'] = 'Runtime client unavailable or not running'
         return jsonify(out)
 
     out['podman_available'] = True
@@ -8265,56 +7820,48 @@ def r_scan_deps():
     return jsonify({'status': 'success', 'packages': all_pkgs, 'detected': sorted(found), 'config_original': sorted(config_pkgs)})
 
 
+def _r_repo_snapshot():
+    """Read configured/cached repositories without probing or waiting for a probe."""
+    mode = R_RUNTIME.get('repos', 'auto')
+    if str(mode).lower() != 'auto':
+        cran = _normalize_cran_repo_url(mode)
+        return {'repo_mode': mode, 'repos': cran,
+                'bioc_mirror': _resolve_bioc_mirror_from_cran(cran), 'repo_pending': False}
+    selected = _R_REPO_AUTO_CACHE.get('selection')
+    return {'repo_mode': 'auto', 'repos': selected['cran'] if selected else None,
+            'bioc_mirror': selected['bioc'] if selected else None,
+            'repo_pending': selected is None}
+
+
+@app.route('/r/repo', methods=['GET'])
+def r_repo_status():
+    return jsonify({'status': 'success', **_r_repo_snapshot()})
+
+
 @app.route('/r/check-runtime', methods=['GET'])
 def r_check_runtime():
-    """Check if Podman is available and R image is ready."""
-    client = get_docker_client()
-    if not client:
-        return jsonify({'status': 'error', 'message': 'Podman is not running'})
-    found_img = None
+    """Read preparation status without networking, importing, or starting recovery."""
+    state = _offline_r_environment().snapshot()
+    return jsonify(dict(status='success' if state['ready'] else ('image_missing' if state['state']=='pending' else 'error'),
+        message=state['error'] or state['phase'], runtime_state=state['state'], ready=state['ready'],
+        preparation=state, rscript='Runtime: ' + (state['image_id'] or ''), version=R_VERSION,
+        bioconductor_version=BIOCONDUCTOR_VERSION, docker_image=R_DOCKER_IMAGE,
+        custom_image=R_CUSTOM_IMAGE, library_generation=R_LIBRARY_GENERATION, **_r_repo_snapshot()))
+
+
+@app.route('/r/prepare-runtime', methods=['POST'])
+def r_prepare_runtime():
+    _offline_r_environment().start()
+    return jsonify(status='accepted', preparation=_offline_r_environment().snapshot()), 202
+
+
+@app.route('/r/cleanup-previous-runtime', methods=['POST'])
+def r_cleanup_previous_runtime():
     try:
-        custom = client.images.get(R_CUSTOM_IMAGE)
-        if not _custom_r_image_matches_contract(custom):
-            raise RuntimeError('custom image contract mismatch')
-        try:
-            if not _image_exists_locally(client, R_DOCKER_IMAGE):
-                raise docker.errors.ImageNotFound(R_DOCKER_IMAGE)
-            found_img = R_CUSTOM_IMAGE
-            _image_exists_cache[R_CUSTOM_IMAGE] = True
-            _image_exists_cache[R_DOCKER_IMAGE] = True
-        except Exception:
-            pass
-    except Exception:
-        pass
-    if not found_img:
-        try:
-            if not _image_exists_locally(client, R_DOCKER_IMAGE):
-                raise docker.errors.ImageNotFound(R_DOCKER_IMAGE)
-            found_img = R_DOCKER_IMAGE
-            _image_exists_cache[R_DOCKER_IMAGE] = True
-        except Exception:
-            pass
-    if not found_img:
-        for stale_key in [R_CUSTOM_IMAGE, R_DOCKER_IMAGE]:
-            _image_exists_cache.pop(stale_key, None)
-        return jsonify({
-            'status': 'image_missing',
-            'message': f'R image {R_DOCKER_IMAGE} is not installed',
-            'docker_image': R_DOCKER_IMAGE
-        })
-    repos, bioc_mirror = _resolve_r_repo_bundle(R_RUNTIME.get('repos'))
-    return jsonify({
-        'status': 'success',
-        'rscript': f'Podman: {found_img}',
-        'version': R_VERSION,
-        'bioconductor_version': BIOCONDUCTOR_VERSION,
-        'repo_mode': R_RUNTIME.get('repos', 'auto'),
-        'repos': repos,
-        'bioc_mirror': bioc_mirror,
-        'docker_image': R_DOCKER_IMAGE,
-        'custom_image': R_CUSTOM_IMAGE,
-        'library_generation': R_LIBRARY_GENERATION,
-    })
+        _offline_r_environment().cleanup_previous((request.get_json(silent=True) or {}).get('confirmed'))
+        return jsonify(status='success')
+    except Exception as exc:
+        return jsonify(status='error', message=str(exc)), 409
 
 
 @app.route('/r/set-repo', methods=['POST'])
@@ -8323,15 +7870,17 @@ def r_set_repo():
     url = data.get('repo')
     if not url:
         return jsonify({'status': 'error', 'message': 'repo required'})
-    repos, bioc_mirror = _resolve_r_repo_bundle(url)
-    repo_mode = 'auto' if str(url).strip().lower() == 'auto' else repos
-    R_RUNTIME['repos'] = repo_mode
+    repo_mode = 'auto' if str(url).strip().lower() == 'auto' else _normalize_cran_repo_url(url)
     _save_r_runtime_state(repo_mode=repo_mode)
-    return jsonify({'status': 'success', 'repo_mode': repo_mode, 'repos': repos, 'bioc_mirror': bioc_mirror})
+    R_RUNTIME['repos'] = repo_mode
+    if repo_mode == 'auto':
+        _schedule_r_repo_probe()
+    return jsonify({'status': 'success', **_r_repo_snapshot()})
 
 
 # Cache for installed R packages list (avoid spinning up containers repeatedly)
 _r_packages_cache = {'packages': None, 'time': 0}
+_r_packages_cache_lock = threading.RLock()
 _R_PKG_CACHE_TTL = 30  # seconds
 _r_libs_revision = 0
 R_PREFLIGHT_CACHE_FILE = os.path.join(APP_INSTALL_DIR, f'.primigenius_r_preflight_cache_{R_LIBRARY_GENERATION}.json')
@@ -8380,7 +7929,7 @@ def _cleanup_stale_containers():
         return
     removed = []
     try:
-        for c in client.containers.list(all=True):
+        for c in client.containers.list(all=True, filters={'label': 'primigenius.owner=' + _get_podman_manager().runtime.identity}):
             name = (c.name or '')
             status = c.status
             if status in ('exited', 'dead', 'created'):
@@ -8404,7 +7953,7 @@ def _cleanup_orphaned_r_containers(client=None):
         return
     removed = []
     try:
-        for c in client.containers.list(all=True):
+        for c in client.containers.list(all=True, filters={'label': 'primigenius.owner=' + _get_podman_manager().runtime.identity}):
             name = (c.name or '')
             status = c.status
             if status in ('exited', 'dead', 'created'):
@@ -8561,7 +8110,7 @@ def _parse_r_dependency_names(value):
 def _host_r_dependency_status(root_packages):
     """Fast host-side dependency-chain check using installed DESCRIPTION files.
 
-    This intentionally avoids starting R/Podman. It is used as the cheap guard
+    This intentionally avoids starting R/Runtime. It is used as the cheap guard
     before trusting the persistent pre-flight cache, so manually deleted
     dependency directories are detected on the next plugin run.
     """
@@ -8600,8 +8149,9 @@ def _host_r_dependency_status(root_packages):
 
 def _bump_r_libs_revision(reason=''):
     global _r_libs_revision
-    _r_libs_revision += 1
-    _r_packages_cache['packages'] = None
+    with _r_packages_cache_lock:
+        _r_libs_revision += 1
+        _r_packages_cache['packages'] = None
     _scan_r_libs_package_set()
     if reason:
         log(f'[SYSTEM] R libs revision bumped to {_r_libs_revision} ({reason})')
@@ -8609,12 +8159,18 @@ def _bump_r_libs_revision(reason=''):
 
 @app.route('/r/list-packages', methods=['GET'])
 def r_list_packages():
+    # Serialize short host-directory scans and invalidations, never container work.
+    with _r_packages_cache_lock:
+        return _r_list_packages_locked()
+
+
+def _r_list_packages_locked():
     """List installed R packages by reading DESCRIPTION files directly from host r_libs directory.
     This avoids spinning up Docker containers, making the check nearly instant."""
     now = time.time()
     # Return cached result if still fresh
-    if _r_packages_cache['packages'] is not None and now - _r_packages_cache['time'] < _R_PKG_CACHE_TTL:
-        return jsonify({'status': 'success', 'packages': _r_packages_cache['packages']})
+    if request.args.get('refresh') != '1' and _r_packages_cache['packages'] is not None and now - _r_packages_cache['time'] < _R_PKG_CACHE_TTL:
+        return jsonify({'status': 'success', 'packages': _r_packages_cache['packages'], 'revision': _r_libs_revision})
     try:
         pkgs = []
         if os.path.isdir(R_LIBS_DIR):
@@ -8646,9 +8202,90 @@ def r_list_packages():
                 pkgs.append({'package': pkg_name, 'version': 'image', 'builtin': True})
         _r_packages_cache['packages'] = pkgs
         _r_packages_cache['time'] = now
-        return jsonify({'status': 'success', 'packages': pkgs})
+        return jsonify({'status': 'success', 'packages': pkgs, 'revision': _r_libs_revision})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
+
+
+@functools.lru_cache(maxsize=32)
+def _r_online_package_search(query, cache_epoch):
+    """Search metadata only; never start a container or install from R-universe."""
+    url = 'https://r-universe.dev/api/search?' + urllib.parse.urlencode({'q': query, 'limit': 30})
+    req = urllib.request.Request(url, headers={'User-Agent': 'PrimiGenius R package search'})
+    with urllib.request.urlopen(req, timeout=4) as response:
+        raw = response.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise ValueError('Package search response too large')
+    data = json.loads(raw)
+    if not isinstance(data.get('results'), list):
+        raise ValueError('Invalid package search response')
+    return [{'package': item['Package'], 'source': 'R-universe',
+             'title': str(item.get('Title') or '')[:240]}
+            for item in data['results'][:30] if isinstance(item, dict)
+            and re.fullmatch(r'[A-Za-z][A-Za-z0-9.]*', str(item.get('Package') or ''))
+            and query.lower() in item['Package'].lower()]
+
+
+@functools.lru_cache(maxsize=6)
+def _r_repository_package_index(url, cache_epoch):
+    """Reuse repository metadata across queries; no R/container startup needed."""
+    req = urllib.request.Request(url, headers={'User-Agent': 'PrimiGenius R package search'})
+    with urllib.request.urlopen(req, timeout=4) as response:
+        raw = response.read(8 * 1024 * 1024 + 1)
+    if len(raw) > 8 * 1024 * 1024:
+        raise ValueError('Repository index too large')
+    with gzip.GzipFile(fileobj=io.BytesIO(raw)) as archive:
+        decoded = archive.read(48 * 1024 * 1024 + 1)
+    if len(decoded) > 48 * 1024 * 1024:
+        raise ValueError('Expanded repository index too large')
+    names = re.findall(r'^Package:\s*([A-Za-z][A-Za-z0-9.]*)\s*$', decoded.decode('utf-8'), re.M)
+    if not names:
+        raise ValueError('Invalid repository package index')
+    return tuple(dict.fromkeys(names))
+
+
+def _r_repository_package_search(query):
+    selected = R_RUNTIME.get('repos', 'auto')
+    # Use the selected mirror without running the installation mirror probes.
+    cran = ('https://mirrors.ustc.edu.cn/CRAN' if selected == 'auto'
+            else _normalize_cran_repo_url(selected))
+    bioc = _resolve_bioc_mirror_from_cran(cran)
+    urls = [(cran + '/src/contrib/PACKAGES.gz', 'CRAN'),
+            (bioc + f'/packages/{BIOCONDUCTOR_VERSION}/bioc/src/contrib/PACKAGES.gz', 'Bioconductor'),
+            ('https://cloud.r-project.org/src/contrib/PACKAGES.gz', 'CRAN')]
+    matches, succeeded, errors = [], False, []
+    for url, source in urls:
+        try:
+            names = _r_repository_package_index(url, int(time.time() // 3600))
+            succeeded = True
+            matches.extend({'package': name, 'source': source, 'title': ''}
+                           for name in names if query in name.lower())
+            if matches:
+                break
+        except Exception as exc:
+            errors.append(f'{url}: {exc}')
+    if not succeeded:
+        raise RuntimeError('; '.join(errors))
+    return matches
+
+
+@app.route('/r/search-packages', methods=['GET'])
+def r_search_packages():
+    query = request.args.get('q', '').strip()
+    if not re.fullmatch(r'[A-Za-z0-9.]{2,100}', query):
+        return jsonify({'status': 'error', 'message': 'Enter 2-100 package-name characters (letters, digits or dots).'}), 400
+    try:
+        matches = _r_online_package_search(query.lower(), int(time.time() // 300))
+    except Exception as primary_error:
+        try:
+            matches = _r_repository_package_search(query.lower())
+        except Exception as fallback_error:
+            logging.warning('R package search failed: %s; repositories: %s', primary_error, fallback_error)
+            return jsonify({'status': 'error', 'message': 'Package search failed. Check the network or change the mirror and retry.'}), 503
+    matches = list({item['package'].lower(): item for item in matches}.values())
+    matches.sort(key=lambda p: (p['package'].lower() != query.lower(),
+                               not p['package'].lower().startswith(query.lower()), p['package'].lower()))
+    return jsonify({'status': 'success', 'packages': matches[:30]})
 
 
 @app.route('/r/install-packages', methods=['POST'])
@@ -8668,9 +8305,18 @@ def r_install_packages():
     if image_pkgs:
         initial_log.append('[SYSTEM] Already provided by the pinned R base image: ' + ', '.join(image_pkgs))
     INSTALL_JOBS[job_id] = {'status': 'pending', 'log': initial_log, 'exit_code': None, 'packages': pkgs, 'sse_run_id': sse_run_id}
+    for line in initial_log:
+        _publish_run_log_event(sse_run_id, 'R', line)
+    initial_log.clear()
     if install_pkgs:
-        thr = threading.Thread(target=_run_r_install_job, args=(job_id, install_pkgs, repo, None, skip_repair), daemon=True)
-        thr.start()
+        try:
+            _enqueue_job_log(job_id, '[SYSTEM] Queued for R package installation; existing tasks retain their place.')
+            _R_INSTALL_WORKERS.submit(_run_r_install_job, job_id, install_pkgs, repo, None, skip_repair)
+        except queue.Full:
+            message = 'Installation queue is full; retry after a running job completes'
+            INSTALL_JOBS[job_id].update(status='failed', exit_code=-1, error=message)
+            _enqueue_job_log(job_id, '[ERROR] ' + message)
+            return jsonify({'status': 'error', 'message': message, 'job_id': job_id, 'run_id': sse_run_id})
     else:
         INSTALL_JOBS[job_id]['status'] = 'done'
         INSTALL_JOBS[job_id]['exit_code'] = 0
@@ -8683,8 +8329,39 @@ def r_install_status():
     if not job_id or job_id not in INSTALL_JOBS:
         return jsonify({'status': 'error', 'message': 'unknown job_id'})
     job = INSTALL_JOBS[job_id]
-    lines = list(job['log'])
-    return jsonify({'status': 'success', 'job_id': job_id, 'state': job['status'], 'exit_code': job.get('exit_code'), 'log': lines})
+    state = job['status']
+    run_id = job.get('sse_run_id')
+    try:
+        after = max(0, int(request.args.get('afterSeq', 0)))
+    except ValueError:
+        return jsonify({'status': 'error', 'message': 'Invalid log cursor'}), 400
+    latest = _LOG_JOURNAL.latest(run_id) if run_id else 0
+    if run_id and 'afterSeq' not in request.args:
+        # Legacy clients still receive the complete two arrays. Serialize pages
+        # instead of holding the entire history and a second line list in RAM.
+        metadata = dict(status='success', job_id=job_id, state=state,
+                        exit_code=job.get('exit_code'), run_id=run_id,
+                        nextSeq=latest, has_more=False)
+        def complete_response():
+            yield json.dumps(metadata, ensure_ascii=False)[:-1] + ',"events":['
+            for field in ('events', 'log'):
+                cursor, separator = 0, ''
+                while True:
+                    page = _LOG_JOURNAL.read(run_id, cursor, until=latest)
+                    if not page:
+                        break
+                    for event in page:
+                        yield separator + json.dumps(event if field == 'events' else event['line'], ensure_ascii=False)
+                        separator = ','
+                    cursor = page[-1]['seq']
+                yield '],"log":[' if field == 'events' else ']}'
+        return Response(complete_response(), content_type='application/json; charset=utf-8')
+    events = _LOG_JOURNAL.read(run_id, after, until=latest) if run_id else []
+    next_seq = events[-1]['seq'] if events else after
+    return jsonify({'status': 'success', 'job_id': job_id, 'state': state,
+                    'exit_code': job.get('exit_code'), 'run_id': run_id,
+                    'events': events, 'nextSeq': next_seq, 'has_more': next_seq < latest,
+                    'log': [e['line'] for e in events] if run_id else list(job['log'])})
 
 
 @app.route('/r/delete-packages', methods=['POST'])
@@ -8723,7 +8400,8 @@ def _r_delete_packages_locked():
         _bump_r_libs_revision('delete-packages')
         _clear_cached_r_preflight('delete-packages')
     else:
-        _r_packages_cache['packages'] = None
+        with _r_packages_cache_lock:
+            _r_packages_cache['packages'] = None
     return jsonify({'status': 'success', 'deleted': deleted, 'failed': failed})
 
 
@@ -9055,13 +8733,13 @@ def serve_r_output(filename):
     return send_from_directory(out_root, filename)
 
 # ==========================================
-# Podman Image Management API
+# Runtime Image Management API
 # ==========================================
 
 _podman_info_cache = {'data': None, 'time': 0}
 _podman_wsl_cache = {'data': None, 'time': 0}
 
-def _podman_loading_payload(message='Podman deployment is starting'):
+def _podman_loading_payload(message='Runtime deployment is starting'):
     mgr = _get_podman_manager()
     disk_image_location = ''
     try:
@@ -9110,13 +8788,11 @@ def podman_info():
         return jsonify(_podman_info_cache['data'])
     mgr = _get_podman_manager()
     if not mgr.is_engine_ready():
-        if not _podman_permanently_failed:
-            _start_podman_async()
         return jsonify(_podman_loading_payload())
     if _fetch_podman_info_data():
         return jsonify(_podman_info_cache['data'])
     threading.Thread(target=_refresh_podman_info_cache, daemon=True).start()
-    return jsonify(_podman_loading_payload('Podman information is loading'))
+    return jsonify(_podman_loading_payload('Runtime information is loading'))
 
 
 def _podman_info_payload(info):
@@ -9153,18 +8829,9 @@ def _fetch_podman_info_data():
             return True
         except Exception as e:
             _close_readonly_api_client(api)
-            log(f'[DEBUG] readonly podman_info failed: {e}')
-    if _pull_in_progress.is_set():
-        return False
-    client = get_docker_client()
-    if client:
-        try:
-            info = client.info()
-            _podman_info_cache = {'data': _podman_info_payload(info), 'time': now}
-            return True
-        except Exception as e:
-            log(f'[ERROR] podman_info: {e}')
+            log(f'[DEBUG] readonly runtime_info failed: {e}')
     return False
+
 
 def _refresh_podman_info_cache():
     if not _podman_info_refresh_lock.acquire(blocking=False):
@@ -9188,19 +8855,8 @@ def _fetch_images_data():
             return True
         except Exception:
             _close_readonly_api_client(api)
-    if _pull_in_progress.is_set():
-        return False
-    client = get_docker_client()
-    if client:
-        try:
-            raw_images = client.api.images(all=False)
-            result = _parse_images(raw_images)
-            resp_data = {'status': 'success', 'images': result}
-            _images_cache = {'data': resp_data, 'time': now}
-            return True
-        except Exception:
-            pass
     return False
+
 
 def _refresh_images_cache():
     if not _images_refresh_lock.acquire(blocking=False):
@@ -9224,16 +8880,16 @@ def podman_list_images():
         return jsonify(_images_cache['data'])
     if _images_cache['data']:
         threading.Thread(target=_refresh_images_cache, daemon=True).start()
-        return jsonify(_images_cache['data'])
+        return jsonify(dict(_images_cache['data'], refreshing=True))
     mgr = _get_podman_manager()
     if not mgr.is_engine_ready():
-        _start_podman_async()
+        starting = bool(_podman_async_running or getattr(mgr, '_setup_running', False))
         return jsonify({
-            'status': 'success',
+            'status': 'success' if starting else 'error',
             'images': [],
-            'loading': True,
-            'setup_running': True,
-            'message': 'Podman engine is starting'
+            'loading': starting,
+            'setup_running': starting,
+            'message': 'Container engine is starting' if starting else 'Local runtime connection unavailable'
         })
     if _fetch_images_data():
         return jsonify(_images_cache['data'])
@@ -9242,7 +8898,7 @@ def podman_list_images():
         'status': 'success',
         'images': [],
         'loading': True,
-        'message': 'Podman images are loading'
+        'message': 'Runtime images are loading'
     })
 
 def _parse_images(raw_images):
@@ -9252,7 +8908,11 @@ def _parse_images(raw_images):
     seen_entries = set()
     now_dt = datetime.datetime.now(datetime.timezone.utc)
     for img_data in raw_images:
+        labels = img_data.get('Labels') or (img_data.get('Config') or {}).get('Labels') or {}
+        builtin_r = bool(labels.get('org.primigenius.r-version'))
         tags = img_data.get('RepoTags') or ['<none>:<none>']
+        if builtin_r:
+            tags = [R_CUSTOM_IMAGE]
         short_id = img_data['Id'].replace('sha256:', '')[:12]
         _hide = False
         for t in tags:
@@ -9267,14 +8927,18 @@ def _parse_images(raw_images):
                     break
             if _hide:
                 break
-        if _hide:
+        if _hide and not builtin_r:
             continue
         for tag in tags:
             slash = tag.rfind('/')
             colon = tag.rfind(':')
             parts = [tag[:colon], tag[colon + 1:]] if colon > slash else [tag, 'latest']
-            is_system_r_image = _is_pinned_r_runtime_local_ref(tag)
-            if is_system_r_image:
+            is_system_r_image = builtin_r or _is_pinned_r_runtime_local_ref(tag)
+            if builtin_r:
+                display_repo, display_tag = R_CUSTOM_IMAGE.rsplit(':', 1)
+                canonical_ref = local_ref = display_name = R_CUSTOM_IMAGE
+                entry_key = ('builtin-r', img_data['Id'])
+            elif is_system_r_image:
                 display_repo = R_DOCKER_IMAGE_REPOSITORY
                 display_tag = R_DOCKER_IMAGE_TAG
                 canonical_ref = R_DOCKER_IMAGE_TAGGED
@@ -9333,6 +8997,7 @@ def _parse_images(raw_images):
                 'canonical_ref': canonical_ref,
                 'display_name': display_name,
                 'is_system_r_image': is_system_r_image,
+                'is_builtin_r_environment': builtin_r,
                 'tag': display_tag,
                 'size': size_str,
                 'created': created_str,
@@ -9347,7 +9012,7 @@ def podman_remove_image():
     """Remove a local image by ID."""
     client = get_docker_client()
     if not client:
-        return jsonify({'status': 'error', 'message': 'Podman is not running'})
+        return jsonify({'status': 'error', 'message': 'Runtime is not running'})
     data = request.get_json(force=True)
     image_id = data.get('image_id', '').strip()
     repo = data.get('repo', '').strip()
@@ -9358,11 +9023,16 @@ def podman_remove_image():
         if _strip_repo.startswith(pfx):
             _strip_repo = _strip_repo[len(pfx):]
             break
-    if _strip_repo == 'primigenius-r-base' or _strip_repo.startswith('primigenius-r-base:'):
-        return jsonify({'status': 'error', 'message': 'Cannot remove system-required image'})
     try:
-        if _is_pinned_r_runtime_local_ref(repo):
-            _remove_custom_r_runtime_images(client)
+        target = client.images.get(image_id)
+        labels = ((getattr(target, 'attrs', {}) or {}).get('Config') or {}).get('Labels') or {}
+        if labels.get('org.primigenius.r-version'):
+            if data.get('confirm_r_environment') is not True:
+                return jsonify(status='error', message='Confirm deletion of the built-in R environment', requires_r_confirmation=True), 409
+            _offline_r_environment().remove(target.id, confirmed=True)
+            _image_exists_cache.clear()
+            _images_cache.update(data=None, time=0)
+            return jsonify(status='success', r_environment_removed=True, recovery='local-archive')
         if _strip_repo == 'quay.io/biocontainers/star' or _strip_repo.startswith('quay.io/biocontainers/star:'):
             try:
                 client.images.remove('primigenius-star-align:latest', force=True)
@@ -9377,7 +9047,7 @@ def podman_remove_image():
         log(f'[SYSTEM] Removed image: {image_id}')
         return jsonify({'status': 'success'})
     except Exception as e:
-        log(f'[ERROR] podman_remove_image: {e}')
+        log(f'[ERROR] runtime_remove_image: {e}')
         return jsonify({'status': 'error', 'message': str(e)})
 
 
@@ -9408,7 +9078,7 @@ def podman_export_image():
     try:
         output_path = _validate_local_tar_path(data.get('path'), must_exist=False)
         if not mgr.is_engine_ready():
-            return jsonify({'status': 'error', 'message': 'Podman is not running'}), 503
+            return jsonify({'status': 'error', 'message': 'Runtime is not running'}), 503
         if not _image_archive_lock.acquire(blocking=False):
             return jsonify({'status': 'error', 'message': 'Another image import or export is already running'}), 409
         try:
@@ -9419,13 +9089,13 @@ def podman_export_image():
             )
             result = mgr._run_wsl(command, timeout=24 * 60 * 60)
             if result is None or result.returncode != 0:
-                detail = ((result.stderr or '') or (result.stdout or '')).strip() if result else 'Podman command failed'
+                detail = ((result.stderr or '') or (result.stdout or '')).strip() if result else 'Runtime command failed'
                 raise RuntimeError(detail)
         finally:
             _image_archive_lock.release()
         return jsonify({'status': 'success', 'path': output_path, 'image': image_ref})
     except Exception as e:
-        log(f'[ERROR] podman_export_image: {e}')
+        log(f'[ERROR] runtime_export_image: {e}')
         return jsonify({'status': 'error', 'message': str(e)})
 
 
@@ -9438,14 +9108,14 @@ def podman_load_image_archive():
     try:
         input_path = _validate_local_tar_path(data.get('path'), must_exist=True)
         if not mgr.is_engine_ready():
-            return jsonify({'status': 'error', 'message': 'Podman is not running'}), 503
+            return jsonify({'status': 'error', 'message': 'Runtime is not running'}), 503
         if not _image_archive_lock.acquire(blocking=False):
             return jsonify({'status': 'error', 'message': 'Another image import or export is already running'}), 409
         try:
             wsl_path = mgr.host_path_to_wsl(input_path)
             result = mgr._run_wsl(f'podman load -i {shlex.quote(wsl_path)}', timeout=24 * 60 * 60)
             if result is None or result.returncode != 0:
-                detail = ((result.stderr or '') or (result.stdout or '')).strip() if result else 'Podman command failed'
+                detail = ((result.stderr or '') or (result.stdout or '')).strip() if result else 'Runtime command failed'
                 raise RuntimeError(detail)
             output = ((result.stdout or '') + '\n' + (result.stderr or '')).strip()
             _image_exists_cache.clear()
@@ -9455,13 +9125,13 @@ def podman_load_image_archive():
             _image_archive_lock.release()
         return jsonify({'status': 'success', 'path': input_path, 'output': output})
     except Exception as e:
-        log(f'[ERROR] podman_load_image_archive: {e}')
+        log(f'[ERROR] runtime_load_image_archive: {e}')
         return jsonify({'status': 'error', 'message': str(e)})
 
 
 @app.route('/podman/images/search', methods=['GET'])
 def podman_search_images():
-    """Search Docker Hub for images (Podman-compatible)."""
+    """Search Docker Hub for images (Runtime-compatible)."""
     client = None
     query = request.args.get('q', '').strip()
     if not query:
@@ -9691,7 +9361,7 @@ def podman_search_images():
                 if client is None:
                     client = get_docker_client()
                 if not client:
-                    errors.append('engine: Podman API unavailable')
+                    errors.append('engine: Local engine connection unavailable')
                     continue
                 results = []
                 seen_names = set()
@@ -9738,7 +9408,7 @@ def podman_search_images():
                 )
         except Exception as e:
             errors.append(f'{src}: {e!r}')
-            log(f'[WARN] podman_search_images source failed [{src}]: {e!r}')
+            log(f'[WARN] runtime_search_images source failed [{src}]: {e!r}')
             continue
 
     # 理论上不会到这里；兜底保持前端可用
@@ -10047,7 +9717,10 @@ def podman_pull_image():
             try:
                 client = get_docker_client()
                 if not client:
-                    pull_error[0] = 'Cannot connect to Podman API'
+                    pull_error[0] = 'Cannot connect to Local engine connection'
+                    return
+                if image_name == R_DOCKER_IMAGE:
+                    _offline_r_environment().ensure()
                     return
                 if archive_only:
                     with _IMAGE_PULL_LOCK:
@@ -10085,7 +9758,7 @@ def podman_pull_image():
             while True:
                 with _LOG_EVENT_COND:
                     _LOG_EVENT_COND.wait(timeout=0.5)
-                    events = [e for e in _LOG_EVENTS if e.get('runId') == pull_run_id and e.get('seq', 0) > last_seq]
+                events = _LOG_JOURNAL.read(pull_run_id, last_seq)
 
                 for evt in sorted(events, key=lambda e: e.get('seq', 0)):
                     last_seq = evt.get('seq', last_seq)
@@ -10116,7 +9789,7 @@ def podman_pull_image():
                         yield f"data: {json.dumps({'type': 'status', 'status': raw_line, 'id': ''})}\n\n"
                     last_emit = time.monotonic()
 
-                # Keep the local fetch/SSE stream alive while Podman is busy on
+                # Keep the local fetch/SSE stream alive while Runtime is busy on
                 # a large layer and produces no newline-delimited status output.
                 if not events and (time.monotonic() - last_emit) >= 10:
                     yield ': keepalive\n\n'
@@ -10147,7 +9820,7 @@ def podman_network_profile_set():
     mode = _safe_network_mode(data.get('mode'))
     saved = _save_network_profile(mode)
     strategy = NETWORK_MODE_STRATEGIES.get(mode, NETWORK_MODE_STRATEGIES['auto'])
-    log(f'[SYSTEM] Podman network profile set to: {mode}')
+    log(f'[SYSTEM] Runtime network profile set to: {mode}')
     return jsonify({
         'status': 'success',
         'mode': saved.get('mode', mode),
@@ -10192,7 +9865,7 @@ def podman_config_read():
         mirrors = mgr._get_configured_mirrors()
         return jsonify({'status': 'success', 'config': content, 'path': config_path, 'registry-mirrors': mirrors})
     except Exception as e:
-        log(f'[ERROR] podman_config_read: {e}')
+        log(f'[ERROR] runtime_config_read: {e}')
         return jsonify({'status': 'error', 'message': str(e)})
 
 
@@ -10204,10 +9877,10 @@ def podman_mirror_configure():
     mirrors = [m.strip().removeprefix('https://').removeprefix('http://') for m in mirrors if m and m.strip()]
     try:
         mgr.configure_mirror(mirrors)
-        log(f'[SYSTEM] Podman mirror configured: {mirrors}')
+        log(f'[SYSTEM] Runtime mirror configured: {mirrors}')
         return jsonify({'status': 'success', 'mirrors': mirrors})
     except Exception as e:
-        log(f'[ERROR] podman_mirror_configure: {e}')
+        log(f'[ERROR] runtime_mirror_configure: {e}')
         return jsonify({'status': 'error', 'message': str(e)})
 
 
@@ -10236,15 +9909,15 @@ def podman_config_write():
         return jsonify({'status': 'error', 'message': 'Empty configuration'})
     try:
         config_path = mgr.write_config(config_str)
-        log(f'[SYSTEM] Podman containers.conf updated: {config_path}')
+        log(f'[SYSTEM] Runtime containers.conf updated: {config_path}')
         if platform.system() == 'Windows':
             mgr.machine_stop()
             time.sleep(2)
             mgr.machine_start()
-            log('[SYSTEM] Podman Machine restarting after config change ...')
+            log('[SYSTEM] Runtime restarting after config change ...')
         return jsonify({'status': 'success', 'path': config_path})
     except Exception as e:
-        log(f'[ERROR] podman_config_write: {e}')
+        log(f'[ERROR] runtime_config_write: {e}')
         return jsonify({'status': 'error', 'message': str(e)})
 
 
@@ -10255,20 +9928,20 @@ def podman_machine_relocate():
     new_path = data.get('path', '').strip()
     if not new_path:
         return jsonify({'status': 'error', 'message': 'No target path provided'})
-    log(f'[SYSTEM] Podman Machine relocate: target = {new_path}')
+    log(f'[SYSTEM] Runtime relocate: target = {new_path}')
     try:
         ok, message = mgr.relocate_data_dir(new_path)
         if not ok:
             return jsonify({'status': 'error', 'message': message})
-        log(f'[SYSTEM] Podman Machine storage relocated to {message} successfully.')
+        log(f'[SYSTEM] Runtime storage relocated to {message} successfully.')
         return jsonify({'status': 'success', 'new_path': message})
     except Exception as e:
-        log(f'[ERROR] podman_machine_relocate: {e}')
+        log(f'[ERROR] runtime_machine_relocate: {e}')
         return jsonify({'status': 'error', 'message': str(e)})
 
 
 # ==========================================
-# Podman Machine Management API
+# Runtime Management API
 # ==========================================
 
 @app.route('/podman/machine/status', methods=['GET'])
@@ -10338,119 +10011,118 @@ def podman_auto_setup():
 
 @app.route('/podman/wsl-status', methods=['GET'])
 def podman_wsl_status():
-    global _podman_wsl_cache
-    now = time.time()
-    include_usage = str(request.args.get('include_usage', '')).strip().lower() in ('1', 'true', 'yes', 'on')
-    if (not include_usage) and _podman_wsl_cache['data'] and now - _podman_wsl_cache['time'] < 5:
-        return jsonify(_podman_wsl_cache['data'])
     mgr = _get_podman_manager()
-    setup_running = bool(_podman_async_running or getattr(mgr, '_setup_running', False))
-    engine_ready = mgr.is_engine_ready()
-    if setup_running and not engine_ready:
-        machine_exists = False
-        try:
-            machine_exists = bool(mgr._is_wsl_distro_registered())
-        except Exception:
-            pass
-        resp_data = {
-            'status': 'success',
-            'wsl_enabled': True,
-            'wsl2_feature_enabled': True,
-            'depends_on_wsl': platform.system() == 'Windows',
-            'wsl_default_version': None,
-            'wsl_distro_version': None,
-            'wsl_distro_registered': machine_exists,
-            'wsl_status_text': '',
-            'wsl_distro_list_text': '',
-            'podman_available': True,
-            'podman_version': '',
-            'machine_exists': machine_exists,
-            'machine_running': False,
-            'api_service_running': False,
-            'setup_running': True,
-            'client_type': 'starting',
-            'machine_name': mgr.machine_name,
-            'wsl_distro_name': mgr.wsl_distro_name,
-            'runtime_channel': mgr.runtime_channel,
-            'data_dir': mgr.podman_data_dir,
-            'config_dir': mgr.podman_config_dir,
-            'data_usage': ''
-        }
-        _podman_wsl_cache = {'data': resp_data, 'time': now}
-        return jsonify(resp_data)
-    wsl_info = mgr.get_wsl_status_details()
-    api_running = False
-    if mgr._wsl_service_started and mgr._test_tcp_connection():
-        api_running = True
-    elif mgr._api_service_proc is not None:
-        try:
-            mgr._api_service_proc.poll()
-            api_running = mgr._api_service_proc.returncode is None
-        except Exception:
-            pass
-    client_type = 'none'
-    if api_running:
-        try:
-            client = getattr(mgr, '_api_client', None) or _api_client_cache.get('client') or _docker_client
-            if client is not None:
-                try:
-                    from podman import PodmanClient as NativePodmanClient
-                    client_type = 'podman-native' if isinstance(client, NativePodmanClient) else 'docker-sdk'
-                except ImportError:
-                    client_type = 'docker-sdk'
-            else:
-                client_type = 'api-ready'
-        except Exception:
-            client_type = 'api-ready'
-    resp_data = {
-        'status': 'success',
-        'wsl_enabled': bool(wsl_info.get('wsl_available')),
-        'wsl2_feature_enabled': bool(wsl_info.get('wsl2_enabled')),
-        'depends_on_wsl': platform.system() == 'Windows',
-        'wsl_default_version': wsl_info.get('default_version'),
-        'wsl_distro_version': wsl_info.get('distro_version'),
-        'wsl_distro_registered': bool(wsl_info.get('distro_registered')),
-        'wsl_status_text': wsl_info.get('status_text') or '',
-        'wsl_distro_list_text': wsl_info.get('distro_list_text') or '',
-        'podman_available': mgr.is_podman_available(),
-        'podman_version': mgr.get_podman_version(),
-        'machine_exists': mgr.machine_exists(),
-        'machine_running': mgr.machine_is_running(),
-        'api_service_running': api_running,
-        'setup_running': setup_running,
-        'client_type': client_type,
-        'machine_name': mgr.machine_name,
-        'wsl_distro_name': mgr.wsl_distro_name,
-        'runtime_channel': mgr.runtime_channel,
-        'data_dir': mgr.podman_data_dir,
-        'config_dir': mgr.podman_config_dir,
-        'data_usage': mgr.get_data_usage() if include_usage else ''
-    }
-    if not include_usage:
-        _podman_wsl_cache = {'data': resp_data, 'time': now}
-    return jsonify(resp_data)
+    ready = mgr.is_engine_ready()
+    exists = mgr.machine_exists()
+    runtime = mgr.runtime.status()
+    return jsonify({
+        'status': 'success', 'wsl_enabled': exists, 'wsl2_feature_enabled': exists,
+        'depends_on_wsl': platform.system() == 'Windows', 'wsl_default_version': None,
+        'wsl_distro_version': 2 if exists else None, 'wsl_distro_registered': exists,
+        'wsl_status_text': 'connected' if ready else 'registered' if exists else 'not deployed',
+        'wsl_distro_list_text': '', 'podman_available': mgr.is_podman_available(),
+        'podman_version': mgr.get_podman_version(), 'machine_exists': exists,
+        'machine_running': ready, 'api_service_running': ready,
+        'setup_running': bool(_podman_async_running or mgr._setup_running),
+        'client_type': 'docker-sdk' if ready else 'none', 'machine_name': mgr.machine_name,
+        'wsl_distro_name': mgr.wsl_distro_name, 'runtime_channel': mgr.runtime_channel,
+        'data_dir': mgr.podman_data_dir, 'config_dir': mgr.podman_config_dir,
+        'data_usage': mgr.get_data_usage() if request.args.get('include_usage') == '1' else '',
+        'runtime': runtime, 'runtime_state': runtime['state'], 'transport': runtime['transport'],
+        'engine_ready': ready, 'active': _podman_suspend_busy_state()
+    })
 
 
 @app.route('/podman/cleanup', methods=['POST'])
 def podman_full_cleanup():
     mgr = _get_podman_manager()
     mgr.cleanup_all()
-    return jsonify({'status': 'success', 'message': 'All Podman data cleaned up'})
+    return jsonify({'status': 'success', 'message': 'All Runtime data cleaned up'})
 
+
+
+@app.before_request
+def _guard_runtime_shutdown():
+    # Keep header-less native/plugin clients compatible while refusing browser
+    # requests from remote sites or DNS-rebound hosts to this local control API.
+    try:
+        local = urllib.parse.urlsplit('//' + request.host)
+        if local.hostname not in ('127.0.0.1', 'localhost', '::1'):
+            return jsonify({'status': 'error', 'message': 'Local API host required'}), 403
+        origin = request.headers.get('Origin', '')
+        if origin and origin != 'null':
+            parsed = urllib.parse.urlsplit(origin)
+            if parsed.scheme != 'file' and (parsed.scheme not in ('http', 'https') or
+                    parsed.hostname not in ('127.0.0.1', 'localhost', '::1') or parsed.port != local.port):
+                return jsonify({'status': 'error', 'message': 'Cross-origin control request denied'}), 403
+    except ValueError:
+        return jsonify({'status': 'error', 'message': 'Invalid local API origin'}), 403
+    if _SHUTDOWN_REQUESTED.is_set() and request.method == 'POST' and request.path != '/podman/shutdown':
+        return jsonify({'status': 'error', 'message': 'Application is stopping tasks'}), 503
+
+
+@app.route('/podman/runtime-status', methods=['GET', 'POST'])
+def runtime_status():
+    mgr = _get_podman_manager()
+    ready = mgr.is_engine_ready()
+    active = _podman_suspend_busy_state()
+    if ready:
+        try:
+            client = mgr.get_podman_client()
+            active['containers'] = len(client.containers.list(filters={'label': 'primigenius.owner=' + mgr.runtime.identity}))
+        except Exception as exc:
+            return jsonify({'status': 'error', 'message': str(exc), 'active': active}), 503
+    return jsonify({'status': 'success', 'runtime': mgr.runtime.status(), 'active': active})
+
+
+@app.after_request
+def _add_runtime_status(response):
+    if request.path in ('/podman/info', '/podman/wsl-status') and response.is_json:
+        payload = response.get_json()
+        mgr = _get_podman_manager()
+        ready = mgr.is_engine_ready()
+        state = mgr.runtime.status()
+        payload.update(runtime=state, runtime_state=state['state'], transport=state['transport'],
+                       engine_ready=ready, active=_podman_suspend_busy_state())
+        response.set_data(json.dumps(payload, ensure_ascii=False))
+    return response
 
 @app.route('/podman/shutdown', methods=['POST'])
 def podman_shutdown():
     mgr = _get_podman_manager()
-    data = request.get_json(force=True) or {}
-    stop_machine = data.get('stop_machine', True)
-    if stop_machine:
+    _SHUTDOWN_REQUESTED.set()
+    try:
+        client = mgr.get_podman_client()
+        if client is not None:
+            for container in client.containers.list(filters={'label': 'primigenius.owner=' + mgr.runtime.identity}):
+                container.stop(timeout=5)
+        for proc in _native_process_snapshot():
+            if proc.poll() is None:
+                if os.name == 'nt':
+                    subprocess.run(['taskkill', '/PID', str(proc.pid), '/T', '/F'], timeout=10,
+                                   capture_output=True, **_HIDDEN_SUBPROCESS_KWARGS)
+                else:
+                    proc.terminate()
+        # Analysis workers own final log collection. Let them finish before closing IPC.
+        deadline = time.monotonic() + 45
+        while any(_podman_suspend_busy_state().values()) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        busy = _podman_suspend_busy_state()
+        if any(busy.values()):
+            return jsonify({'status': 'busy', 'active': busy, 'message': 'Tasks are still draining; the backend was preserved'}), 409
+        _LOG_JOURNAL.flush()
         mgr.stop_containers_and_machine()
-    else:
-        try:
-            mgr._run_podman(['stop', '--all'], timeout=30)
-        except Exception:
-            pass
-    return jsonify({'status': 'success'})
+        global _docker_client
+        _close_docker_client(_docker_client)
+        _docker_client = None
+        cached = _api_client_cache.pop('client', None)
+        if cached is not None:
+            cached.close()
+        return jsonify({'status': 'success'})
+    except Exception as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), 503
+    finally:
+        _SHUTDOWN_REQUESTED.clear()
 
 
 @app.route('/podman/suspend', methods=['POST'])
@@ -10459,7 +10131,7 @@ def podman_suspend():
     if any(busy.values()):
         return jsonify({
             'status': 'busy',
-            'message': 'Podman was kept running because work is active.',
+            'message': 'Runtime was kept running because work is active.',
             'active': busy,
         })
     ok, message = _get_podman_manager().prepare_for_host_suspend()
@@ -10472,19 +10144,12 @@ def podman_suspend():
 
 @app.route('/podman/resume', methods=['POST'])
 def podman_resume():
+    mgr = _get_podman_manager()
     busy = _podman_suspend_busy_state()
-    if any(busy.values()):
-        return jsonify({
-            'status': 'busy',
-            'message': 'Automatic recovery was skipped because work is active.',
-            'active': busy,
-        })
-    ok, message = _get_podman_manager().auto_setup()
-    return jsonify({
-        'status': 'success' if ok else 'error',
-        'message': message,
-        'active': busy,
-    }), (200 if ok else 503)
+    # IPC can recover while tasks run. This never resets or terminates WSL.
+    ok = mgr._start_wsl_podman_service(force=True)
+    return jsonify({'status': 'success' if ok else 'error', 'active': busy,
+                    'message': 'Local connection restored' if ok else mgr.runtime.last_error}), (200 if ok else 503)
 
 
 @app.route('/podman/api-service/start', methods=['POST'])
@@ -10492,7 +10157,7 @@ def podman_api_service_start():
     mgr = _get_podman_manager()
     ok = mgr.start_api_service(timeout=0)
     if ok:
-        return jsonify({'status': 'success', 'message': 'Podman API service started'})
+        return jsonify({'status': 'success', 'message': 'Local engine connection service started'})
     return jsonify({'status': 'error', 'message': 'Failed to start API service'})
 
 
@@ -10500,7 +10165,7 @@ def podman_api_service_start():
 def podman_api_service_stop():
     mgr = _get_podman_manager()
     mgr.stop_api_service()
-    return jsonify({'status': 'success', 'message': 'Podman API service stopped'})
+    return jsonify({'status': 'success', 'message': 'Local engine connection service stopped'})
 
 
 @app.route('/podman/client-type', methods=['GET'])
@@ -10508,31 +10173,53 @@ def podman_client_type():
     mgr = _get_podman_manager()
     client = mgr.get_podman_client()
     if client is None:
-        return jsonify({'status': 'error', 'client_type': 'none', 'message': 'No Podman client available'})
+        return jsonify({'status': 'error', 'client_type': 'none', 'message': 'No Runtime client available'})
     try:
         from podman import PodmanClient as NativePodmanClient  # type: ignore
         if isinstance(client, NativePodmanClient):
-            return jsonify({'status': 'success', 'client_type': 'podman-native', 'message': 'Using Podman Python Bindings'})
+            return jsonify({'status': 'success', 'client_type': 'podman-native', 'message': 'Using the runtime client'})
     except ImportError:
         pass
-    return jsonify({'status': 'success', 'client_type': 'docker-sdk', 'message': 'Using Docker SDK (Podman compatible)'})
+    return jsonify({'status': 'success', 'client_type': 'docker-sdk', 'message': 'Using the built-in container engine'})
 
 
 if __name__ == '__main__':
+    if '--prepare-offline-r' in sys.argv:
+        # NSIS launches this as the interactive user, so WSL registration and
+        # package-library ownership match the eventual application session.
+        result_dir = os.path.join(APP_INSTALL_DIR, 'resources', 'r-environment', 'stage')
+        os.makedirs(result_dir, exist_ok=True)
+        exit_code, detail = 1, ''
+        try:
+            manager = _get_podman_manager()
+            ok, message = manager.auto_setup()
+            if not ok:
+                raise RuntimeError(message)
+            _offline_r_environment().ensure()
+            exit_code = 0
+        except Exception as exc:
+            detail = str(exc)
+            log('[R-ENV] Installation needs attention: ' + detail)
+        finally:
+            _LOG_JOURNAL.flush()
+            try:
+                _get_podman_manager().runtime.stop()
+            except Exception:
+                pass
+            result_file = os.path.join(result_dir, 'install-result.txt')
+            with open(result_file + '.tmp', 'w', encoding='utf-8') as handle:
+                handle.write(str(exit_code) + '\n' + detail)
+            os.replace(result_file + '.tmp', result_file)
+        sys.exit(exit_code)
     log("[SYSTEM] Starting PrimiGenius backend...")
-    log("[SYSTEM] Initializing PodmanManager...")
+    log("[SYSTEM] Initializing runtime manager...")
     _get_podman_manager()
-    log("[SYSTEM] Starting Podman asynchronously...")
+    log("[SYSTEM] Starting Runtime asynchronously...")
     _start_podman_async()
     def _warmup_plugin_cache():
-        time.sleep(3)
         try:
             load_all_plugins()
             log("[SYSTEM] Plugin config cache warmed up")
-        except Exception:
-            pass
-        try:
-            _cleanup_stale_containers()
         except Exception:
             pass
     threading.Thread(target=_warmup_plugin_cache, daemon=True).start()
@@ -10540,7 +10227,7 @@ if __name__ == '__main__':
     # conflicts and Windows/Hyper-V excluded port ranges on end-user machines.
     server = make_server('127.0.0.1', 0, app, threaded=True)
     api_port = int(server.server_port)
-    log(f"[SYSTEM] Starting API server on port {api_port} (Podman will be ready in background)...")
+    log(f"[SYSTEM] Starting API server on port {api_port} (Runtime will be ready in background)...")
     # Machine-readable startup handshake consumed by the Electron main process.
     print(f"PRIMIGENIUS_API_PORT={api_port}", flush=True)
     server.serve_forever()

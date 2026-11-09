@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "r_version": "4.6.1",
+  "bioconductor_version": "3.23",
+  "recipe_sha256": "d029da6d09321aca1b701e3c9e327297ac38f6d4df8d7c15a99824893ce9b02e",
+  "image_id": "sha256:0f3be9d2714e02c1dbf9c3f3b856338653f5efb28b1ca5394c2122ee6ac9c49e",
+  "archive": "environment.tar.xz",
+  "archive_sha256": "1f5821372619255ccb2608b63b867ea1f66513ed36aeb32d10dc84d0fb3ced02",
+  "archive_bytes": 548438276,
+  "image_bytes": 2651999402,
+  "required_free_bytes": 5840869716,
+  "space_policy": "conservative: two image copies plus 512 MiB; acceptance records measured peak separately",
+  "source_image": "primigenius-r-base:r4.6.1-bioc3.23-v6",
+  "network_disabled_smoke_test": true,
+  "metadata_files": {
+    "Containerfile": "0904b8bb6e1cbf2497e35db3b463350ffe20c0cf4611ef02a59dbd744e87018c",
+    "packages.txt": "997d8dd97194dc856f22c7241e2bc04822626489d9162a7de97981cbc930d5b3",
+    "r-packages.txt": "b663f0234c9b9ccafed0afff42c4c618ca971bac20e1c06a9a2583bbe5fb593a",
+    "licenses.tar.gz": "3f7811bc37eb914e4c691d38162a4e425e8d793ab68022ab59d7c03bc9b5bcb4",
+    "build.Containerfile": "50762551a0246e5ced705e6ff056821f9e91124516e1f0257c490a8766395c6d"
+  },
+  "build_parent_image_id": "sha256:016a941a68d52b737edc08295fa6b5ee65d7b3e292e8c801236307bc02275468"
+}

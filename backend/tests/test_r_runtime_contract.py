@@ -131,7 +131,7 @@ class RRuntimeContractTests(unittest.TestCase):
 
     def test_custom_recipe_carries_runtime_contract_labels(self):
         recipe = backend_app._r_custom_recipe_text()
-        self.assertIn(f'FROM {backend_app.R_DOCKER_IMAGE}', recipe)
+        self.assertIn(f'FROM docker.io/{backend_app.R_DOCKER_IMAGE}', recipe)
         self.assertIn('org.primigenius.r-version="4.6.1"', recipe)
         self.assertIn('org.primigenius.bioconductor-version="3.23"', recipe)
         self.assertIn(backend_app.R_DOCKER_IMAGE_DIGEST, recipe)
@@ -145,6 +145,15 @@ class RRuntimeContractTests(unittest.TestCase):
         self.assertIn('--no-install-recommends', recipe)
         self.assertNotIn('update -qq', recipe)
         self.assertNotIn('2>/dev/null', recipe)
+
+    def test_tcltk_runtime_and_headers_are_declared_and_validated(self):
+        recipe = backend_app._r_custom_recipe_text()
+        for package in ('libtcl8.6', 'libtk8.6', 'tcl8.6-dev', 'tk8.6-dev', 'tcl-dev', 'tk-dev'):
+            self.assertIn(package, backend_app.R_SYSTEM_DEPS.split())
+            self.assertIn('        ' + package + ' ', recipe)
+        self.assertIn('library(tcltk)', backend_app.R_TCLTK_CHECK)
+        self.assertIn('tcl("expr", "1+1")', backend_app.R_TCLTK_CHECK)
+        self.assertIn('R_TCLTK_CHECK', inspect.getsource(backend_app._validate_offline_r_environment))
 
     def test_apt_mirrors_are_ordered_by_live_probe_with_fallbacks(self):
         latency = {'tuna': 90, 'ustc': 20, 'official': 120}
@@ -162,38 +171,12 @@ class RRuntimeContractTests(unittest.TestCase):
         self.assertEqual('https://mirrors.ustc.edu.cn/ubuntu', ordered[0])
         self.assertIn('https://mirrors.aliyun.com/ubuntu', ordered)
 
-    def test_custom_image_build_retries_with_next_apt_mirror(self):
-        labels = {
-            'org.primigenius.r-version': backend_app.R_VERSION,
-            'org.primigenius.bioconductor-version': backend_app.BIOCONDUCTOR_VERSION,
-            'org.primigenius.base-digest': backend_app.R_DOCKER_IMAGE_DIGEST,
-            'org.primigenius.recipe-version': str(backend_app.R_CUSTOM_RECIPE_VERSION),
-            'org.primigenius.recipe-sha256': backend_app.R_CUSTOM_RECIPE_SHA256,
-        }
-        built_image = mock.Mock(attrs={'Config': {'Labels': labels}})
-        client = mock.Mock()
-        client.images.get.side_effect = [backend_app.docker.errors.ImageNotFound('missing'), built_image]
-        client.api.build.side_effect = [
-            [{'error': 'first mirror failed'}],
-            [{'stream': 'build complete'}],
-        ]
-        validation_container = mock.Mock(id='validation-container')
-        validation_container.wait.return_value = {'StatusCode': 0}
-        client.containers.run.return_value = validation_container
-        backend_app._image_exists_cache.pop(backend_app.R_CUSTOM_IMAGE, None)
-        with tempfile.TemporaryDirectory() as root, \
-             mock.patch.object(backend_app, 'APP_INSTALL_DIR', root), \
-             mock.patch.object(backend_app, '_ensure_pinned_r_base_image', return_value=True), \
-             mock.patch.object(backend_app, '_ordered_r_apt_mirrors', return_value=['https://bad.example/ubuntu', 'https://good.example/ubuntu']):
+    def test_compatibility_entry_only_prepares_offline_environment(self):
+        env, client = mock.Mock(), mock.Mock()
+        with mock.patch.object(backend_app, '_offline_r_environment', return_value=env):
             self.assertTrue(backend_app._ensure_custom_r_image(client))
-        self.assertEqual(2, client.api.build.call_count)
-        self.assertEqual(
-            {'APT_MIRROR': 'https://good.example/ubuntu'},
-            client.api.build.call_args.kwargs['buildargs'],
-        )
-        self.assertTrue(client.api.build.call_args.kwargs['forcerm'])
-        validation_container.remove.assert_called_once_with(force=True)
-        backend_app._image_exists_cache.pop(backend_app.R_CUSTOM_IMAGE, None)
+        env.ensure.assert_called_once()
+        client.api.build.assert_not_called()
 
     def test_digest_is_preserved_in_mirror_pull_candidates(self):
         with mock.patch.object(backend_app, '_load_custom_mirrors', return_value=['mirror.example']), \
@@ -242,7 +225,7 @@ class RRuntimeContractTests(unittest.TestCase):
             )
         manager.pull_image_stream_wsl.assert_called_once_with(
             'docker.io/rocker/r-ver@' + backend_app.R_DOCKER_IMAGE_DIGEST,
-            cancel_event=None,
+            cancel_event=backend_app._SHUTDOWN_REQUESTED,
             retry_count=2,
             total_timeout=1800,
             bypass_registry_mirrors=True,
@@ -282,19 +265,13 @@ class RRuntimeContractTests(unittest.TestCase):
         manager._run_wsl.assert_called_once()
         self.assertGreater(manager._run_wsl.call_args.args[0].count('podman image exists'), 1)
 
-    def test_r_install_dialog_uses_direct_archive_fallback_and_refreshes(self):
-        renderer_path = os.path.abspath(os.path.join(BACKEND_DIR, '..', 'src', 'renderer.js'))
-        with open(renderer_path, 'r', encoding='utf-8') as handle:
-            source = handle.read()
-        self.assertIn('class="dlg-backup"', source)
-        self.assertIn('archive_only: true', source)
-        self.assertIn("await loadPackages(true)", source)
-        self.assertIn('let activeRImageInstallDialog = null', source)
-        self.assertIn('r-image-install-dialog-minimized', source)
-        self.assertIn("const message = downloading", source)
-        self.assertIn('窗口已最小化', source)
-        self.assertIn('activeRImageInstallDialog.updateLanguage();', source)
-        self.assertIn('install-dialog click handler survives language changes', source)
+    def test_r_dialog_offers_offline_repair(self):
+        with open(os.path.join(BACKEND_DIR, '..', 'src', 'renderer.js'), encoding='utf-8') as f:
+            source = f.read()
+        dialog = source[source.index('function showRImageInstallDialog('):source.index("ipcRenderer.on('sys-log'")]
+        self.assertIn('/r/prepare-runtime', dialog)
+        self.assertIn('installer containing the matching R environment', dialog)
+        self.assertNotIn('/podman/images/pull', dialog)
 
     def test_r_archive_uses_plugin_release_accelerators(self):
         main_path = os.path.abspath(os.path.join(BACKEND_DIR, '..', 'main.js'))
@@ -328,49 +305,18 @@ class RRuntimeContractTests(unittest.TestCase):
     def test_legacy_latest_image_is_not_mislabeled_as_pinned_runtime(self):
         self.assertFalse(backend_app._is_pinned_r_runtime_local_ref('rocker/r-ver:latest'))
 
-    def test_deleting_pinned_r_base_also_removes_all_custom_r_images(self):
-        custom_current = mock.Mock(
-            id='sha256:custom-current',
-            tags=[backend_app.R_CUSTOM_IMAGE],
-            attrs={},
-        )
-        custom_legacy = mock.Mock(
-            id='sha256:custom-legacy',
-            tags=['localhost/primigenius-r-base:install-v2'],
-            attrs={},
-        )
-        dangling_build = mock.Mock(
-            id='sha256:custom-dangling',
-            tags=[],
-            attrs={'Config': {'Labels': {
-                'org.primigenius.r-version': backend_app.R_VERSION,
-                'org.primigenius.base-digest': backend_app.R_DOCKER_IMAGE_DIGEST,
-            }}},
-        )
-        unrelated = mock.Mock(
-            id='sha256:unrelated',
-            tags=['quay.io/example/tool:1.0'],
-            attrs={},
-        )
+    def test_removing_base_does_not_cascade_to_complete_environments(self):
         client = mock.Mock()
-        client.images.list.return_value = [custom_current, custom_legacy, dangling_build, unrelated]
-        with backend_app.app.test_request_context(
-            '/podman/images/remove',
-            method='POST',
-            json={'image_id': 'sha256:r-base', 'repo': backend_app.R_DOCKER_IMAGE_TAGGED},
-        ), mock.patch.object(backend_app, 'get_docker_client', return_value=client), \
-             mock.patch.object(backend_app.threading, 'Thread'):
+        client.images.get.return_value = mock.Mock(attrs={})
+        with backend_app.app.test_request_context('/podman/images/remove', method='POST', json={'image_id':'base','repo':backend_app.R_DOCKER_IMAGE_TAGGED}), mock.patch.object(backend_app,'get_docker_client',return_value=client), mock.patch.object(backend_app.threading,'Thread'):
             response = backend_app.podman_remove_image()
         self.assertEqual('success', response.get_json()['status'])
-        removed = [call.kwargs['image'] for call in client.images.remove.call_args_list]
-        self.assertEqual(
-            ['sha256:custom-current', 'sha256:custom-legacy', 'sha256:custom-dangling', 'sha256:r-base'],
-            removed,
-        )
-        client.images.list.assert_called_once_with(all=True)
+        client.images.remove.assert_called_once_with(image='base', force=True)
+        client.images.list.assert_not_called()
 
     def test_deleting_an_unrelated_image_does_not_scan_or_remove_custom_r_images(self):
         client = mock.Mock()
+        client.images.get.return_value = mock.Mock(attrs={})
         with backend_app.app.test_request_context(
             '/podman/images/remove',
             method='POST',
@@ -446,59 +392,12 @@ class RRuntimeContractTests(unittest.TestCase):
                 backend_app._complete_r_runtime_migration(client, lock_held=True)
             self.assertTrue(os.path.isdir(legacy))
 
-    def test_successful_validation_retires_legacy_library(self):
-        class Images:
-            def __init__(self):
-                self.removed = []
-
-            def get(self, _name):
-                labels = {
-                    'org.primigenius.r-version': backend_app.R_VERSION,
-                    'org.primigenius.bioconductor-version': backend_app.BIOCONDUCTOR_VERSION,
-                    'org.primigenius.base-digest': backend_app.R_DOCKER_IMAGE_DIGEST,
-                    'org.primigenius.recipe-version': str(backend_app.R_CUSTOM_RECIPE_VERSION),
-                    'org.primigenius.recipe-sha256': backend_app.R_CUSTOM_RECIPE_SHA256,
-                }
-                return mock.Mock(attrs={'Config': {'Labels': labels}})
-
-            def remove(self, image, force=False, noprune=True):
-                self.removed.append(image)
-
-        images = Images()
-        client = mock.Mock(images=images)
-        validation_container = mock.Mock()
-        validation_container.wait.return_value = {'StatusCode': 0}
-        client.containers.run.return_value = validation_container
-        with tempfile.TemporaryDirectory() as root:
-            legacy = os.path.join(root, 'install', 'r_libs')
-            backend_legacy = os.path.join(root, 'backend', 'r_libs')
-            current = os.path.join(root, 'r_libs_current')
-            os.makedirs(legacy)
-            os.makedirs(backend_legacy)
-            os.makedirs(current)
-            with open(os.path.join(legacy, 'old-package'), 'w', encoding='utf-8') as handle:
-                handle.write('legacy')
-            with open(os.path.join(backend_legacy, 'old-package'), 'w', encoding='utf-8') as handle:
-                handle.write('legacy')
-            with mock.patch.object(backend_app, 'R_LEGACY_LIBS_DIR', legacy), \
-                 mock.patch.object(backend_app, 'R_LEGACY_BACKEND_LIBS_DIR', backend_legacy), \
-                 mock.patch.object(backend_app, 'R_LIBS_DIR', current), \
-                 mock.patch.object(backend_app, '_image_exists_locally', return_value=True), \
-                 mock.patch.object(backend_app, '_load_r_runtime_state', return_value={
-                     'migration_complete': True,
-                     'cleanup_complete': True,
-                     'library_generation': backend_app.R_LIBRARY_GENERATION,
-                 }), \
-                 mock.patch.object(backend_app, '_save_r_runtime_state') as save_state:
-                backend_app._complete_r_runtime_migration(client, lock_held=True)
-            self.assertFalse(os.path.exists(legacy))
-            self.assertFalse(os.path.exists(backend_legacy))
-            self.assertIn(backend_app.R_LEGACY_DOCKER_IMAGE, images.removed)
-            self.assertTrue(save_state.call_args.kwargs['migration_complete'])
-            self.assertEqual(2, len(save_state.call_args.kwargs['cleanup']['legacy_libraries_removed']))
-            self.assertTrue(client.containers.run.call_args.kwargs['detach'])
-            self.assertEqual({'type': 'json-file'}, client.containers.run.call_args.kwargs['log_config'])
-            self.assertTrue(client.containers.run.call_args.kwargs['mounts'][0]['ReadOnly'])
+    def test_migration_never_removes_old_libraries_or_images(self):
+        client = mock.Mock()
+        with mock.patch.object(backend_app.shutil, 'rmtree') as remove:
+            backend_app._complete_r_runtime_migration(client, lock_held=True)
+        remove.assert_not_called()
+        client.images.remove.assert_not_called()
 
 
 class RRepositorySelectionTests(unittest.TestCase):

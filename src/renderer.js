@@ -1,7 +1,19 @@
 const { ipcRenderer } = require('electron');
 const path = require('path');
+const {mountImageZoom, mountFilePreview, loadPreviewImage, mountHtmlPreview, makeWindowDraggable, makeWindowResizable, decoratePreviewHeader} = require('./file-preview');
 const os = require('os');
 const { marked } = require('marked');
+const { createStatusResource, createViewStatusRegistry } = require('./status-state');
+const { TextHistory, SvgTextIndex, latestFrame } = require('./vector-runtime');
+const marketplace = require('./marketplace');
+const { createAccountMenu } = require('./github-account');
+const { publicGithubCandidates, raceGithubReads, installGithubAvatarFallback } = require('./github-public');
+installGithubAvatarFallback(document);
+
+function isSystemLogFile(filename) {
+    const name = path.basename(filename).toLowerCase();
+    return name.endsWith('.primigenius.log') || /^primigenius\.\d{4}-\d{2}-\d{2}(?:_\d{2}-\d{2}-\d{2})?\.log$/.test(name);
+}
 
 // ==========================================
 // 1. 状态与 i18n 配置
@@ -12,10 +24,45 @@ let tabCounter = 0;
 let allPlugins = []; 
 let currentLang = 'en';
 let activeRImageInstallDialog = null;
+let desktopRuntimeState = null;
 let _appOutputsDir = '';  // populated from backend at init — absolute path to app outputs directory
 const runLogTargets = new Map(); // runId -> tabId
 const runLogStreams = new Map(); // runId -> EventSource
 const _tabRunState = new Map(); // tabId -> { runId, btnEl, origText, type:'linux'|'r' }
+let activeWorkflowRuns = 0;
+let stopWorkflowScheduling = false;
+window.primigeniusRuntimeUI = {
+    status: () => ({ active: activeWorkflowRuns + _tabRunState.size, lang: currentLang }),
+    stop: () => { stopWorkflowScheduling = true; },
+    graphics: () => ipcRenderer.invoke('rendering-diagnostics')
+};
+// Keep slow status requests from accumulating another request on every timer tick.
+// Returns a normal interval handle so existing clearInterval cleanup remains valid.
+function setNonOverlappingInterval(callback, milliseconds, owner, onDetach) {
+    let pending = false;
+    const timer = setInterval(async () => {
+        if (owner && !owner.isConnected) {
+            clearInterval(timer);
+            if (onDetach) onDetach();
+            return;
+        }
+        if (pending) return;
+        pending = true;
+        try { await callback(); }
+        catch (error) { console.warn('Status refresh failed:', error); }
+        finally { pending = false; }
+    }, milliseconds);
+    return timer;
+}
+function runtimeStateLabel(runtime) {
+    const labels = {
+        undeployed: ['未部署', 'Not deployed'], starting: ['启动中', 'Starting'],
+        ready: ['就绪', 'Ready'], recovering: ['恢复中', 'Recovering'],
+        stopped: ['已停止', 'Stopped'], attention: ['需处理', 'Needs attention']
+    };
+    const state = runtime && runtime.engine_ready ? 'ready' : (runtime && runtime.state) || 'attention';
+    return (labels[state] || labels.attention)[currentLang === 'zh' ? 0 : 1];
+}
 const BACKEND_PORT = Number(ipcRenderer.sendSync('get-backend-port-sync'));
 if (!Number.isInteger(BACKEND_PORT) || BACKEND_PORT <= 0 || BACKEND_PORT > 65535) {
     throw new Error(`Invalid backend port received from main process: ${BACKEND_PORT}`);
@@ -25,6 +72,225 @@ const API_BASE = `http://127.0.0.1:${BACKEND_PORT}`;
 // POST requests cannot exhaust Chromium's per-origin connection pool.
 const AUX_API_BASE = `http://localhost:${BACKEND_PORT}`;
 const auxApiUrl = (path) => AUX_API_BASE + path;
+
+async function readStatusJson(url, timeout = 10000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+        const response = await fetch(auxApiUrl(url), {cache: 'no-store', signal: controller.signal});
+        if (!response.ok) throw new Error(`Status HTTP ${response.status}`);
+        return await response.json();
+    } finally { clearTimeout(timer); }
+}
+const statusResources = {
+    'r-runtime': createStatusResource(() => readStatusJson('/r/check-runtime', 5000)),
+    'r-packages': createStatusResource(async () => {
+        const data = await readStatusJson('/r/list-packages', 15000);
+        if (data.status !== 'success') throw new Error(data.message || 'Package status unavailable');
+        return data;
+    })
+};
+const viewStatus = createViewStatusRegistry(element => !document.hidden &&
+    !!element.closest('.page-view.active'));
+function notifyStatusChanged(...keys) {
+    keys.forEach(key => statusResources[key]?.invalidate());
+    viewStatus.refresh(keys);
+}
+ipcRenderer.on('runtime-state', (_event, update) => {
+    if (update?.kind === 'engine') {
+        desktopRuntimeState = update.state;
+        document.querySelectorAll('.docker-machine-card .info-value').forEach(element => {
+            element.textContent = runtimeStateLabel(update.state);
+        });
+        notifyStatusChanged('runtime');
+    }
+    if (update?.kind === 'r') notifyStatusChanged('r-runtime');
+});
+const fetchRRuntimeStatus = () => statusResources['r-runtime'].read();
+const fetchRPackages = () => statusResources['r-packages'].read();
+window.__checkRRuntime = () => notifyStatusChanged('r-runtime', 'r-packages');
+window.addEventListener('app-tab-switched', () => viewStatus.refresh());
+window.addEventListener('focus', () => viewStatus.refresh());
+document.addEventListener('visibilitychange', () => { if (!document.hidden) viewStatus.refresh(); });
+// Recover missed completions (including jobs whose originating tab was closed).
+const viewStatusTimer = setInterval(() => viewStatus.refresh(), 10000);
+window.addEventListener('beforeunload', () => { clearInterval(viewStatusTimer); viewStatus.dispose(); });
+
+function attachLogArchiveLink(box, runId) {
+    if (!box || !runId || !box.parentElement) return;
+    box.dataset.logRunId = runId;
+    if (box.closest('[data-auto-close-log]')) {
+        box._archiveControls?.remove();
+        return;
+    }
+    if (!box._archiveControls) {
+        const controls = document.createElement('div');
+        controls.className = 'log-archive-controls';
+        const history = document.createElement('button');
+        history.type = 'button';
+        history.className = 'log-archive-button';
+        history.onclick = () => showLogHistory(box.dataset.logRunId);
+        controls.appendChild(history);
+        box._archiveControls = controls;
+    }
+    const controls = box._archiveControls;
+    const history = controls.querySelector('button');
+    history.title = runId === '*' ? (currentLang === 'zh' ? '查看本次启动的完整日志' : 'View complete logs for this session') : '';
+    if (history.dataset.lang !== currentLang) {
+        history.innerHTML = `<i class="fas fa-history" aria-hidden="true"></i> <span>${currentLang === 'zh' ? '查看完整日志' : 'Full log history'}</span>`;
+        history.dataset.lang = currentLang;
+    }
+    const header = (box.firstElementChild && box.firstElementChild.matches('.log-header') ? box.firstElementChild : null) || Array.from(box.parentElement.children)
+        .find(el => el.matches('.log-header, .local-log-header, .rpkg-log-header, .r-install-log-header'));
+    if (header) {
+        header.classList.add('log-header-with-actions');
+        if (controls.parentElement !== header) header.insertBefore(controls, header.querySelector(':scope > .rpkg-log-close, :scope > .plugin-store-install-log-close'));
+    } else if (controls.parentElement !== box.parentElement) {
+        box.parentElement.insertBefore(controls, box);
+    }
+}
+
+function finishAutoCloseInstallLog(panel, result, box = panel) {
+    if (!panel?.isConnected || !['done', 'failed'].includes(result.state)) return;
+    panel.style.display = 'none';
+    if (result.state === 'failed') {
+        const lines = result.log?.length ? result.log : [result.message || box.innerText || (currentLang === 'zh' ? '安装失败' : 'Installation failed')];
+        showLogHistory(result.run_id || box.dataset.logRunId, lines);
+    }
+}
+
+function showLogHistory(runId, localLines = []) {
+    const zh = currentLang === 'zh';
+    const sessionQuery = runId === '*' ? '&scope=session' : '';
+    const heading = runId === '*' ? (zh ? '本次启动完整日志' : 'Full Logs for This Session') : (zh ? '完整日志' : 'Full Log History');
+    const dialog = document.createElement('dialog');
+    dialog.className = 'log-history-dialog';
+    dialog.setAttribute('aria-label', heading);
+    const header = document.createElement('div');
+    header.className = 'log-history-header';
+    const title = document.createElement('span');
+    title.innerHTML = `<i class="fas fa-terminal" aria-hidden="true"></i> ${heading}`;
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'log-history-close';
+    close.textContent = '×';
+    close.title = zh ? '关闭' : 'Close';
+    close.setAttribute('aria-label', close.title);
+    close.onclick = () => dialog.close();
+    const download = document.createElement('a');
+    download.className = 'log-history-export';
+    const localUrl = runId ? null : URL.createObjectURL(new Blob([localLines.join('\n') + '\n'], {type:'text/plain;charset=utf-8'}));
+    download.href = localUrl || auxApiUrl('/logs/download?runId=' + encodeURIComponent(runId) + sessionQuery);
+    download.innerHTML = `<i class="fas fa-download" aria-hidden="true"></i> ${zh ? '导出完整日志' : 'Export Full Log'}`;
+    download.download = 'primigenius-log.txt';
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'log-history-retry';
+    retry.textContent = zh ? '重试' : 'Retry';
+    retry.hidden = true;
+    header.append(title, download, retry, close);
+    const text = document.createElement('pre');
+    text.className = 'log-history-content';
+    text.tabIndex = 0;
+    text.setAttribute('aria-label', zh ? '日志内容' : 'Log contents');
+    const status = document.createElement('div');
+    status.className = 'log-history-status';
+    status.setAttribute('role', 'status');
+    // Keep only three chunks in the DOM. Older chunks remain in the journal
+    // and are fetched again on upward scroll; export always reads the full log.
+    const cursors = [0], chunks = [];
+    let hasMore = true, loading = false, controller;
+    const load = async (backward = false) => {
+        if (loading || !dialog.open) return;
+        const index = backward ? chunks[0].index - 1 : (chunks.length ? chunks[chunks.length - 1].index + 1 : 0);
+        if (index < 0 || (!backward && !hasMore)) return;
+        loading = true;
+        retry.hidden = true;
+        text.setAttribute('aria-busy', 'true');
+        status.textContent = zh ? '正在加载日志…' : 'Loading logs…';
+        controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10000);
+        try {
+            const response = await fetch(auxApiUrl(`/logs/history?runId=${encodeURIComponent(runId)}&afterSeq=${cursors[index]}${sessionQuery}`), {signal: controller.signal});
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const data = await response.json();
+            if (!dialog.open) return;
+            const node = document.createElement('div');
+            node.textContent = data.events.map(event => event.line).join('\n');
+            const oldHeight = text.scrollHeight, oldTop = text.scrollTop;
+            cursors[index + 1] = data.nextSeq;
+            if (backward) {
+                text.prepend(node);
+                chunks.unshift({index, node});
+                const addedHeight = text.scrollHeight - oldHeight;
+                if (chunks.length > 3) { chunks.pop().node.remove(); hasMore = true; }
+                text.scrollTop = oldTop + addedHeight;
+            } else {
+                text.append(node);
+                chunks.push({index, node});
+                hasMore = !!data.has_more;
+                if (chunks.length > 3) {
+                    const removed = chunks.shift().node;
+                    const height = removed.getBoundingClientRect().height;
+                    removed.remove();
+                    text.scrollTop = Math.max(0, oldTop - height);
+                }
+            }
+            status.textContent = hasMore
+                ? (zh ? '向下滚动自动加载更多日志' : 'Scroll down to load more logs')
+                : (zh ? '已到日志末尾' : 'End of log');
+        } catch (error) {
+            if (!dialog.open) return;
+            // Never replace already loaded logs with an error message.
+            status.textContent = (zh ? '日志加载失败：' : 'Failed to load logs: ') + String(error);
+            retry.hidden = false;
+            retry.onclick = () => load(backward);
+        } finally {
+            clearTimeout(timeout);
+            loading = false;
+            text.setAttribute('aria-busy', 'false');
+        }
+        if (dialog.open && retry.hidden && hasMore && text.scrollHeight <= text.clientHeight + 1) load();
+    };
+    text.addEventListener('scroll', () => {
+        if (loading || !retry.hidden) return;
+        if (text.scrollTop < 80 && chunks.length && chunks[0].index > 0) load(true);
+        else if (text.scrollTop + text.clientHeight >= text.scrollHeight - 160) load();
+    });
+    dialog.append(header, text, status);
+    document.body.appendChild(dialog);
+    dialog.addEventListener('close', () => { if (controller) controller.abort(); if (localUrl) URL.revokeObjectURL(localUrl); dialog.remove(); }, {once: true});
+    dialog.showModal();
+    if (runId) load();
+    else {
+        text.textContent = localLines.join('\n');
+        status.textContent = zh ? '已显示本次安装返回的日志' : 'Showing logs returned by this installation';
+    }
+}
+
+function appendArchivedInstallEvent(box, event, maxLines = 300) {
+    if (!event || !event.seq || event.seq <= (box._lastLogSeq || 0)) return;
+    attachLogArchiveLink(box, event.runId);
+    const node = document.createElement('div');
+    node.className = 'r-install-log-line';
+    node.textContent = event.line;
+    box.appendChild(node);
+    box._lastLogSeq = event.seq;
+    while (box.children.length > maxLines) box.firstElementChild.remove();
+    scheduleLogScrollToBottom(box);
+}
+
+async function readInstallStatus(jobId, box) {
+    const response = await fetch(auxApiUrl(`/r/install-status?job_id=${encodeURIComponent(jobId)}&afterSeq=${box._lastLogSeq || 0}`), {
+        cache: 'no-store', signal: AbortSignal.timeout(10000)
+    });
+    if (!response.ok) throw new Error(`Install status HTTP ${response.status}`);
+    const data = await response.json();
+    (data.events || []).forEach(event => appendArchivedInstallEvent(box, event));
+    // Do not close the live stream until all committed pages have been consumed.
+    if (data.has_more && (data.state === 'done' || data.state === 'failed') && !box.closest?.('[data-auto-close-log]')) data.state = 'draining';
+    return data;
+}
 
 window.addEventListener('message', async (event) => {
     const data = event && event.data ? event.data : {};
@@ -113,7 +379,9 @@ function startRunLogStream(runId, tabId) {
         try {
             const payload = JSON.parse(event.data || '{}');
             if (payload.type !== 'log') return;
+            if (payload.seq <= (es.lastSeq || 0)) return;
             appendStructuredLogLine(payload.line || '', runId, tabId);
+            es.lastSeq = payload.seq;
         } catch (e) {}
     };
     es.onerror = () => {
@@ -122,17 +390,36 @@ function startRunLogStream(runId, tabId) {
     return es;
 }
 
-function finishRunLogStream(runId) {
+async function finishRunLogStream(runId) {
     if (!runId) return;
     runId = String(runId);
     const es = runLogStreams.get(runId);
-    setTimeout(() => {
-        if (es) {
-            try { es.close(); } catch (e) {}
+    if (!es) return;
+    try {
+        let more = true;
+        while (more) {
+            const response = await fetch(auxApiUrl(`/logs/history?runId=${encodeURIComponent(runId)}&afterSeq=${es.lastSeq || 0}`), {signal: AbortSignal.timeout(10000)});
+            if (!response.ok) throw new Error(`Log drain HTTP ${response.status}`);
+            const data = await response.json();
+            for (const event of data.events) {
+                if (event.seq <= (es.lastSeq || 0)) continue;
+                appendStructuredLogLine(event.line, runId, runLogTargets.get(runId));
+                es.lastSeq = event.seq;
+            }
+            more = data.has_more;
         }
-        runLogStreams.delete(runId);
-        unbindRunLogTarget(runId);
-    }, 1500);
+        es.close();
+        if (runLogStreams.get(runId) === es) {
+            runLogStreams.delete(runId);
+            unbindRunLogTarget(runId);
+        }
+    } catch (error) {
+        // Keep SSE connected: a transient error must not discard the final log tail.
+        console.error('Log drain pending; complete log remains available in history:', error);
+        setTimeout(() => {
+            if (runLogStreams.get(runId) === es) finishRunLogStream(runId);
+        }, 3000);
+    }
 }
 
 // 国际化字典
@@ -209,7 +496,7 @@ const i18nData = {
         'r-pkg-loading': '正在加载 R 包列表...',
         'r-pkg-empty': '暂无已安装的 R 包',
         'r-pkg-search-placeholder': '搜索已安装的包...',
-        'r-pkg-install-placeholder': '输入包名，回车安装 (多个用逗号分隔)',
+        'r-pkg-install-placeholder': '输入至少 2 个字符检索 R 包，回车搜索',
         'r-pkg-delete-confirm': '确定要删除这些 R 包吗？',
         'r-pkg-install-btn': '安装',
         'r-pkg-delete-btn': '删除',
@@ -236,7 +523,7 @@ const i18nData = {
         'community-error': '加载失败，点击重试',
         'community-empty': '暂无讨论',
         'community-title': '社区交流',
-        'docker-title': 'Podman 镜像管理',
+        'docker-title': '镜像管理',
         'docker-loading': '正在加载镜像列表...',
         'docker-no-images': '暂无本地镜像',
         'docker-search-placeholder': '搜索镜像仓库...',
@@ -247,22 +534,22 @@ const i18nData = {
         'docker-size': '大小',
         'docker-created': '创建时间',
         'docker-search-hint': '输入镜像名称后按回车搜索镜像仓库',
-        'docker-not-running': 'Podman 未运行，请先启动 Podman Machine',
+        'docker-not-running': '运行环境 未运行，请先启动 运行环境',
         'docker-mirror-accel': '镜像加速',
-        'docker-mirror-accel-title': '配置 Podman 镜像加速',
-        'docker-mirror-accel-desc': '国内网络拉取镜像较慢，可配置镜像加速源以提高下载速度。',
+        'docker-mirror-accel-title': '下载加速设置',
+        'docker-mirror-accel-desc': '国内优先会自动启用内置加速，下载时检测和切换线路。也可添加自己的镜像源，优先使用。',
         'docker-mirror-accel-current': '当前加速源',
         'docker-mirror-accel-none': '未配置（使用默认仓库）',
-        'docker-mirror-accel-apply': '应用并重启 Podman',
+        'docker-mirror-accel-apply': '应用设置',
         'docker-mirror-accel-remove': '移除加速',
-        'docker-mirror-accel-success': '镜像加速配置已更新，Podman Machine 正在重启...',
-        'docker-mirror-accel-removed': '已移除镜像加速配置，Podman Machine 正在重启...',
+        'docker-mirror-accel-success': '镜像加速配置已更新。',
+        'docker-mirror-accel-removed': '已移除镜像加速配置。',
         'docker-mirror-custom': '自定义加速源',
         'docker-mirror-custom-placeholder': '输入镜像加速源地址，如 docker.example.com',
         'docker-mirror-custom-add': '添加',
         'docker-mirror-custom-hint': '自定义加速源在拉取时优先使用',
         'docker-network-mode': '网络模式',
-        'docker-network-mode-desc': '根据网络环境选择搜索/拉取策略。国内优先可提升国内网络下的成功率与响应速度。',
+        'docker-network-mode-desc': '国内优先自动使用内置加速，并在下载时检测和切换可用线路。',
         'docker-network-mode-auto': '自动',
         'docker-network-mode-cn': '国内优先',
         'docker-network-mode-global': '国际优先',
@@ -346,7 +633,7 @@ const i18nData = {
         'r-pkg-loading': 'Loading R packages...',
         'r-pkg-empty': 'No R packages installed',
         'r-pkg-search-placeholder': 'Search installed packages...',
-        'r-pkg-install-placeholder': 'Enter package names, press Enter (comma-separated)',
+        'r-pkg-install-placeholder': 'Search R package names (2+ characters), Enter to search',
         'r-pkg-delete-confirm': 'Are you sure you want to delete these R packages?',
         'r-pkg-install-btn': 'Install',
         'r-pkg-delete-btn': 'Delete',
@@ -373,7 +660,7 @@ const i18nData = {
         'community-error': 'Failed to load, click to retry',
         'community-empty': 'No discussions yet',
         'community-title': 'Community',
-        'docker-title': 'Podman Image Manager',
+        'docker-title': 'Image Manager',
         'docker-loading': 'Loading image list...',
         'docker-no-images': 'No local images found',
         'docker-search-placeholder': 'Search image registry...',
@@ -384,22 +671,22 @@ const i18nData = {
         'docker-size': 'Size',
         'docker-created': 'Created',
         'docker-search-hint': 'Type image name and press Enter to search registry',
-        'docker-not-running': 'Podman is not running. Please start Podman Machine first.',
+        'docker-not-running': 'Runtime is not running. Please start Runtime first.',
         'docker-mirror-accel': 'Registry Mirror',
-        'docker-mirror-accel-title': 'Configure Registry Mirror',
-        'docker-mirror-accel-desc': 'Configure a registry mirror to speed up image pulls.',
+        'docker-mirror-accel-title': 'Download Acceleration Settings',
+        'docker-mirror-accel-desc': 'Domestic First automatically enables built-in acceleration and switches routes on failure. You can also add your own preferred mirrors.',
         'docker-mirror-accel-current': 'Current mirror',
         'docker-mirror-accel-none': 'None (using default registry)',
-        'docker-mirror-accel-apply': 'Apply & Restart Podman',
+        'docker-mirror-accel-apply': 'Apply settings',
         'docker-mirror-accel-remove': 'Remove Mirror',
-        'docker-mirror-accel-success': 'Registry mirror configured. Podman Machine is restarting...',
-        'docker-mirror-accel-removed': 'Registry mirror removed. Podman Machine is restarting...',
+        'docker-mirror-accel-success': 'Registry mirror configured.',
+        'docker-mirror-accel-removed': 'Registry mirror removed.',
         'docker-mirror-custom': 'Custom Mirror',
         'docker-mirror-custom-placeholder': 'Enter mirror address, e.g. docker.example.com',
         'docker-mirror-custom-add': 'Add',
         'docker-mirror-custom-hint': 'Custom mirrors are prioritized during pulls',
         'docker-network-mode': 'Network Mode',
-        'docker-network-mode-desc': 'Choose search/pull strategy by network condition. Domestic-first improves reliability and responsiveness on mainland networks.',
+        'docker-network-mode-desc': 'Domestic First automatically uses built-in acceleration and checks and switches routes during downloads.',
         'docker-network-mode-auto': 'Auto',
         'docker-network-mode-cn': 'Domestic First',
         'docker-network-mode-global': 'Global First',
@@ -565,6 +852,17 @@ function _refreshWorkflowInfoPanelLanguage(panel) {
     });
 }
 
+function containerStatusLabel(status) {
+    const zh = currentLang === 'zh';
+    const labels = {
+        running: zh ? '运行中' : 'Running', created: zh ? '已创建' : 'Created',
+        exited: zh ? '已退出' : 'Exited', stopped: zh ? '已停止' : 'Stopped',
+        dead: zh ? '已死亡' : 'Dead', paused: zh ? '已暂停' : 'Paused',
+        restarting: zh ? '重启中' : 'Restarting', removing: zh ? '删除中' : 'Removing'
+    };
+    return labels[status] || status;
+}
+
 function updateLanguage(lang) {
     currentLang = lang;
     _refreshTabGroupLanguage();
@@ -589,6 +887,8 @@ function updateLanguage(lang) {
     if(navInst) navInst.innerHTML = `<i class="fas fa-puzzle-piece"></i> ${t('nav-install')}`;
     const navStore = document.getElementById('nav-plugin-store-label');
     if(navStore) navStore.innerHTML = `<i class="fas fa-store"></i> ${t('nav-plugin-store')}`;
+    const navMarket = document.getElementById('nav-marketplace-label');
+    if (navMarket) navMarket.innerHTML = `<i class="fas fa-box-open"></i> ${currentLang === 'zh' ? '自由市场' : 'Free Market'}`;
     const navLang = document.getElementById('nav-lang-label');
     if(navLang) navLang.innerHTML = `<i class="fas fa-globe"></i> ${t('nav-lang')}`;
     const navComm = document.getElementById('nav-community-label');
@@ -653,7 +953,7 @@ function updateLanguage(lang) {
     if (communityView && tabs['sys-community']) {
         const zh = currentLang === 'zh';
         const title = communityView.querySelector('.tool-title');
-        if (title) title.innerHTML = `<i class="fas fa-comments" style="color:#2196F3"></i> ${t('community-title')}`;
+        if (title) title.innerHTML = `<i class="fas fa-comments"></i> ${t('community-title')}`;
         const filterBtns = communityView.querySelectorAll('.community-filter-btn');
         filterBtns.forEach(btn => {
             const src = btn.dataset.source;
@@ -775,7 +1075,7 @@ function updateLanguage(lang) {
     if (dockerView && tabs['sys-docker']) {
         const zh = currentLang === 'zh';
         const title = dockerView.querySelector('.tool-title');
-        if (title) title.innerHTML = `<i class="fas fa-cube" style="color:#1976d2"></i> ${t('docker-title')}`;
+        if (title) title.innerHTML = `<i class="fas fa-cube"></i> ${t('docker-title')}`;
         const sectionHeaders = dockerView.querySelectorAll('.docker-section-header');
         if (sectionHeaders[0]) sectionHeaders[0].innerHTML = `<i class="fas fa-play-circle"></i> ${zh ? '运行中容器' : 'Running Containers'}`;
         if (sectionHeaders[1]) sectionHeaders[1].innerHTML = `<i class="fas fa-hdd"></i> ${zh ? '本地镜像列表' : 'Local Images'}`;
@@ -786,13 +1086,9 @@ function updateLanguage(lang) {
         if (searchHint) searchHint.textContent = t('docker-search-hint');
         // 信息卡片区域的文本
         const machineLabel = dockerView.querySelector('.docker-machine-label');
-        if (machineLabel) machineLabel.textContent = zh ? 'Machine 状态' : 'Machine Status';
+        if (machineLabel) machineLabel.textContent = zh ? '运行环境' : 'Runtime';
         const machineCard = dockerView.querySelector('.docker-machine-card');
-        if (machineCard) machineCard.title = zh ? 'Podman Machine 状态' : 'Podman Machine Status';
-        const configValue = dockerView.querySelector('.docker-config-value');
-        if (configValue) configValue.textContent = zh ? '引擎配置' : 'Engine Config';
-        const configCard = dockerView.querySelector('.docker-config-card');
-        if (configCard) configCard.title = zh ? '点击编辑 Podman Engine 配置' : 'Click to edit Podman Engine config';
+        if (machineCard) machineCard.title = zh ? '运行环境' : 'Runtime';
         const storageBar = dockerView.querySelector('.docker-storage-card');
         if (storageBar) {
             storageBar.title = zh ? '管理镜像安装位置、导入与导出' : 'Manage image location, import and export';
@@ -866,10 +1162,8 @@ function updateLanguage(lang) {
             const mv = mirrorCard.querySelector('.info-value');
             if (mv) mv.textContent = t('docker-mirror-accel');
             const ml = mirrorCard.querySelector('.docker-mirror-status-label');
-            if (ml && !ml.querySelector('.fa-spinner')) {
-                const hasCheck = ml.querySelector('.fa-check-circle');
-                if (hasCheck) ml.innerHTML = `<i class="fas fa-check-circle" style="color:#4fc3f7;font-size:10px;margin-right:2px;"></i>${zh?'已配置':'Configured'}`;
-                else ml.textContent = t('docker-mirror-accel-none');
+            if (ml && ml.dataset.networkMode) {
+                ml.textContent = t('docker-network-mode-' + ml.dataset.networkMode);
             }
         }
         if (typeof dockerView.__dockerReflowBadges === 'function') {
@@ -897,22 +1191,9 @@ function updateLanguage(lang) {
                 });
             }
         });
-        const i18nStatusMap = {
-            'running': zh ? '运行中' : 'Running',
-            'created': zh ? '已创建' : 'Created',
-            'exited': zh ? '已退出' : 'Exited',
-            'stopped': zh ? '已停止' : 'Stopped',
-            'dead': zh ? '已死亡' : 'Dead',
-            'paused': zh ? '已暂停' : 'Paused',
-            'restarting': zh ? '重启中' : 'Restarting',
-            'removing': zh ? '删除中' : 'Removing'
-        };
         dockerView.querySelectorAll('.docker-container-status-badge').forEach(badge => {
-            const cls = badge.className;
-            const match = cls.match(/status-(\w+)/);
-            if (match && i18nStatusMap[match[1]]) {
-                badge.textContent = i18nStatusMap[match[1]];
-            }
+            const status = Array.from(badge.classList).find(name => name.startsWith('status-'));
+            if (status) badge.textContent = containerStatusLabel(status.slice(7));
         });
         if (typeof dockerView.__updateContainerDetailI18n === 'function') {
             dockerView.__updateContainerDetailI18n();
@@ -924,7 +1205,7 @@ function updateLanguage(lang) {
     if (rpkgView && tabs['sys-r-packages']) {
         const zh = currentLang === 'zh';
         const title = rpkgView.querySelector('.rpkg-title-el');
-        if (title) title.innerHTML = `<i class="fas fa-cubes" style="color:#2196F3"></i> ${t('r-packages-title')}`;
+        if (title) title.innerHTML = `<i class="fas fa-cubes"></i> ${t('r-packages-title')}`;
         const refreshLabel = rpkgView.querySelector('.rpkg-refresh-label');
         if (refreshLabel) refreshLabel.textContent = t('r-pkg-refresh-btn');
         const refreshBtn = rpkgView.querySelector('.rpkg-refresh-btn');
@@ -953,8 +1234,7 @@ function updateLanguage(lang) {
         // Install input placeholder & button
         const installInput = rpkgView.querySelector('.rpkg-install-input');
         if (installInput) installInput.placeholder = t('r-pkg-install-placeholder');
-        const installBtn = rpkgView.querySelector('.rpkg-main-install-btn');
-        if (installBtn && !installBtn.disabled) installBtn.innerHTML = `<i class="fas fa-download"></i> ${t('r-pkg-install-btn')}`;
+        if (rpkgView._refreshRPackageSearch) rpkgView._refreshRPackageSearch();
         // Log header
         const logTitle = rpkgView.querySelector('.rpkg-log-title-el');
         if (logTitle) logTitle.textContent = t('r-pkg-install-log');
@@ -1008,6 +1288,7 @@ function updateLanguage(lang) {
                 else if (tabObj && tabObj.config) span.innerText = getPluginText(tabObj.config.name);
                 else if (tabId === 'sys-install') span.innerText = t('nav-install');
                 else if (tabId === 'sys-plugin-store') span.innerText = t('nav-plugin-store');
+                else if (tabId === 'sys-marketplace') span.innerText = currentLang === 'zh' ? '自由市场' : 'Community Market';
                 else if (tabId === 'sys-community') span.innerText = t('nav-community');
                 else if (tabId === 'sys-docker') span.innerText = t('nav-docker');
                 else if (tabId === 'sys-r-packages') span.innerText = t('nav-r-packages');
@@ -1017,6 +1298,8 @@ function updateLanguage(lang) {
         }
 
         if (!view) return;
+        if (tabObj && tabObj.type === 'marketplace' && tabObj.renderMarket) tabObj.renderMarket();
+        if (tabObj && tabObj.type === 'community' && tabObj.renderAccount) tabObj.renderAccount();
 
         // 工作流面板：更新工具箱标题并刷新左侧工具箱（分类 & 工具名）
         if (tabObj && tabObj.type === 'workflow') {
@@ -1496,7 +1779,7 @@ function updateLanguage(lang) {
                         if (isMultiFile) {
                             const addZone = form.querySelector(`.r-multifile-add-zone[data-id="${pm.id}"]`);
                             if (addZone) {
-                                addZone.innerHTML = '<i class="fas fa-plus-circle"></i> ' +
+                                addZone.textContent =
                                     (currentLang === 'zh' ? '拖入文件或点击添加（可多选）' : 'Drop or click to add files (multi)');
                                 const multiWrap = addZone.closest('.r-multifile-wrap');
                                 if (multiWrap) {
@@ -1513,7 +1796,7 @@ function updateLanguage(lang) {
                             // 只有当没有文件(没有 has-file类)时才更新文字，否则保留文件名
                             if (dropZone && !dropZone.classList.contains('has-file')) {
                                 const hintText = currentLang === 'zh' ? '拖入文件或点击选择' : 'Drop file or click to choose';
-                                dropZone.innerHTML = '<i class="fas fa-file-upload" style="margin-right:6px;color:#90caf9"></i>' + hintText;
+                                dropZone.textContent = hintText;
                             }
                         }
                     }
@@ -1528,19 +1811,19 @@ function updateLanguage(lang) {
                     const hasTimes = rtSpan.querySelector('.fa-times-circle');
                     const hasSpinner = rtSpan.querySelector('.fa-spinner');
                     if (hasSpinner) {
-                        rtStatus.innerHTML = `<span style="color:#78909c;font-size:12px;"><i class="fas fa-spinner fa-spin"></i> ${currentLang==='zh'?'正在检测 R 镜像...':'Checking R image...'}</span>`;
+                        rtStatus.innerHTML = `<span style="color:#78909c;font-size:12px;"><i class="fas fa-spinner fa-spin"></i> ${currentLang==='zh'?'正在检测 R 环境...':'Checking R environment...'}</span>`;
                     } else if (hasCheck) {
-                        rtStatus.innerHTML = `<span style="color:#66bb6a;font-size:12px;"><i class="fas fa-cube"></i> <i class="fas fa-check-circle"></i> ${currentLang==='zh'?'R 镜像已就绪':'R image ready'}</span>`;
+                        rtStatus.innerHTML = `<span style="color:#66bb6a;font-size:12px;"><i class="fas fa-cube"></i> <i class="fas fa-check-circle"></i> ${currentLang==='zh'?'R 环境就绪':'R environment ready'}</span>`;
                     } else if (hasExcl) {
                         // Keep the node so its install-dialog click handler survives language changes.
                         rtSpan.title = currentLang==='zh' ? '点击安装 R 镜像' : 'Click to install R image';
-                        rtSpan.innerHTML = `<i class="fas fa-cube"></i> <i class="fas fa-exclamation-circle"></i> ${currentLang==='zh'?'R 镜像未安装 (点击安装)':'R image not installed (click to install)'}`;
+                        rtSpan.innerHTML = `<i class="fas fa-cube"></i> <i class="fas fa-exclamation-circle"></i> ${currentLang==='zh'?'R 环境需处理':'R environment needs attention'}`;
                     } else if (hasTimes) {
                         const isOffline = rtSpan.textContent.includes('Backend') || rtSpan.textContent.includes('无法连接');
                         if (isOffline) {
                             rtStatus.innerHTML = `<span style="color:#ef5350;font-size:12px;"><i class="fas fa-times-circle"></i> ${currentLang==='zh'?'无法连接后端':'Backend offline'}</span>`;
                         } else {
-                            rtStatus.innerHTML = `<span style="color:#ef5350;font-size:12px;"><i class="fas fa-times-circle"></i> ${currentLang==='zh'?'Podman 未启动或 R 镜像不可用':'Podman not running or R image unavailable'}</span>`;
+                            rtStatus.innerHTML = `<span style="color:#ef5350;font-size:12px;"><i class="fas fa-times-circle"></i> ${currentLang==='zh'?'R 环境暂不可用':'R environment unavailable'}</span>`;
                         }
                     }
                 }
@@ -1553,7 +1836,7 @@ function updateLanguage(lang) {
         // 安装面板：更新标题和提示
         if (tabId === 'sys-install') {
             const sysTitle = view.querySelector('.tool-title');
-            if (sysTitle) sysTitle.innerText = t('nav-install');
+            if (sysTitle) sysTitle.innerHTML = `<i class="fas fa-puzzle-piece"></i> ${t('nav-install')}`;
             const sysLogHeader = view.querySelector('.local-log-header');
             if (sysLogHeader) sysLogHeader.innerHTML = `<i class="fas fa-terminal"></i> ${t('log-header')}`;
             const zone = view.querySelector('#plugin-install-zone');
@@ -1567,14 +1850,14 @@ function updateLanguage(lang) {
         // 社区交流面板：语言切换时更新标题
         if (tabId === 'sys-community' || (tabObj && tabObj.type === 'community')) {
             const sysTitle = view.querySelector('.tool-title');
-            if (sysTitle) sysTitle.innerHTML = `<i class="fas fa-comments" style="color:#2196F3"></i> ${t('community-title')}`;
+            if (sysTitle) sysTitle.innerHTML = `<i class="fas fa-comments"></i> ${t('community-title')}`;
             return;
         }
 
         // Docker 镜像面板：语言切换时更新标题
         if (tabId === 'sys-docker' || (tabObj && tabObj.type === 'docker-images')) {
             const sysTitle = view.querySelector('.tool-title');
-            if (sysTitle) sysTitle.innerHTML = `<i class="fas fa-cube" style="color:#1976d2"></i> ${t('docker-title')}`;
+            if (sysTitle) sysTitle.innerHTML = `<i class="fas fa-cube"></i> ${t('docker-title')}`;
             return;
         }
 
@@ -1745,6 +2028,7 @@ function updateLanguage(lang) {
     });
 
     document.querySelectorAll('.local-log-header').forEach(h => { h.innerHTML = `<i class="fas fa-terminal"></i> ${t('log-header')}`; });
+    document.querySelectorAll('[data-log-run-id]').forEach(box => attachLogArchiveLink(box, box.dataset.logRunId));
 
     // tag_select options and selected chips are custom DOM rather than native
     // <option> elements, so refresh their multilingual labels in place.
@@ -2069,6 +2353,7 @@ document.addEventListener('click', clearRightClickFlag);
 const tabBar = document.getElementById('tab-bar');
 const mainContainer = document.getElementById('main-container');
 const globalLogBox = document.getElementById('log');
+attachLogArchiveLink(globalLogBox, '*');
 
 // 上下文菜单 & 模态框
 const contextMenu = document.getElementById('context-menu');
@@ -2190,6 +2475,19 @@ const _menuInstall = document.getElementById('menu-install-plugin');
 if (_menuInstall) _menuInstall.onclick = () => openInstallTab();
 const _menuPluginStore = document.getElementById('menu-plugin-store');
 if (_menuPluginStore) _menuPluginStore.onclick = () => openPluginStoreTab();
+const _menuMarketplace = document.getElementById('menu-marketplace');
+if (_menuMarketplace) {
+    _menuMarketplace.onclick = () => marketplace.open({ ipc: ipcRenderer, tabs, createTabFrame, switchTab,
+        language: () => currentLang, refreshPlugins: () => init(),
+        finishInstallLog: (panel, result, box) => finishAutoCloseInstallLog(panel, result, box),
+        prepareSession: async () => { await _ghRestoreSharedSession(); await _ghSyncMarketSession().catch(() => {}); },
+        onAccount: account => _ghSetUser({ ..._ghGetUser(), ...account }),
+        githubLogout: () => _ghClearAuth(),
+        githubLogin: async () => !!(await ghEnsureAuth()) });
+    _menuMarketplace.onkeydown = event => {
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); _menuMarketplace.click(); }
+    };
+}
 const menuWorkflow = document.getElementById('menu-workflow');
 if(menuWorkflow) menuWorkflow.onclick = () => openWorkflowTab();
 const _menuCommunity = document.getElementById('menu-community');
@@ -2274,6 +2572,11 @@ function scheduleLogScrollToBottom(box) {
 function appendLogNodeToBox(box, node) {
     if (!box || !node) return;
     box.appendChild(node);
+    if (node.dataset.archivedRunId) {
+        const archived = box._archivedLogNodes || (box._archivedLogNodes = []);
+        archived.push(node);
+        while (archived.length > LOG_COMPACT_THRESHOLD) archived.shift().remove();
+    }
     scheduleLogCompaction(box);
     scheduleLogScrollToBottom(box);
 }
@@ -2301,7 +2604,7 @@ function compactOldLogNodes(box) {
     if (!box || box.childElementCount <= LOG_COMPACT_THRESHOLD) return;
     const compactable = [];
     for (const child of box.children) {
-        if (child.classList && child.classList.contains('log-entry') && !child.classList.contains('log-chunk')) {
+        if (child.classList && child.classList.contains('log-entry') && !child.classList.contains('log-chunk') && !child.dataset.archivedRunId) {
             compactable.push(child);
             if (compactable.length >= LOG_COMPACT_BATCH) break;
         }
@@ -2325,9 +2628,12 @@ function compactOldLogNodes(box) {
 function appendStructuredLogLine(line, runId, tabId) {
     if (!String(line || '').trim()) return;
     const node = createLogEntryNode(line);
+    node.dataset.archivedRunId = runId;
+    attachLogArchiveLink(globalLogBox, '*');
     appendLogNodeToBox(globalLogBox, cloneLogEntryNode(node));
     const targetTabId = tabId || runLogTargets.get(String(runId || ''));
     if (targetTabId && tabs[targetTabId] && tabs[targetTabId].logUI) {
+        attachLogArchiveLink(tabs[targetTabId].logUI, runId);
         appendLogNodeToBox(tabs[targetTabId].logUI, node);
     }
 }
@@ -2381,103 +2687,262 @@ function escapeHtml(str) {
         .replace(/'/g, '&#039;');
 }
 
-let cachedXlsxModule = null;
+// Show the members of a grouped input first. Each member then opens the
+// same file preview used by workflow outputs and ordinary input chips.
+function showFileGroupPreview(files, groupName) {
+    const members = Array.from(new Set((files || []).filter(Boolean)));
+    if (members.length === 0) return;
 
-function getXlsxModule() {
-    if (cachedXlsxModule) return cachedXlsxModule;
-    cachedXlsxModule = require('xlsx');
-    return cachedXlsxModule;
-}
+    const overlay = document.createElement('div');
+    overlay.className = 'wf-preview-overlay';
+    const win = document.createElement('div');
+    win.className = 'wf-preview-window wf-group-preview-window';
 
-function parseDelimitedRows(content, delimiter) {
-    return String(content || '')
-        .split(/\r?\n/)
-        .filter(row => row.trim())
-        .map(row => {
-            const cells = [];
-            let current = '';
-            let inQuotes = false;
-            for (let i = 0; i < row.length; i++) {
-                const char = row[i];
-                const next = row[i + 1];
-                if (char === '"') {
-                    if (inQuotes && next === '"') {
-                        current += '"';
-                        i++;
-                    } else {
-                        inQuotes = !inQuotes;
-                    }
-                } else if (char === delimiter && !inQuotes) {
-                    cells.push(current.trim());
-                    current = '';
-                } else {
-                    current += char;
-                }
-            }
-            cells.push(current.trim());
-            return cells;
-        });
-}
+    const header = document.createElement('div');
+    header.className = 'wf-preview-header';
+    const title = document.createElement('span');
+    title.className = 'wf-group-preview-title';
+    title.innerHTML = `<i class="fas fa-link"></i><span>${escapeHtml(groupName || (currentLang === 'zh' ? '文件组合' : 'File group'))}</span><small>${members.length} ${currentLang === 'zh' ? '个文件' : 'files'}</small>`;
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'wf-preview-close';
+    closeBtn.innerHTML = '×';
+    header.appendChild(title);
+    header.appendChild(closeBtn);
 
-function readSpreadsheetPreviewRows(filePath) {
-    const XLSX = getXlsxModule();
-    const workbook = XLSX.readFile(filePath, { cellDates: true });
-    const sheetName = workbook.SheetNames && workbook.SheetNames[0];
-    if (!sheetName) return { rows: [], sheetName: '', totalRows: 0, totalCols: 0 };
-
-    const sheet = workbook.Sheets[sheetName];
-    const rows = XLSX.utils.sheet_to_json(sheet, {
-        header: 1,
-        raw: false,
-        defval: '',
-        blankrows: false
+    const body = document.createElement('div');
+    body.className = 'wf-preview-body wf-group-preview-body';
+    members.forEach((filePath, index) => {
+        const fileName = path.basename(filePath);
+        const row = document.createElement('div');
+        row.className = 'wf-group-preview-file';
+        row.title = filePath;
+        const number = document.createElement('span');
+        number.className = 'wf-group-preview-index';
+        number.textContent = String(index + 1);
+        const name = document.createElement('span');
+        name.className = 'wf-group-preview-name';
+        name.textContent = fileName;
+        const eye = document.createElement('button');
+        eye.className = 'wf-group-preview-eye';
+        eye.title = currentLang === 'zh' ? `预览 ${fileName}` : `Preview ${fileName}`;
+        eye.innerHTML = '<i class="fas fa-eye"></i>';
+        eye.onclick = (e) => { e.stopPropagation(); showFilePreview(filePath, fileName); };
+        row.ondblclick = () => showFilePreview(filePath, fileName);
+        row.appendChild(number);
+        row.appendChild(name);
+        row.appendChild(eye);
+        body.appendChild(row);
     });
-    const range = sheet && sheet['!ref'] ? XLSX.utils.decode_range(sheet['!ref']) : null;
-    const totalRows = range ? (range.e.r - range.s.r + 1) : rows.length;
-    const totalCols = range ? (range.e.c - range.s.c + 1) : rows.reduce((max, row) => Math.max(max, row.length), 0);
-    return { rows, sheetName, totalRows, totalCols };
+
+    win.appendChild(header);
+    win.appendChild(body);
+    overlay.appendChild(win);
+    const closeGroupPreview = () => {
+        overlay.remove();
+        document.removeEventListener('keydown', escHandler);
+    };
+    closeBtn.onclick = closeGroupPreview;
+    overlay.onclick = (e) => { if (e.target === overlay) closeGroupPreview(); };
+    const escHandler = (e) => {
+        if (e.key === 'Escape' && overlay.isConnected) {
+            closeGroupPreview();
+        }
+    };
+    document.addEventListener('keydown', escHandler);
+    document.body.appendChild(overlay);
 }
 
-function renderPreviewDataTable(container, rows) {
-    container.innerHTML = '';
-    if (!rows || rows.length === 0) {
-        container.innerHTML = '<div style="padding:20px;color:#999;">Table is empty</div>';
+// File preview function — optimized for long data, images, PDFs, and text files
+function showFilePreview(filePath, fileName) {
+    const ext = (fileName.split('.').pop() || '').toLowerCase();
+    // Determine multi-dot extensions like .fq.gz, .summary.txt
+    const lowerName = fileName.toLowerCase();
+    const isImage = ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'tiff', 'tif', 'ico', 'svg'].includes(ext);
+    const isSvg = ext === 'svg';
+    const isPdf = ext === 'pdf';
+    const isSpreadsheet = ['xlsx', 'xls'].includes(ext);
+    const isTable = ['csv', 'tsv', 'tab'].includes(ext) || isSpreadsheet;
+    const isHtml = ['html', 'htm'].includes(ext);
+    const isSpecial = /\.(tiff?|pdb|cif|mmcif|sdf|mol2|xyz|bam|cram|bcf|bw|bigwig|bb|bigbed)$|\.(vcf|bed|gff3?|gtf)(\.gz)?$/i.test(fileName);
+    const isBinary = ['bam', 'bai', 'gz', 'zip', 'tar', 'rar', '7z', 'exe', 'dll', 'so', 'o', 'pyc', 'class', 'ht2'].includes(ext);
+
+    // For images — native in-app preview (same as R tool image viewer)
+    if (isImage && !isSpecial) {
+        const imgOverlay = document.createElement('div');
+        imgOverlay.className = 'r-viewer-overlay';
+        const imgUrl = require('url').pathToFileURL(filePath).href;
+        imgOverlay.innerHTML = `
+            <div class="r-viewer-window">
+                <div class="r-viewer-header">
+                    <span><i class="fas fa-image"></i> ${escapeHtml(fileName)}</span>
+                    <button class="r-viewer-close"><i class="fas fa-times"></i></button>
+                </div>
+                <div class="r-viewer-body r-viewer-img-body">
+                    <img class="r-viewer-zoomable-img" />
+                </div>
+                <div class="r-viewer-footer">
+                    <button class="r-viewer-action-btn" data-action="zoomout"><i class="fas fa-search-minus"></i></button>
+                    <span class="r-viewer-zoom-label">100%</span>
+                    <button class="r-viewer-action-btn" data-action="zoomin"><i class="fas fa-search-plus"></i></button>
+                    <button class="r-viewer-action-btn" data-action="zoomfit"><i class="fas fa-expand"></i> Fit</button>
+                    <div style="flex:1"></div>
+                    <button class="r-viewer-action-btn" data-action="openext"><i class="fas fa-external-link-alt"></i> ${currentLang==='zh'?'外部打开':'Open Externally'}</button>
+                    <button class="r-viewer-action-btn" data-action="download"><i class="fas fa-download"></i> ${currentLang==='zh'?'下载':'Download'}</button>
+                </div>
+            </div>
+        `;
+        const imgWin = imgOverlay.querySelector('.r-viewer-window');
+        const imgHeader = imgOverlay.querySelector('.r-viewer-header');
+        decoratePreviewHeader(imgHeader,filePath,currentLang);
+        const img = imgOverlay.querySelector('.r-viewer-zoomable-img');
+        queueMicrotask(() => loadPreviewImage(img, filePath, currentLang));
+        mountImageZoom(imgOverlay, img);
+
+        imgOverlay.querySelector('.r-viewer-close').onclick = () => imgOverlay.remove();
+        imgOverlay.onclick = e => { if (e.target === imgOverlay) imgOverlay.remove(); };
+        imgOverlay.querySelector('[data-action="openext"]').onclick = () => {
+            try { require('electron').shell.openPath(filePath); } catch(e) { console.warn('openPath failed', e); }
+        };
+        imgOverlay.querySelector('[data-action="download"]').onclick = () => {
+            try {
+                const a = document.createElement('a');
+                a.href = imgUrl; a.download = fileName; a.click();
+            } catch(e) { console.warn('download failed', e); }
+        };
+
+        document.body.appendChild(imgOverlay);
+        makeWindowDraggable(imgOverlay, imgWin, imgHeader);
+        makeWindowResizable(imgWin);
         return;
     }
 
-    const table = document.createElement('table');
-    table.className = 'preview-data-table';
-    const thead = document.createElement('thead');
-    const tbody = document.createElement('tbody');
+    // For PDFs — inline preview via iframe (same as R tool PDF viewer)
+    if (isPdf) {
+        const pdfOverlay = document.createElement('div');
+        pdfOverlay.className = 'r-viewer-overlay';
+        const pdfUrl = require('url').pathToFileURL(filePath).href;
+        pdfOverlay.innerHTML = `
+            <div class="r-viewer-window" style="width:85%;max-width:1100px;height:85%;">
+                <div class="r-viewer-header">
+                    <span><i class="fas fa-file-pdf" style="color:#ef5350;"></i> ${fileName}</span>
+                    <button class="r-viewer-close"><i class="fas fa-times"></i></button>
+                </div>
+                <div class="r-viewer-body r-pdf-body" style="padding:0;background:#e5e7eb;flex:1;overflow:hidden;">
+                    <iframe src="${pdfUrl}" style="width:100%;height:100%;border:none;"></iframe>
+                </div>
+            </div>
+        `;
+        const pdfWin = pdfOverlay.querySelector('.r-viewer-window');
+        const pdfHeader = pdfOverlay.querySelector('.r-viewer-header');
+        decoratePreviewHeader(pdfHeader,filePath,currentLang);
+        pdfOverlay.querySelector('.r-viewer-close').onclick = () => pdfOverlay.remove();
+        pdfOverlay.onclick = e => { if (e.target === pdfOverlay) pdfOverlay.remove(); };
+        document.body.appendChild(pdfOverlay);
+        makeWindowDraggable(pdfOverlay, pdfWin, pdfHeader);
+        makeWindowResizable(pdfWin);
+        return;
+    }
 
-    rows.forEach((row, rowIndex) => {
-        const tr = document.createElement('tr');
-        const numTd = document.createElement(rowIndex === 0 ? 'th' : 'td');
-        numTd.className = 'row-num';
-        numTd.innerText = rowIndex === 0 ? '#' : String(rowIndex);
-        tr.appendChild(numTd);
+    const overlay = document.createElement('div');
+    overlay.className = 'wf-preview-overlay';
+    overlay.onclick = (e) => { if (e.target === overlay) { overlay.remove(); document.removeEventListener('keydown', escHandler); } };
+    // Close on Escape key
+    const escHandler = (e) => { if (e.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', escHandler); } };
+    document.addEventListener('keydown', escHandler);
 
-        (row || []).forEach(cell => {
-            const td = document.createElement(rowIndex === 0 ? 'th' : 'td');
-            const val = cell == null ? '' : String(cell).trim();
-            td.innerText = val;
-            if (val.length > 100) {
-                td.title = val;
-                td.style.maxWidth = '300px';
-                td.style.overflow = 'hidden';
-                td.style.textOverflow = 'ellipsis';
-                td.style.whiteSpace = 'nowrap';
-            }
-            tr.appendChild(td);
-        });
+    const win = document.createElement('div');
+    win.className = 'wf-preview-window';
 
-        if (rowIndex === 0) thead.appendChild(tr);
-        else tbody.appendChild(tr);
-    });
+    const header = document.createElement('div');
+    header.className = 'wf-preview-header';
 
-    table.appendChild(thead);
-    table.appendChild(tbody);
-    container.appendChild(table);
+    // Left: icon + filename + optional dims
+    const headerLeft = document.createElement('span');
+    headerLeft.style.cssText = 'display:flex;align-items:center;gap:8px;overflow:hidden;';
+    let fileIcon = 'fa-file-alt';
+    if (isSvg) fileIcon = 'fa-image';
+    else if (isTable) fileIcon = 'fa-table';
+    else if (isHtml) fileIcon = 'fa-code';
+    else if (ext === 'docx') fileIcon = 'fa-file-word';
+    headerLeft.innerHTML = `<i class="fas ${fileIcon}" style="flex-shrink:0;"></i><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${filePath}">${fileName}</span>${isTable ? '<span class="wf-table-dims" style="color:#90caf9;font-weight:400;flex-shrink:0;margin-left:4px;"></span>' : ''}`;
+
+    // Right: open externally button + close button
+    const headerRight = document.createElement('div');
+    headerRight.style.cssText = 'display:flex;align-items:center;gap:4px;flex-shrink:0;';
+
+    const openExtBtn = document.createElement('button');
+    openExtBtn.className = 'wf-preview-close';
+    openExtBtn.innerHTML = '<i class="fas fa-external-link-alt" style="font-size:13px;"></i>';
+    openExtBtn.title = currentLang==='zh'?'使用系统应用打开':'Open with system app';
+    openExtBtn.onclick = () => { try { require('electron').shell.openPath(filePath); } catch(e) {} };
+
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'wf-preview-close';
+    closeBtn.innerHTML = '×';
+    closeBtn.onclick = () => { overlay.remove(); document.removeEventListener('keydown', escHandler); };
+
+    headerRight.appendChild(openExtBtn);
+    headerRight.appendChild(closeBtn);
+    header.appendChild(headerLeft);
+    header.appendChild(headerRight);
+    decoratePreviewHeader(header,filePath,currentLang);
+
+    const body = document.createElement('div');
+    body.className = 'wf-preview-body';
+
+    try {
+        const fs = require('fs');
+
+        if (isSpecial || /\.(zip|tar|tgz|gz)$/i.test(fileName)) {
+            mountFilePreview(body,filePath,{kind:'text',lang:currentLang,showExternalOpen:false});
+        } else if (isBinary) {
+            // Binary file — show info only
+            let fileSize = 0;
+            try { fileSize = fs.statSync(filePath).size; } catch(e) {}
+            const sizeStr = fileSize > 1048576 ? (fileSize / 1048576).toFixed(1) + ' MB'
+                : fileSize > 1024 ? (fileSize / 1024).toFixed(1) + ' KB' : fileSize + ' B';
+            body.innerHTML = `<div style="text-align:center;color:#78909c;padding:60px 20px;">
+                <i class="fas fa-file-archive" style="font-size:56px;margin-bottom:16px;color:#90a4ae;"></i>
+                <p style="font-size:16px;font-weight:600;margin-bottom:8px;">${currentLang==='zh'?'二进制文件，无法直接预览':'Binary file, cannot preview directly'}</p>
+                <p style="font-size:13px;color:#b0bec5;margin-bottom:16px;">${ext.toUpperCase()} · ${sizeStr}</p>
+                <button onclick="try{require('electron').shell.openPath('${filePath.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}');}catch(e){}" style="padding:8px 20px;border:1px solid #1976d2;background:#e3f2fd;color:#1565c0;border-radius:4px;cursor:pointer;font-size:13px;">
+                    <i class="fas fa-external-link-alt"></i> ${currentLang==='zh'?'使用系统应用打开':'Open with system app'}
+                </button>
+            </div>`;
+        } else if (isHtml) {
+                mountHtmlPreview(body, filePath, currentLang, {showExternalOpen:false});
+        } else {
+            body.style.padding = '0';
+            mountFilePreview(body, filePath, {
+                    kind: isTable || isSpreadsheet ? 'table' : 'text', lang: currentLang, showExternalOpen:false,
+                onDimensions: text => { const dims = headerLeft.querySelector('.wf-table-dims'); if (dims) dims.textContent = text; }
+            });
+        }
+    } catch (e) {
+        body.innerHTML = `<div style="text-align:center;color:#e53935;padding:40px;"><i class="fas fa-exclamation-triangle" style="font-size:48px;margin-bottom:12px;"></i><p>${e.message}</p></div>`;
+    }
+
+    win.appendChild(header);
+    win.appendChild(body);
+    overlay.appendChild(win);
+    document.body.appendChild(overlay);
+}
+
+
+function createFilePreviewEye(files) {
+    const eye = document.createElement('button');
+    eye.type = 'button';
+    eye.className = 'chip-eye';
+    eye.title = currentLang === 'zh' ? '预览文件' : 'Preview file';
+    eye.setAttribute('aria-label', eye.title);
+    eye.innerHTML = '<i class="fas fa-eye" aria-hidden="true"></i>';
+    eye.onclick = event => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (Array.isArray(files)) showFileGroupPreview(files, fileGroupDisplayName(files));
+        else showFilePreview(files, path.basename(files));
+    };
+    return eye;
 }
 
 function parseDockerImageSearchTarget(value) {
@@ -2579,190 +3044,99 @@ function showDockerPullFailedDialog(imageName) {
             setTimeout(() => { copyBtn.innerHTML = `<i class="fas fa-copy"></i> ${zh ? '复制' : 'Copy'}`; }, 1500);
         });
     };
-    dlg.addEventListener('cancel', e => { e.preventDefault(); closeDlg(); });
+    dlg.oncancel = e => { e.preventDefault(); closeDlg(); };
     document.body.appendChild(dlg);
     dlg.showModal();
 }
 
 // Show dialog when R Docker image is not installed — guides user to Image Manager
 function showRImageInstallDialog(imageName, onInstalled) {
-    if (activeRImageInstallDialog && activeRImageInstallDialog.dlg.isConnected) {
-        activeRImageInstallDialog.onInstalled = onInstalled;
-        activeRImageInstallDialog.updateLanguage();
-        const existing = activeRImageInstallDialog.dlg;
-        existing.classList.remove('r-image-install-dialog-minimized');
-        if (!existing.open) existing.showModal();
-        existing.focus();
-        return;
-    }
     const zh = currentLang === 'zh';
     const dlg = document.createElement('dialog');
-    dlg.style.cssText = 'border:none;border-radius:12px;padding:0;background:#fff;box-shadow:0 8px 32px rgba(0,0,0,0.3);z-index:200000;min-width:440px;max-width:560px;';
-    dlg.innerHTML = `
-        <div style="padding:12px 14px 10px 20px;font-size:16px;font-weight:700;color:#ff9800;border-bottom:1px solid #eee;display:flex;align-items:center;justify-content:space-between;gap:8px;">
-            <span><i class="fas fa-exclamation-circle" style="margin-right:8px;"></i><span class="dlg-title-text">${zh ? 'R 镜像未安装' : 'R Image Not Installed'}</span></span>
-            <button class="dlg-minimize" style="width:32px;height:28px;border:none;border-radius:5px;background:#f5f5f5;color:#607d8b;cursor:pointer;font-size:14px;" title="${zh ? '最小化窗口' : 'Minimize window'}"><i class="fas fa-minus"></i></button>
-        </div>
-        <div style="padding:16px 20px;line-height:1.8;font-size:14px;color:#333;">
-            <p class="dlg-intro">${zh ? '运行 R 工具需要以下容器镜像：' : 'Running R tools requires the following container image:'}</p>
-            <div style="display:flex;align-items:center;gap:8px;margin:10px 0;padding:10px 14px;background:#f5f5f5;border-radius:8px;font-family:Consolas,monospace;font-size:13px;word-break:break-all;">
-                <i class="fas fa-cube" style="color:#1976d2;font-size:16px;"></i>
-                <span style="flex:1;">${escapeHtml(imageName)}</span>
-            </div>
-            <p class="dlg-hint" style="color:#666;font-size:13px;">${zh ? '可前往 <b>镜像管理</b> 正常拉取，或使用备用下载从 GitHub Release 安装。' : 'Pull normally in <b>Image Manager</b>, or install from GitHub Release using Backup Download.'}</p>
-            <div class="dlg-backup-progress" style="display:none;margin-top:14px;">
-                <div style="height:7px;background:#e0e0e0;border-radius:5px;overflow:hidden;"><div class="dlg-backup-fill" style="width:0;height:100%;background:#43a047;transition:width .2s;"></div></div>
-                <div class="dlg-backup-status" style="margin-top:6px;color:#666;font-size:12px;">${zh ? '正在准备...' : 'Preparing...'}</div>
-            </div>
-        </div>
-        <div style="padding:10px 20px 16px;display:flex;justify-content:flex-end;gap:10px;">
-            <button class="dlg-goto" style="padding:8px 18px;border-radius:6px;border:none;background:#1976d2;color:#fff;cursor:pointer;font-size:13px;font-weight:600;"><i class="fas fa-cube" style="margin-right:4px;"></i>${zh ? '前往镜像管理' : 'Go to Image Manager'}</button>
-            <button class="dlg-backup" style="padding:8px 18px;border-radius:6px;border:none;background:#43a047;color:#fff;cursor:pointer;font-size:13px;font-weight:600;"><i class="fab fa-github" style="margin-right:4px;"></i>${zh ? '备用下载' : 'Backup Download'}</button>
-            <button class="dlg-close" style="padding:8px 18px;border-radius:6px;border:1px solid #ccc;background:#f5f5f5;cursor:pointer;font-size:13px;">${zh ? '关闭' : 'Close'}</button>
-        </div>
-    `;
-    const closeBtn = dlg.querySelector('.dlg-close');
-    const gotoBtn = dlg.querySelector('.dlg-goto');
-    const backupBtn = dlg.querySelector('.dlg-backup');
-    const minimizeBtn = dlg.querySelector('.dlg-minimize');
-    const titleText = dlg.querySelector('.dlg-title-text');
-    const introText = dlg.querySelector('.dlg-intro');
-    const hintText = dlg.querySelector('.dlg-hint');
-    const progressWrap = dlg.querySelector('.dlg-backup-progress');
-    const progressFill = dlg.querySelector('.dlg-backup-fill');
-    const progressStatus = dlg.querySelector('.dlg-backup-status');
-    let downloading = false;
-    let downloadFailed = false;
-    const updateDialogLanguage = () => {
-        const liveZh = currentLang === 'zh';
-        titleText.textContent = liveZh ? 'R 镜像未安装' : 'R Image Not Installed';
-        introText.textContent = liveZh ? '运行 R 工具需要以下容器镜像：' : 'Running R tools requires the following container image:';
-        hintText.innerHTML = liveZh
-            ? '可前往 <b>镜像管理</b> 正常拉取，或使用备用下载从 GitHub Release 安装。'
-            : 'Pull normally in <b>Image Manager</b>, or install from GitHub Release using Backup Download.';
-        minimizeBtn.title = downloading
-            ? (liveZh ? '最小化，继续后台下载' : 'Minimize and keep downloading')
-            : (liveZh ? '最小化窗口' : 'Minimize window');
-        gotoBtn.innerHTML = `<i class="fas fa-cube" style="margin-right:4px;"></i>${liveZh ? '前往镜像管理' : 'Go to Image Manager'}`;
-        closeBtn.textContent = liveZh ? '关闭' : 'Close';
-        if (downloading) {
-            backupBtn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> ${liveZh ? '下载中...' : 'Downloading...'}`;
-        } else {
-            backupBtn.innerHTML = `<i class="fab fa-github" style="margin-right:4px;"></i>${downloadFailed ? (liveZh ? '重新备用下载' : 'Retry Backup Download') : (liveZh ? '备用下载' : 'Backup Download')}`;
-        }
-    };
-    const dialogState = {dlg, onInstalled, updateLanguage: updateDialogLanguage};
-    activeRImageInstallDialog = dialogState;
-    const closeDlg = () => {
-        if (activeRImageInstallDialog === dialogState) activeRImageInstallDialog = null;
-        try{dlg.close();}catch(e){}
-        try{dlg.remove();}catch(e){}
-    };
-    const minimizeDlg = () => {
-        dlg.classList.add('r-image-install-dialog-minimized');
-        try{dlg.close();}catch(e){}
-        const liveZh = currentLang === 'zh';
-        const message = downloading
-            ? (liveZh ? 'R 镜像继续在后台下载；再次点击“R 镜像未安装”可恢复窗口' : 'The R image download continues in the background. Click “R image not installed” to restore it.')
-            : (liveZh ? '窗口已最小化；再次点击“R 镜像未安装”可恢复窗口' : 'Window minimized. Click “R image not installed” to restore it.');
-        _showToast(message, 'info');
-    };
-    minimizeBtn.onclick = minimizeDlg;
-    closeBtn.onclick = () => { if (!downloading) closeDlg(); };
-    gotoBtn.onclick = () => {
-        closeDlg();
-        const dockerBtn = document.getElementById('menu-docker-images');
-        if (dockerBtn) dockerBtn.click();
-        setTimeout(() => {
-            const dockerView = document.getElementById('view-sys-docker');
-            if (!dockerView) return;
-            const searchInput = dockerView.querySelector('.docker-search-input');
-            const searchBtn = dockerView.querySelector('.docker-search-btn');
-            if (searchInput) {
-                searchInput.value = imageName;
-                searchInput.focus();
-                if (searchBtn) searchBtn.click();
-            }
-        }, 300);
-    };
-    backupBtn.onclick = async () => {
-        downloading = true;
-        downloadFailed = false;
-        gotoBtn.disabled = true;
-        closeBtn.disabled = true;
-        backupBtn.disabled = true;
-        updateDialogLanguage();
-        progressWrap.style.display = 'block';
-        progressStatus.style.color = '#666';
-        progressStatus.textContent = currentLang === 'zh' ? '正在连接备用下载源...' : 'Connecting to backup source...';
+    dlg.className = 'image-install-dialog r-environment-dialog';
+    dlg.setAttribute('aria-label', zh ? '内置 R 环境' : 'Built-in R environment');
+    dlg.innerHTML = `<div class="image-install-header">
+        <div><i class="fab fa-r-project"></i> ${zh ? '内置 R 环境' : 'Built-in R environment'}</div>
+        <button class="image-install-close close" aria-label="${zh ? '关闭' : 'Close'}">×</button>
+        </div><div class="image-install-body">
+        <section class="image-install-section">
+            <div class="image-install-section-title"><i class="fas fa-lock"></i> ${zh ? '固定运行环境' : 'Fixed runtime'}</div>
+            <div class="r-environment-version"></div>
+            <p class="image-install-help">${zh ? 'R 运行环境随软件安装，保持固定版本，无需另行下载或构建镜像。' : 'R is installed with the app at a fixed version. No separate image download or build is needed.'}</p>
+            <div class="image-install-status" role="status" aria-live="polite">${zh ? '正在读取状态…' : 'Reading status…'}</div>
+        </section>
+        <section class="image-install-section r-environment-repair" hidden>
+            <div class="image-install-section-title"><i class="fas fa-tools"></i> ${zh ? '修复说明' : 'Repair guidance'}</div>
+            <p class="image-install-help r-storage-repair" hidden>${zh ? '旧 WSL 虚拟磁盘或存储路径丢失。请先从旧安装目录或备份恢复原数据，保留 .primigenius-preserved 目录；不要重置环境或注销 WSL。恢复后在“运行环境管理”中启动运行环境，再点击“重新检查”。重新安装 R 不能恢复已删除的虚拟磁盘。' : 'The registered WSL disk or storage path is missing. Restore the original data from the old installation or backup and keep .primigenius-preserved. Do not reset or unregister WSL. Start the runtime in Runtime management after restoration, then select Check again. Reinstalling R cannot recover a deleted virtual disk.'}</p>
+            <p class="image-install-help">${zh ? '若内置资源缺失或损坏，请运行包含匹配 R 环境的安装包修复，再点击“重新检查”。无需与当前软件版本相同，系统会核对环境标识和校验和。已有包库和分析数据会保留。' : 'If bundled resources are missing or damaged, repair with an installer containing the matching R environment, then select “Check again”. The app version may differ; environment identity and checksums are verified. Existing packages and analysis data are preserved.'}</p>
+            <p class="image-install-help">${zh ? '若提示已有 R 包不兼容，需要处理对应包；重复导入相同环境不会修复包依赖。' : 'If an existing R package is incompatible, address that package. Reimporting the same environment cannot repair package dependencies.'}</p>
+        </section>
+        <div class="r-environment-actions"><button class="image-install-action retry" hidden>${zh ? '重新检查' : 'Check again'}</button>
+        <button class="image-install-action cleanup" hidden>${zh ? '清理旧环境' : 'Remove previous environment'}</button></div>
+        </div>`;
+    const status = dlg.querySelector('[role="status"]');
+    let timer = null;
+    async function update() {
         try {
-            const response = await fetch(auxApiUrl('/podman/images/pull'), {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({image: imageName, archive_only: true})
+            const result = await fetchRRuntimeStatus();
+            if (!dlg.isConnected) return;
+            const phases = {waiting:'等待运行环境',checking:'检查已有环境','validating-existing':'验证已有环境','verifying-archive':'校验离线资源',importing:'导入内置环境',validating:'验证兼容性',ready:'就绪','saving-recovery':'正在保存离线恢复资源'};
+            const phasesEn = {waiting:'Waiting for runtime',checking:'Checking environment','validating-existing':'Validating environment','verifying-archive':'Verifying offline resources',importing:'Importing environment',validating:'Validating compatibility',ready:'Ready'};
+            const needsAttention = result.runtime_state === 'attention';
+            status.classList.toggle('is-error', needsAttention);
+            status.textContent = result.ready ? (zh ? '已就绪，可直接运行 R 分析。' : 'Ready to run R analyses.')
+                : result.preparation?.error || (zh ? phases : phasesEn)[result.preparation?.phase] || result.message || result.runtime_state;
+            dlg.querySelector('.r-environment-version').textContent = result.version ? `R ${result.version}` : '';
+            dlg.querySelector('.r-environment-repair').hidden = !needsAttention;
+            const storageMissing = desktopRuntimeState?.storage_missing || result.preparation?.phase === 'engine-storage-missing';
+            const storageHelp = dlg.querySelector('.r-storage-repair');
+            storageHelp.hidden = !storageMissing;
+            dlg.querySelectorAll('.r-environment-repair .image-install-help').forEach(element => {
+                if (element !== storageHelp) element.hidden = !!storageMissing;
             });
-            if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-            let completed = false;
-            while (true) {
-                const part = await reader.read();
-                if (part.done) break;
-                buffer += decoder.decode(part.value, {stream: true});
-                const lines = buffer.split('\n');
-                buffer = lines.pop();
-                for (const line of lines) {
-                    if (!line.startsWith('data: ')) continue;
-                    const evt = JSON.parse(line.slice(6));
-                    if (evt.type === 'progress') {
-                        const liveZh = currentLang === 'zh';
-                        const percent = Math.max(0, Math.min(99, Number(evt.percent) || 0));
-                        progressFill.style.width = percent + '%';
-                        const phase = evt.status === 'Loading'
-                            ? (liveZh ? '正在导入镜像' : 'Importing image')
-                            : evt.status === 'Verifying'
-                                ? (liveZh ? '正在校验镜像' : 'Verifying image')
-                                : evt.status === 'Probing'
-                                    ? (liveZh ? '正在探测最快下载源' : 'Probing the fastest source')
-                                    : (liveZh ? '正在下载' : 'Downloading');
-                        if (evt.total > 0) {
-                            progressStatus.textContent = `${percent}% ${phase} ${(evt.current / 1048576).toFixed(1)}/${(evt.total / 1048576).toFixed(1)} MB`;
-                        } else {
-                            progressStatus.textContent = `${percent}% ${phase}`;
-                        }
-                    } else if (evt.type === 'done') {
-                        completed = true;
-                        progressFill.style.width = '100%';
-                        progressStatus.textContent = currentLang === 'zh' ? '100% 安装完成，正在刷新当前 R 插件...' : '100% Installed. Refreshing the current R plugin...';
-                    } else if (evt.type === 'error') {
-                        throw new Error(evt.message || (currentLang === 'zh' ? '备用下载失败' : 'Backup download failed'));
-                    }
-                }
+            dlg.querySelector('.cleanup').hidden = !result.ready || !result.preparation?.previous_image_id;
+            dlg.querySelector('.retry').hidden = result.runtime_state !== 'attention';
+            if (result.preparation?.phase === 'removed') {
+                status.textContent = zh ? 'R 环境已删除，可使用本地恢复资源重新启用。' : 'R environment was removed. A local recovery archive is available.';
+                dlg.querySelector('.retry').textContent = zh ? '恢复环境' : 'Restore environment';
             }
-            if (!completed) throw new Error(currentLang === 'zh' ? '下载连接已结束，但后端未确认安装完成' : 'The download ended before installation was confirmed');
-            _lastLocalImagesData = null;
-            _lastLocalImagesTime = 0;
-            if (typeof dialogState.onInstalled === 'function') await dialogState.onInstalled();
-            closeDlg();
-        } catch (e) {
-            downloading = false;
-            downloadFailed = true;
-            gotoBtn.disabled = false;
-            closeBtn.disabled = false;
-            backupBtn.disabled = false;
-            updateDialogLanguage();
-            progressStatus.style.color = '#e53935';
-            progressStatus.textContent = (currentLang === 'zh' ? '下载失败：' : 'Download failed: ') + e.message;
+            if (result.ready) {
+                notifyStatusChanged('r-runtime', 'r-packages');
+                if (onInstalled) await onInstalled();
+                return;
+            }
+            if (dlg.isConnected && result.runtime_state !== 'attention') timer = setTimeout(update, 1500);
+        } catch (error) {
+            status.classList.add('is-error');
+            status.textContent = zh ? '无法读取运行状态，请检查后端连接后重试。' : 'Unable to read runtime status. Check the backend connection and try again.';
+            dlg.querySelector('.retry').hidden = false;
         }
+    }
+    dlg.querySelector('.retry').onclick = async () => {
+        clearTimeout(timer);
+        const retry = dlg.querySelector('.retry');
+        retry.disabled = true;
+        try {
+            const response = await fetch(auxApiUrl('/r/prepare-runtime'), {method:'POST'});
+            if (!response.ok) throw new Error(zh ? '重新检查失败，请稍后重试。' : 'Check failed. Please try again.');
+            notifyStatusChanged('r-runtime');
+            await update();
+        }
+        catch (error) { status.textContent = String(error); }
+        finally { retry.disabled = false; }
     };
-    dlg.addEventListener('cancel', e => {
-        e.preventDefault();
-        if (downloading) minimizeDlg();
-        else closeDlg();
-    });
-    document.body.appendChild(dlg);
-    dlg.showModal();
+    dlg.querySelector('.cleanup').onclick = async () => {
+        if (!confirm(zh ? '删除未使用的旧 R 环境？旧包库和分析数据会保留，但该环境将不能用于回退。' : 'Remove the unused previous R environment? Packages and analysis data are preserved, but this environment will no longer be available for rollback.')) return;
+        try {
+            const response = await fetch(auxApiUrl('/r/cleanup-previous-runtime'), {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmed:true})});
+            const result = await response.json();
+            if (result.status !== 'success') throw new Error(result.message);
+            await update();
+        } catch (error) {status.textContent = String(error);}
+    };
+    dlg.querySelector('.close').onclick = () => dlg.close();
+    dlg.addEventListener('close', () => { clearTimeout(timer); dlg.remove(); });
+    document.body.appendChild(dlg); dlg.showModal(); update();
 }
 
 ipcRenderer.on('sys-log', (event, msg) => log(msg));
@@ -3100,13 +3474,13 @@ var _showPluginUpdateDialog;
                 const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
                 return `<img src="${escapeHtml(href)}" alt="${escapeHtml(text || '')}"${titleAttr}>`;
             };
-            return marked.parse(normalizedMarkdown, {
+            return require('./preview-sanitize').default.sanitize(marked.parse(normalizedMarkdown, {
                 gfm: true,
                 breaks: true,
                 headerIds: false,
                 mangle: false,
                 renderer
-            });
+            }));
         } catch (e) {
             return `<div style="white-space:pre-wrap;">${escapeHtml(markdownText)}</div>`;
         }
@@ -3319,6 +3693,7 @@ ipcRenderer.on('soft-refresh', async () => {
     allTabIds.forEach(tabId => {
         const btn = document.getElementById(`btn-${tabId}`);
         const view = document.getElementById(`view-${tabId}`);
+        if (view) viewStatus.dispose(view);
         if (btn) btn.remove();
         if (view && tabId !== 'welcome') view.remove();
         delete tabs[tabId];
@@ -3451,6 +3826,7 @@ function renderToolSearch(plugins) {
 }
 
 function renderMenu(plugins) {
+    notifyStatusChanged('plugins');
     renderToolSearch(plugins);
     if (linuxMenuRoot) linuxMenuRoot.innerHTML = '';
     if (rMenuRoot) rMenuRoot.innerHTML = '';
@@ -3908,7 +4284,7 @@ document.getElementById('ctx-rename-plugin').onclick = (e) => {
         if (menuLinux) menuLinux._isRightClickedOpen = false;
         if (menuR) menuR._isRightClickedOpen = false;
     };
-    dlg.addEventListener('cancel', e => { e.preventDefault(); closeDlg(); });
+    dlg.oncancel = e => { e.preventDefault(); closeDlg(); };
     dlg.showModal();
     dlg.querySelector('.rename-plugin-zh').focus();
     dlg.querySelector('.rename-plugin-zh').select();
@@ -5478,6 +5854,9 @@ function renderWorkflowUI(container, tabId) {
     };
 
     toolbar.querySelector('.wf-start-all').onclick = async () => {
+        stopWorkflowScheduling = false;
+        activeWorkflowRuns += 1;
+        try {
         // Workflow-run id for this Start All invocation
         const wfRunId = 'wf-' + Date.now() + '-' + Math.floor(Math.random()*10000);
         const nodes = Array.from(canvasInner.querySelectorAll('.wf-node'));
@@ -5524,7 +5903,7 @@ function renderWorkflowUI(container, tabId) {
             }
         };
 
-        while (pendingNodes.size > 0) {
+        while (pendingNodes.size > 0 && !stopWorkflowScheduling) {
             // Propagate failure only along connected downstream branches.
             for (const nodeId of Array.from(pendingNodes)) {
                 const blocking = upstreamIdsFor(nodeId).filter(id => {
@@ -5609,6 +5988,7 @@ function renderWorkflowUI(container, tabId) {
                     return;
                 }
 
+                if (stopWorkflowScheduling) return;
                 const succeeded = await startNode(n, plugin, startBtn, stopBtn);
                 setExecutionStatus(nodeId, succeeded ? 'success' : 'failed');
             });
@@ -5624,7 +6004,7 @@ function renderWorkflowUI(container, tabId) {
                         const fs = require('fs');
                         if (fs.existsSync(n._outDir)) {
                             const allFiles = await listDir(n._outDir, true);
-                            n._outputFiles = allFiles.filter(f => !path.basename(f).toLowerCase().endsWith('.primigenius.log'));
+                            n._outputFiles = allFiles.filter(f => !isSystemLogFile(f));
                         }
                     } catch(e) { console.warn('Re-scan output dir failed', e); }
                 }
@@ -5632,6 +6012,7 @@ function renderWorkflowUI(container, tabId) {
             await new Promise(r => setTimeout(r, 500));
         }
 
+        } finally { activeWorkflowRuns -= 1; }
     };
 
     const applyToAllNodes = (fn) => {
@@ -5998,7 +6379,8 @@ function renderWorkflowUI(container, tabId) {
 
     // shared delete control for connections (a small circular button)
     const connDel = document.createElement('div');
-    connDel.style.cssText = 'position:absolute; width:22px; height:22px; background:linear-gradient(135deg,#e53935,#c62828); color:white; display:none; align-items:center; justify-content:center; border-radius:50%; cursor:pointer; z-index:50; font-size:11px; line-height:22px; box-shadow:0 2px 6px rgba(0,0,0,0.3); transition:transform 0.12s; border:2px solid #fff;';
+    connDel.className = 'wf-connection-delete';
+    connDel.style.cssText = 'position:absolute; width:22px; height:22px; background:transparent; color:#e53935; display:none; align-items:center; justify-content:center; border-radius:50%; cursor:pointer; z-index:50; font-size:11px; line-height:22px; transition:transform 0.12s; border:2px solid transparent;';
     connDel.innerText = '✕';
     connDel.title = currentLang==='zh'?'删除连线':'Delete connection';
     canvasInner.appendChild(connDel);
@@ -6127,7 +6509,7 @@ function renderWorkflowUI(container, tabId) {
             const base = (filename || '').toString();
             const lname = base.toLowerCase();
             // Always exclude system-generated primigenius log files from auto-matching
-            if (lname.endsWith('.primigenius.log')) return false;
+            if (isSystemLogFile(base)) return false;
             // if param specifies allowed extensions or formats, respect them
             const allowed = (param && (param.extensions || param.accept || param.file_types || param.format)) || null;
             if (!allowed) return true;
@@ -7313,12 +7695,12 @@ function renderWorkflowUI(container, tabId) {
                 // Scan output directory and populate output files section
                 try {
                     let allOutputFiles = await listDir(outDir, true);
-                    let resultFiles = allOutputFiles.filter(f => !path.basename(f).toLowerCase().endsWith('.primigenius.log'));
+                    let resultFiles = allOutputFiles.filter(f => !isSystemLogFile(f));
                     if (resultFiles.length === 0) {
                         for (let retry = 0; retry < 3; retry++) {
                             await new Promise(r => setTimeout(r, 1000));
                             allOutputFiles = await listDir(outDir, true);
-                            resultFiles = allOutputFiles.filter(f => !path.basename(f).toLowerCase().endsWith('.primigenius.log'));
+                            resultFiles = allOutputFiles.filter(f => !isSystemLogFile(f));
                             if (resultFiles.length > 0) break;
                         }
                     }
@@ -7484,7 +7866,7 @@ function renderWorkflowUI(container, tabId) {
                             portIdx++;
                         });
 
-                        // System log files (.primigenius.log) are NOT displayed in the output section.
+                        // System log files are NOT displayed in the output section.
                         // They are saved in the output directory for reference only.
 
                         // Update any connections from this node to ensure groupFiles and filePath are current
@@ -7768,449 +8150,6 @@ function renderWorkflowUI(container, tabId) {
         return succeeded;
     }
 
-    // Show the members of a grouped input first. Each member then opens the
-    // same file preview used by workflow outputs and ordinary input chips.
-    function showFileGroupPreview(files, groupName) {
-        const members = Array.from(new Set((files || []).filter(Boolean)));
-        if (members.length === 0) return;
-
-        const overlay = document.createElement('div');
-        overlay.className = 'wf-preview-overlay';
-        const win = document.createElement('div');
-        win.className = 'wf-preview-window wf-group-preview-window';
-
-        const header = document.createElement('div');
-        header.className = 'wf-preview-header';
-        const title = document.createElement('span');
-        title.className = 'wf-group-preview-title';
-        title.innerHTML = `<i class="fas fa-link"></i><span>${escapeHtml(groupName || (currentLang === 'zh' ? '文件组合' : 'File group'))}</span><small>${members.length} ${currentLang === 'zh' ? '个文件' : 'files'}</small>`;
-        const closeBtn = document.createElement('button');
-        closeBtn.className = 'wf-preview-close';
-        closeBtn.innerHTML = '×';
-        header.appendChild(title);
-        header.appendChild(closeBtn);
-
-        const body = document.createElement('div');
-        body.className = 'wf-preview-body wf-group-preview-body';
-        members.forEach((filePath, index) => {
-            const fileName = path.basename(filePath);
-            const row = document.createElement('div');
-            row.className = 'wf-group-preview-file';
-            row.title = filePath;
-            const number = document.createElement('span');
-            number.className = 'wf-group-preview-index';
-            number.textContent = String(index + 1);
-            const name = document.createElement('span');
-            name.className = 'wf-group-preview-name';
-            name.textContent = fileName;
-            const eye = document.createElement('button');
-            eye.className = 'wf-group-preview-eye';
-            eye.title = currentLang === 'zh' ? `预览 ${fileName}` : `Preview ${fileName}`;
-            eye.innerHTML = '<i class="fas fa-eye"></i>';
-            eye.onclick = (e) => { e.stopPropagation(); showFilePreview(filePath, fileName); };
-            row.ondblclick = () => showFilePreview(filePath, fileName);
-            row.appendChild(number);
-            row.appendChild(name);
-            row.appendChild(eye);
-            body.appendChild(row);
-        });
-
-        win.appendChild(header);
-        win.appendChild(body);
-        overlay.appendChild(win);
-        const closeGroupPreview = () => {
-            overlay.remove();
-            document.removeEventListener('keydown', escHandler);
-        };
-        closeBtn.onclick = closeGroupPreview;
-        overlay.onclick = (e) => { if (e.target === overlay) closeGroupPreview(); };
-        const escHandler = (e) => {
-            if (e.key === 'Escape' && overlay.isConnected) {
-                closeGroupPreview();
-            }
-        };
-        document.addEventListener('keydown', escHandler);
-        document.body.appendChild(overlay);
-    }
-
-    // File preview function — optimized for long data, images, PDFs, and text files
-    function showFilePreview(filePath, fileName) {
-        const ext = (fileName.split('.').pop() || '').toLowerCase();
-        // Determine multi-dot extensions like .fq.gz, .summary.txt
-        const lowerName = fileName.toLowerCase();
-        const isImage = ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'tiff', 'tif', 'ico'].includes(ext);
-        const isSvg = ext === 'svg';
-        const isPdf = ext === 'pdf';
-        const isSpreadsheet = ['xlsx', 'xls'].includes(ext);
-        const isTable = ['csv', 'tsv', 'tab'].includes(ext) || isSpreadsheet;
-        const isHtml = ['html', 'htm'].includes(ext);
-        const isBinary = ['bam', 'bai', 'gz', 'zip', 'tar', 'rar', '7z', 'exe', 'dll', 'so', 'o', 'pyc', 'class', 'ht2'].includes(ext);
-
-        // For images — native in-app preview (same as R tool image viewer)
-        if (isImage) {
-            const imgOverlay = document.createElement('div');
-            imgOverlay.className = 'r-viewer-overlay';
-            const imgUrl = API_BASE + '/r/serve-file?path=' + encodeURIComponent(filePath);
-            imgOverlay.innerHTML = `
-                <div class="r-viewer-window">
-                    <div class="r-viewer-header">
-                        <span><i class="fas fa-image"></i> ${escapeHtml(fileName)}</span>
-                        <button class="r-viewer-close"><i class="fas fa-times"></i></button>
-                    </div>
-                    <div class="r-viewer-body r-viewer-img-body">
-                        <img class="r-viewer-zoomable-img" src="${imgUrl}" />
-                    </div>
-                    <div class="r-viewer-footer">
-                        <button class="r-viewer-action-btn" data-action="zoomout"><i class="fas fa-search-minus"></i></button>
-                        <span class="r-viewer-zoom-label">100%</span>
-                        <button class="r-viewer-action-btn" data-action="zoomin"><i class="fas fa-search-plus"></i></button>
-                        <button class="r-viewer-action-btn" data-action="zoomfit"><i class="fas fa-expand"></i> Fit</button>
-                        <div style="flex:1"></div>
-                        <button class="r-viewer-action-btn" data-action="openext"><i class="fas fa-external-link-alt"></i> ${currentLang==='zh'?'外部打开':'Open Externally'}</button>
-                        <button class="r-viewer-action-btn" data-action="download"><i class="fas fa-download"></i> ${currentLang==='zh'?'下载':'Download'}</button>
-                    </div>
-                </div>
-            `;
-            const imgWin = imgOverlay.querySelector('.r-viewer-window');
-            const imgHeader = imgOverlay.querySelector('.r-viewer-header');
-            const img = imgOverlay.querySelector('.r-viewer-zoomable-img');
-            const zoomLabel = imgOverlay.querySelector('.r-viewer-zoom-label');
-            let imgScale = 1;
-
-            function updateZoom() {
-                img.style.transform = `scale(${imgScale})`;
-                zoomLabel.textContent = Math.round(imgScale * 100) + '%';
-            }
-
-            imgOverlay.querySelector('[data-action="zoomin"]').onclick = () => { imgScale = Math.min(imgScale * 1.25, 10); updateZoom(); };
-            imgOverlay.querySelector('[data-action="zoomout"]').onclick = () => { imgScale = Math.max(imgScale / 1.25, 0.1); updateZoom(); };
-            imgOverlay.querySelector('[data-action="zoomfit"]').onclick = () => { imgScale = 1; updateZoom(); };
-            imgOverlay.querySelector('.r-viewer-body').addEventListener('wheel', e => {
-                e.preventDefault();
-                imgScale *= e.deltaY > 0 ? 0.9 : 1.1;
-                imgScale = Math.max(0.1, Math.min(imgScale, 10));
-                updateZoom();
-            }, { passive: false });
-
-            imgOverlay.querySelector('.r-viewer-close').onclick = () => imgOverlay.remove();
-            imgOverlay.onclick = e => { if (e.target === imgOverlay) imgOverlay.remove(); };
-            imgOverlay.querySelector('[data-action="openext"]').onclick = () => {
-                try { require('electron').shell.openPath(filePath); } catch(e) { console.warn('openPath failed', e); }
-            };
-            imgOverlay.querySelector('[data-action="download"]').onclick = () => {
-                try {
-                    const a = document.createElement('a');
-                    a.href = imgUrl; a.download = fileName; a.click();
-                } catch(e) { console.warn('download failed', e); }
-            };
-
-            document.body.appendChild(imgOverlay);
-            makeWindowDraggable(imgOverlay, imgWin, imgHeader);
-            makeWindowResizable(imgWin);
-            return;
-        }
-
-        // For PDFs — inline preview via iframe (same as R tool PDF viewer)
-        if (isPdf) {
-            const pdfOverlay = document.createElement('div');
-            pdfOverlay.className = 'r-viewer-overlay';
-            const pdfUrl = API_BASE + '/r/serve-file?path=' + encodeURIComponent(filePath);
-            pdfOverlay.innerHTML = `
-                <div class="r-viewer-window" style="width:85%;max-width:1100px;height:85%;">
-                    <div class="r-viewer-header">
-                        <span><i class="fas fa-file-pdf" style="color:#ef5350;"></i> ${fileName}</span>
-                        <button class="r-viewer-close"><i class="fas fa-times"></i></button>
-                    </div>
-                    <div class="r-viewer-body r-pdf-body" style="padding:0;background:#525659;flex:1;overflow:hidden;">
-                        <iframe src="${pdfUrl}" style="width:100%;height:100%;border:none;"></iframe>
-                    </div>
-                </div>
-            `;
-            const pdfWin = pdfOverlay.querySelector('.r-viewer-window');
-            const pdfHeader = pdfOverlay.querySelector('.r-viewer-header');
-            pdfOverlay.querySelector('.r-viewer-close').onclick = () => pdfOverlay.remove();
-            pdfOverlay.onclick = e => { if (e.target === pdfOverlay) pdfOverlay.remove(); };
-            document.body.appendChild(pdfOverlay);
-            // Simple drag and resize (inline, same as r-viewer)
-            (function makeDraggable(overlay, win, header) {
-                let isDrag = false, sx = 0, sy = 0;
-                header.addEventListener('mousedown', e => { isDrag = true; sx = e.clientX; sy = e.clientY; e.preventDefault(); });
-                document.addEventListener('mousemove', e => { if (!isDrag) return; win.style.left = (win.offsetLeft + e.clientX - sx) + 'px'; win.style.top = (win.offsetTop + e.clientY - sy) + 'px'; sx = e.clientX; sy = e.clientY; });
-                document.addEventListener('mouseup', () => { isDrag = false; });
-            })(pdfOverlay, pdfWin, pdfHeader);
-            (function makeResizable(win) {
-                const handle = document.createElement('div');
-                handle.className = 'r-viewer-resize-handle';
-                win.appendChild(handle);
-                let isResize = false, sx = 0, sy = 0, ow = 0, oh = 0;
-                handle.addEventListener('mousedown', e => { isResize = true; sx = e.clientX; sy = e.clientY; ow = win.offsetWidth; oh = win.offsetHeight; e.preventDefault(); e.stopPropagation(); });
-                document.addEventListener('mousemove', e => { if (!isResize) return; win.style.width = Math.max(400, ow + e.clientX - sx) + 'px'; win.style.height = Math.max(300, oh + e.clientY - sy) + 'px'; });
-                document.addEventListener('mouseup', () => { isResize = false; });
-            })(pdfWin);
-            return;
-        }
-
-        const overlay = document.createElement('div');
-        overlay.className = 'wf-preview-overlay';
-        overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-        // Close on Escape key
-        const escHandler = (e) => { if (e.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', escHandler); } };
-        document.addEventListener('keydown', escHandler);
-
-        const win = document.createElement('div');
-        win.className = 'wf-preview-window';
-
-        const header = document.createElement('div');
-        header.className = 'wf-preview-header';
-
-        // Left: icon + filename + optional dims
-        const headerLeft = document.createElement('span');
-        headerLeft.style.cssText = 'display:flex;align-items:center;gap:8px;overflow:hidden;';
-        let fileIcon = 'fa-file-alt';
-        if (isSvg) fileIcon = 'fa-image';
-        else if (isTable) fileIcon = 'fa-table';
-        else if (isHtml) fileIcon = 'fa-code';
-        headerLeft.innerHTML = `<i class="fas ${fileIcon}" style="flex-shrink:0;"></i><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${filePath}">${fileName}</span>${isTable ? '<span class="wf-table-dims" style="color:#90caf9;font-weight:400;flex-shrink:0;margin-left:4px;"></span>' : ''}`;
-
-        // Right: open externally button + close button
-        const headerRight = document.createElement('div');
-        headerRight.style.cssText = 'display:flex;align-items:center;gap:4px;flex-shrink:0;';
-
-        const openExtBtn = document.createElement('button');
-        openExtBtn.className = 'wf-preview-close';
-        openExtBtn.innerHTML = '<i class="fas fa-external-link-alt" style="font-size:13px;"></i>';
-        openExtBtn.title = currentLang==='zh'?'使用系统应用打开':'Open with system app';
-        openExtBtn.onclick = () => { try { require('electron').shell.openPath(filePath); } catch(e) {} };
-
-        const closeBtn = document.createElement('button');
-        closeBtn.className = 'wf-preview-close';
-        closeBtn.innerHTML = '×';
-        closeBtn.onclick = () => { overlay.remove(); document.removeEventListener('keydown', escHandler); };
-
-        headerRight.appendChild(openExtBtn);
-        headerRight.appendChild(closeBtn);
-        header.appendChild(headerLeft);
-        header.appendChild(headerRight);
-
-        const body = document.createElement('div');
-        body.className = 'wf-preview-body';
-
-        try {
-            const fs = require('fs');
-
-            if (isBinary) {
-                // Binary file — show info only
-                let fileSize = 0;
-                try { fileSize = fs.statSync(filePath).size; } catch(e) {}
-                const sizeStr = fileSize > 1048576 ? (fileSize / 1048576).toFixed(1) + ' MB'
-                    : fileSize > 1024 ? (fileSize / 1024).toFixed(1) + ' KB' : fileSize + ' B';
-                body.innerHTML = `<div style="text-align:center;color:#78909c;padding:60px 20px;">
-                    <i class="fas fa-file-archive" style="font-size:56px;margin-bottom:16px;color:#90a4ae;"></i>
-                    <p style="font-size:16px;font-weight:600;margin-bottom:8px;">${currentLang==='zh'?'二进制文件，无法直接预览':'Binary file, cannot preview directly'}</p>
-                    <p style="font-size:13px;color:#b0bec5;margin-bottom:16px;">${ext.toUpperCase()} · ${sizeStr}</p>
-                    <button onclick="try{require('electron').shell.openPath('${filePath.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}');}catch(e){}" style="padding:8px 20px;border:1px solid #1976d2;background:#e3f2fd;color:#1565c0;border-radius:4px;cursor:pointer;font-size:13px;">
-                        <i class="fas fa-external-link-alt"></i> ${currentLang==='zh'?'使用系统应用打开':'Open with system app'}
-                    </button>
-                </div>`;
-            } else if (isSvg) {
-                const svgContent = fs.readFileSync(filePath, 'utf-8');
-                const svgContainer = document.createElement('div');
-                svgContainer.style.cssText = 'display:flex;justify-content:center;align-items:center;min-height:200px;padding:20px;background:#fff;';
-                svgContainer.innerHTML = svgContent;
-                // Make SVG responsive
-                const svgEl = svgContainer.querySelector('svg');
-                if (svgEl) {
-                    svgEl.style.maxWidth = '100%';
-                    svgEl.style.height = 'auto';
-                    svgEl.removeAttribute('width');
-                    svgEl.removeAttribute('height');
-                }
-                body.appendChild(svgContainer);
-            } else if (isHtml) {
-                const htmlContent = fs.readFileSync(filePath, 'utf-8');
-                const iframe = document.createElement('iframe');
-                iframe.style.cssText = 'width:100%;height:100%;border:none;';
-                iframe.srcdoc = htmlContent;
-                body.style.padding = '0';
-                body.appendChild(iframe);
-            } else if (isSpreadsheet) {
-                const preview = readSpreadsheetPreviewRows(filePath);
-                const dimsSpan = headerLeft.querySelector('.wf-table-dims');
-                if (dimsSpan) {
-                    const sheetSuffix = preview.sheetName ? ` - ${preview.sheetName}` : '';
-                    dimsSpan.textContent = `(${preview.totalRows} x ${preview.totalCols})${sheetSuffix}`;
-                }
-
-                const tableWrapper = document.createElement('div');
-                tableWrapper.style.cssText = 'overflow:auto;flex:1;min-height:0;';
-                renderPreviewDataTable(tableWrapper, preview.rows);
-                body.style.padding = '0';
-                body.style.overflow = 'hidden';
-                body.appendChild(tableWrapper);
-            } else {
-                // Text-based files: csv, tsv, tab, txt, log, R, py, json, etc.
-                const stats = fs.statSync(filePath);
-                const MAX_SIZE = 20 * 1024 * 1024; // 20MB max for preview
-                let content = '';
-                let truncated = false;
-
-                // Use iconv-lite for encoding detection (supports GBK)
-                const Iconv = require('iconv-lite');
-
-                function looksLikeValid(text) {
-                    if (!text) return false;
-                    if (text.includes('\ufffd')) return false;
-                    // Check if text contains Chinese characters
-                    var hasChinese = /[\u4e00-\u9fff\u3400-\u4dbf\uff00-\uffef\u3000-\u303f]/.test(text);
-                    return hasChinese;
-                }
-
-                if (stats.size > MAX_SIZE) {
-                    // Read only first 20MB
-                    const buf = Buffer.alloc(MAX_SIZE);
-                    const fd = fs.openSync(filePath, 'r');
-                    fs.readSync(fd, buf, 0, MAX_SIZE, 0);
-                    fs.closeSync(fd);
-                    // Try UTF-8 first, then GBK/GB2312
-                    const encodings = ['utf-8', 'gbk', 'gb2312', 'latin-1'];
-                    let decoded = false;
-                    for (const enc of encodings) {
-                        try {
-                            const attempted = Iconv.decode(buf, enc);
-                            if (enc === 'gbk' || enc === 'gb2312') {
-                                // For GBK/GB2312, check no replacement chars AND has Chinese
-                                const hasChinese = /[\u4e00-\u9fff\u3400-\u4dbf\uff00-\uffef\u3000-\u303f]/.test(attempted);
-                                if (!attempted.includes('\ufffd') && hasChinese) { decoded = true; content = attempted; break; }
-                            } else {
-                                // For UTF-8, also require Chinese characters
-                                if ((!attempted.includes('\ufffd') || enc === 'latin-1') && looksLikeValid(attempted)) { decoded = true; content = attempted; break; }
-                            }
-                        } catch(e) {}
-                    }
-                    if (!decoded) content = Iconv.decode(buf, 'utf-8');
-                    truncated = true;
-                } else {
-                    const raw = fs.readFileSync(filePath);
-                    // Try UTF-8 first, then GBK/GB2312
-                    const encodings = ['utf-8', 'gbk', 'gb2312', 'latin-1'];
-                    let decoded = false;
-                    for (const enc of encodings) {
-                        try {
-                            const attempted = Iconv.decode(raw, enc);
-                            if (enc === 'gbk' || enc === 'gb2312') {
-                                // For GBK/GB2312, check no replacement chars AND has Chinese
-                                const hasChinese = /[\u4e00-\u9fff\u3400-\u4dbf\uff00-\uffef\u3000-\u303f]/.test(attempted);
-                                if (!attempted.includes('\ufffd') && hasChinese) { decoded = true; content = attempted; break; }
-                            } else {
-                                // For UTF-8, also require Chinese characters
-                                if ((!attempted.includes('\ufffd') || enc === 'latin-1') && looksLikeValid(attempted)) { decoded = true; content = attempted; break; }
-                            }
-                        } catch(e) {}
-                    }
-                    if (!decoded) content = Iconv.decode(raw, 'utf-8');
-                }
-
-                if (isTable) {
-                    // Render as table with sticky header and row numbers
-                    const delim = ext === 'csv' ? ',' : '\t';
-                    const lines = content.split(/\r?\n/).filter(l => l.trim());
-                    const rows = parseDelimitedRows(content, delim);
-
-                    // Create table wrapper
-                    const tableWrapper = document.createElement('div');
-                    tableWrapper.style.cssText = 'overflow:auto;flex:1;min-height:0;';
-
-                    const totalRows = lines.length;
-                    const firstRowCells = rows.length > 0 ? rows[0] : [];
-                    const totalCols = firstRowCells.length;
-                    
-                    // Show dimensions in header
-                    const dimsSpan = headerLeft.querySelector('.wf-table-dims');
-                    if (dimsSpan) {
-                        dimsSpan.textContent = `(${totalRows} x ${totalCols})`;
-                    }
-
-                    renderPreviewDataTable(tableWrapper, rows);
-                    body.style.padding = '0';
-                    body.style.overflow = 'hidden';
-                    body.appendChild(tableWrapper);
-                } else {
-                    // General text/code preview with line numbers
-                    const preWrapper = document.createElement('div');
-                    preWrapper.className = 'preview-code-wrapper';
-
-                    // Count total lines efficiently (count \n, add 1 if content ends without \n)
-                    let totalLines = 1;
-                    for (let i = 0; i < content.length; i++) {
-                        if (content[i] === '\n') totalLines++;
-                    }
-                    if (content.length === 0) totalLines = 0;
-                    
-                    const MAX_LINES = 500;
-                    const isCapped = totalLines > MAX_LINES;
-                    
-                    // Only split first MAX_LINES to avoid memory bloat on huge files
-                    function splitFirstNLines(text, n) {
-                        const lines = [];
-                        let start = 0;
-                        for (let i = 0; i < text.length && lines.length < n; i++) {
-                            if (text[i] === '\n') {
-                                lines.push(text.substring(start, i));
-                                start = i + 1;
-                            } else if (text[i] === '\r') {
-                                lines.push(text.substring(start, i));
-                                if (i + 1 < text.length && text[i + 1] === '\n') i++;
-                                start = i + 1;
-                            }
-                        }
-                        if (start < text.length && lines.length < n) {
-                            lines.push(text.substring(start));
-                        }
-                        return lines;
-                    }
-                    const displayLines = splitFirstNLines(content, MAX_LINES);
-                    
-                    // Show total lines in header
-                    const dimsSpan = headerLeft.querySelector('.wf-table-dims');
-                    if (!dimsSpan) {
-                        const spanEl = document.createElement('span');
-                        spanEl.style.cssText = 'color:#90caf9;font-weight:400;flex-shrink:0;margin-left:4px;font-size:12px;';
-                        spanEl.textContent = `(${totalLines} ${currentLang==='zh'?'行':'lines'})`;
-                        headerLeft.appendChild(spanEl);
-                    }
-
-                    // Line number gutter + content (line numbers disabled for cleaner text preview)
-                    const codeContent = document.createElement('pre');
-                    codeContent.className = 'preview-code-content';
-
-                    codeContent.textContent = displayLines.join('\n');
-
-                    preWrapper.appendChild(codeContent);
-                    body.style.padding = '0';
-                    body.style.overflow = 'hidden';
-                    body.appendChild(preWrapper);
-
-                    if (isCapped || truncated) {
-                        const truncNote = document.createElement('div');
-                        truncNote.style.cssText = 'padding:8px 16px;background:#fff3e0;color:#e65100;font-size:11px;text-align:center;border-top:1px solid #ffe0b2;flex-shrink:0;';
-                        const msg = isCapped 
-                            ? (currentLang==='zh'?`最多显示前 ${MAX_LINES.toLocaleString()} 行，点击右上角按钮使用系统应用打开完整文件。`:`Showing first ${MAX_LINES.toLocaleString()} lines only. Click the external link button to open the full file.`)
-                            : (currentLang==='zh'?`文件过大(${(stats.size/1024/1024).toFixed(1)}MB)，仅显示前20MB内容。`:`File too large (${(stats.size/1024/1024).toFixed(1)}MB), showing first 20MB only.`);
-                        truncNote.innerHTML = `<i class="fas fa-info-circle"></i> ${msg}`;
-                        body.appendChild(truncNote);
-                    }
-                }
-            }
-        } catch (e) {
-            body.innerHTML = `<div style="text-align:center;color:#e53935;padding:40px;"><i class="fas fa-exclamation-triangle" style="font-size:48px;margin-bottom:12px;"></i><p>${e.message}</p></div>`;
-        }
-
-        win.appendChild(header);
-        win.appendChild(body);
-        overlay.appendChild(win);
-        document.body.appendChild(overlay);
-    }
-
     // stop node: call backend stop API with clientRunId if available
     async function stopNode(nodeEl, startBtn, stopBtn) {
         if (nodeEl._runState !== 'running') return;
@@ -8330,7 +8269,7 @@ function openPluginStoreTab() {
         contentEl.innerHTML = `
             <div class="tool-header plugin-store-header">
                 <div class="plugin-store-heading">
-                    <div class="tool-title plugin-store-title-el"><i class="fas fa-store" style="color:#00897b"></i> ${t('plugin-store-title')}</div>
+                    <div class="tool-title plugin-store-title-el"><i class="fas fa-store"></i> ${t('plugin-store-title')}</div>
                     <div class="plugin-store-count-card" title="${t('plugin-store-published-count-hint')}">
                         <i class="fas fa-puzzle-piece"></i>
                         <span class="plugin-store-count-value">—</span>
@@ -8376,10 +8315,9 @@ function openPluginStoreTab() {
         let activeStoreInstallCount = 0;
         let storeInstallHadFailure = false;
         let storeInstallRefreshPending = false;
-        let storeInstallCloseTimer = null;
 
         const syncChrome = () => {
-            if (titleEl) titleEl.innerHTML = `<i class="fas fa-store" style="color:#00897b"></i> ${t('plugin-store-title')}`;
+            if (titleEl) titleEl.innerHTML = `<i class="fas fa-store"></i> ${t('plugin-store-title')}`;
             if (storeCountCard) storeCountCard.title = t('plugin-store-published-count-hint');
             if (storeCountValue) {
                 storeCountValue.textContent = tabs[tabId].storeLoaded
@@ -8446,10 +8384,6 @@ function openPluginStoreTab() {
         };
 
         const closeInstallLog = () => {
-            if (storeInstallCloseTimer) {
-                clearTimeout(storeInstallCloseTimer);
-                storeInstallCloseTimer = null;
-            }
             if (installLogPanel) {
                 try { installLogPanel.remove(); } catch (e) {}
                 installLogPanel = null;
@@ -8461,10 +8395,6 @@ function openPluginStoreTab() {
         };
 
         const openInstallLog = () => {
-            if (storeInstallCloseTimer) {
-                clearTimeout(storeInstallCloseTimer);
-                storeInstallCloseTimer = null;
-            }
             if (installLogPanel && contentEl.contains(installLogPanel)) {
                 const existingBox = installLogPanel.querySelector('.local-log-box');
                 if (existingBox) {
@@ -8475,6 +8405,7 @@ function openPluginStoreTab() {
             }
             installLogPanel = document.createElement('div');
             installLogPanel.className = 'local-log-container plugin-store-install-log';
+            installLogPanel.dataset.autoCloseLog = 'true';
             installLogPanel.innerHTML = `
                 <div class="local-log-header plugin-store-install-log-header">
                     <span><i class="fas fa-terminal"></i> ${t('plugin-store-log-title')}</span>
@@ -8665,14 +8596,15 @@ function openPluginStoreTab() {
                         ipcRenderer.removeListener('plugin-update-download-progress', progressHandler);
                         activeStoreInstallCount = Math.max(0, activeStoreInstallCount - 1);
                         if (activeStoreInstallCount === 0) {
+                            if (storeInstallHadFailure && installLogPanel) {
+                                finishAutoCloseInstallLog(installLogPanel, {state:'failed'}, installLogPanel.querySelector('.local-log-box'));
+                            }
+                            closeInstallLog();
                             if (storeInstallRefreshPending) {
                                 await init();
                                 await loadStore();
                                 storeInstallRefreshPending = false;
-                            }
-                            if (!storeInstallHadFailure) {
-                                storeInstallCloseTimer = setTimeout(closeInstallLog, 900);
-                            }
+                            } else renderStore();
                         }
                     }
                 };
@@ -8688,6 +8620,16 @@ function openPluginStoreTab() {
                 tabs[tabId].storePlugins = Array.isArray(res.plugins) ? res.plugins : [];
                 tabs[tabId].storeLoaded = true;
                 renderStore();
+                const store = tabs[tabId];
+                const plugins = store.storePlugins;
+                ipcRenderer.invoke('plugin-store-install-counts', { forceRefresh }).then(counts => {
+                    if (!counts || !counts.ok || tabs[tabId] !== store || store.storePlugins !== plugins) return;
+                    plugins.forEach(plugin => {
+                        plugin.install_count = counts.counts[plugin.id] || 0;
+                        plugin.install_count_available = true;
+                    });
+                    if (activeStoreInstallCount === 0) renderStore();
+                }).catch(() => {});
             } catch (e) {
                 listEl.innerHTML = `<div class="plugin-store-status plugin-store-error"><i class="fas fa-exclamation-triangle"></i> ${t('plugin-store-error')}<br><small>${escapeHtml(e.message || String(e))}</small></div>`;
             }
@@ -8736,7 +8678,7 @@ function openInstallTab() {
         tabs[tabId] = { id: tabId, type: 'system', logUI: null }; 
         
         contentEl.innerHTML = `
-            <div class="tool-header"><div class="tool-title">${t('nav-install')}</div></div>
+            <div class="tool-header"><div class="tool-title"><i class="fas fa-puzzle-piece"></i> ${t('nav-install')}</div></div>
             <div id="plugin-install-zone">
                 <i class="fas fa-cloud-upload-alt" style="font-size: 50px; margin-bottom: 15px;"></i>
                 <div style="font-size: 18px; font-weight: bold;">${t('install-drop-hint')}</div>
@@ -9088,9 +9030,6 @@ let _ghCommunityMeta = null;
 let _ghPinnedDiscussionCache = { ts: 0, numbers: [] };
 const _ghCommunityFeedCache = new Map();
 const GH_COMMUNITY_FEED_CACHE_TTL = 45000;
-const GH_PUBLIC_PROXY_PREFIXES = [
-    // Add only proxies verified to return JSON for api.github.com.
-];
 
 function _escapeRegex(s) {
     return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -9114,7 +9053,9 @@ function _parsePinnedDiscussionNumbersFromHtml(html) {
     return Array.from(set);
 }
 
-function _fetchTextViaHttps(url) {
+function _fetchTextViaHttps(url, timeoutMs = 6500, redirects = 3) {
+    const started = Date.now();
+    let timer;
     return new Promise((resolve, reject) => {
         let https;
         try {
@@ -9130,10 +9071,13 @@ function _fetchTextViaHttps(url) {
                 'Accept': 'text/html,application/xhtml+xml'
             }
         }, (res) => {
+            res.on('error', reject);
             const code = Number(res.statusCode || 0);
             if (code >= 300 && code < 400 && res.headers && res.headers.location) {
                 res.resume();
-                _fetchTextViaHttps(res.headers.location).then(resolve).catch(reject);
+                if (!redirects) return reject(new Error('Too many redirects'));
+                _fetchTextViaHttps(new URL(res.headers.location, url).href,
+                    Math.max(1, timeoutMs - (Date.now() - started)), redirects - 1).then(resolve).catch(reject);
                 return;
             }
             if (code < 200 || code >= 300) {
@@ -9146,33 +9090,81 @@ function _fetchTextViaHttps(url) {
             res.on('data', chunk => body += chunk);
             res.on('end', () => resolve(body));
         });
+        timer = setTimeout(() => req.destroy(new Error('GitHub page request timed out')), timeoutMs);
         req.on('error', reject);
         req.end();
-    });
+    }).finally(() => clearTimeout(timer));
 }
 
 // Get stored OAuth token from localStorage, or null
+let _ghRestorePromise = null, _ghSyncPromise = null, _ghSyncToken = '', _ghSyncedToken = '', _ghAuthVersion = 0;
+function _ghNotifyAuth() {
+    Object.values(tabs).forEach(tab => {
+        try { Promise.resolve(tab.onGithubAuthChanged?.()).catch(() => {}); } catch (_) {}
+    });
+}
+async function _ghRestoreSharedSession() {
+    if (!_ghRestorePromise) _ghRestorePromise = (async () => {
+        const version = _ghAuthVersion;
+        try {
+            const session = await ipcRenderer.invoke('market-session');
+            if (version !== _ghAuthVersion) return;
+            if (session.token) _ghSetToken(session.token);
+            if (_ghGetToken()) await _ghSyncMarketSession();
+        } catch (_) {} // Preserve an existing community session during a network outage.
+    })();
+    return _ghRestorePromise;
+}
+async function _ghSyncMarketSession() {
+    const token = _ghGetToken();
+    if (!token || token === _ghSyncedToken) return;
+    if (_ghSyncPromise && _ghSyncToken === token) return _ghSyncPromise;
+    const version = _ghAuthVersion;
+    _ghSyncToken = token;
+    const pending = (async () => {
+        const result = await ipcRenderer.invoke('market-login', { token });
+        if (version !== _ghAuthVersion || token !== _ghGetToken()) return;
+        let account = result.user;
+        try { account = (await ipcRenderer.invoke('market-list')).user || account; } catch (_) {}
+        if (version !== _ghAuthVersion || token !== _ghGetToken()) return;
+        _ghSyncedToken = token;
+        _ghSetUser({ ..._ghGetUser(), ...account });
+    })();
+    _ghSyncPromise = pending;
+    try { await pending; } finally { if (_ghSyncPromise === pending) _ghSyncPromise = null; }
+}
 function _ghGetToken() {
     return localStorage.getItem('gh_oauth_token') || '';
 }
 function _ghSetToken(token) {
+    if (token !== _ghGetToken()) _ghAuthVersion++;
     localStorage.setItem('gh_oauth_token', token);
 }
 function _ghGetUser() {
     try { return JSON.parse(localStorage.getItem('gh_oauth_user') || 'null'); } catch(e) { return null; }
 }
 function _ghSetUser(user) {
-    localStorage.setItem('gh_oauth_user', user ? JSON.stringify(user) : '');
+    const value = user ? JSON.stringify(user) : '';
+    if (localStorage.getItem('gh_oauth_user') === value) return;
+    localStorage.setItem('gh_oauth_user', value);
+    _ghNotifyAuth();
 }
 function _ghClearAuth() {
+    _ghAuthVersion++; _ghSyncedToken = '';
     localStorage.removeItem('gh_oauth_token');
     localStorage.removeItem('gh_oauth_user');
+    return ipcRenderer.invoke('market-logout').catch(() => {}).finally(_ghNotifyAuth);
 }
+ipcRenderer.on('github-session-cleared', () => {
+    _ghAuthVersion++; _ghSyncedToken = '';
+    localStorage.removeItem('gh_oauth_token'); localStorage.removeItem('gh_oauth_user');
+    _ghNotifyAuth();
+});
 
-function _ghHeaders() {
+function _ghHeaders(publicRead = false) {
     const h = { 'Accept': 'application/vnd.github+json' };
     const token = _ghGetToken();
-    if (token) h['Authorization'] = `token ${token}`;
+    if (token && !publicRead) h['Authorization'] = `token ${token}`;
     return h;
 }
 
@@ -9247,27 +9239,8 @@ function _ghGetHeader(headers, name) {
     return '';
 }
 
-function _ghFetchMethod(options) {
-    return String((options && options.method) || 'GET').toUpperCase();
-}
-
-function _ghCanProxyFetch(url, options, mode) {
-    if (String(mode || '').toLowerCase() !== 'cn') return false;
-    if (_ghFetchMethod(options) !== 'GET') return false;
-    if (_ghGetHeader((options || {}).headers, 'Authorization')) return false;
-    try {
-        const parsed = new URL(url);
-        return parsed.protocol === 'https:' && parsed.hostname === 'api.github.com';
-    } catch (e) {
-        return false;
-    }
-}
-
 function _ghFetchCandidateUrls(url, options, mode) {
-    if (!_ghCanProxyFetch(url, options, mode)) return [url];
-    const out = GH_PUBLIC_PROXY_PREFIXES.map(prefix => `${prefix}${url}`);
-    out.push(url);
-    return Array.from(new Set(out));
+    return publicGithubCandidates(url, options, mode);
 }
 
 function _ghFetchOnce(url, options, timeoutMs, externalController) {
@@ -9277,23 +9250,22 @@ function _ghFetchOnce(url, options, timeoutMs, externalController) {
         .finally(() => clearTimeout(timer));
 }
 
-async function _ghFetchFastest(urls, options, timeoutMs) {
-    const controllers = [];
-    const attempts = (urls || []).map((url, index) => {
-        const ac = new AbortController();
-        controllers[index] = ac;
-        return _ghFetchOnce(url, options, timeoutMs, ac).then(resp => {
+async function _ghFetchFastest(urls, options, timeoutMs, mode, originalUrl) {
+    const expectsList = /\/(?:issues|discussions)(?:\/\d+\/comments)?$/.test(new URL(originalUrl).pathname);
+    return raceGithubReads(urls, async (url, controller) => {
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const resp = await _ghFetchOnce(url, { ...options, credentials: 'omit', redirect: 'error' }, timeoutMs, controller);
             if (!resp.ok) throw _ghHttpError(resp);
-            return { resp, index };
-        });
-    });
-    const winner = await Promise.any(attempts);
-    controllers.forEach((ac, index) => {
-        if (index !== winner.index) {
-            try { ac.abort(); } catch (e) {}
+            const value = await resp.clone().json();
+            if (!value || typeof value !== 'object' || (expectsList && !Array.isArray(value))) {
+                throw new Error('GitHub returned an invalid public response');
+            }
+            return resp;
+        } finally {
+            clearTimeout(timer);
         }
-    });
-    return winner.resp;
+    }, mode === 'cn' ? 0 : 600);
 }
 
 async function _ghFetch(url, options, cfg) {
@@ -9310,7 +9282,7 @@ async function _ghFetch(url, options, cfg) {
         try {
             const candidateUrls = _ghFetchCandidateUrls(url, options, mode);
             const resp = candidateUrls.length > 1
-                ? await _ghFetchFastest(candidateUrls, options, timeoutMs)
+                ? await _ghFetchFastest(candidateUrls, options, timeoutMs, mode, url)
                 : await _ghFetchOnce(url, options, timeoutMs);
             const canRetryHttp = allowRetry && i < retries && typeof retryOnHttp === 'function' && retryOnHttp(resp.status);
             if (canRetryHttp) {
@@ -9397,7 +9369,7 @@ async function _ghLoadPinnedDiscussionNumbers(forceRefresh) {
     const token = _ghGetToken();
     if (!token) return [];
     const now = Date.now();
-    if (!forceRefresh && _ghPinnedDiscussionCache.numbers.length && (now - _ghPinnedDiscussionCache.ts) < 60000) {
+    if (!forceRefresh && _ghPinnedDiscussionCache.ts && (now - _ghPinnedDiscussionCache.ts) < 60000) {
         return _ghPinnedDiscussionCache.numbers;
     }
     const q = `
@@ -9415,10 +9387,8 @@ async function _ghLoadPinnedDiscussionNumbers(forceRefresh) {
         const data = await _ghGraphQL(q, { owner: GITHUB_COMMUNITY.owner, repo: GITHUB_COMMUNITY.repo }, true);
         const nodes = (((data || {}).repository || {}).pinnedDiscussions || {}).nodes || [];
         const numbers = nodes.map(n => Number(n.number)).filter(n => Number.isFinite(n));
-        if (numbers.length > 0) {
-            _ghPinnedDiscussionCache = { ts: now, numbers };
-            return numbers;
-        }
+        _ghPinnedDiscussionCache = { ts: now, numbers };
+        return numbers;
     } catch (e) {
         // Ignore and continue with HTML fallback for public repos.
     }
@@ -9569,9 +9539,10 @@ async function ghDeviceLogin() {
                                 }, { retries: 2, timeoutMs: 5000 });
                                 if (userResp.ok) {
                                     const userData = await userResp.json();
-                                    _ghSetUser({ login: userData.login, avatar_url: userData.avatar_url, name: userData.name || userData.login });
+                                    _ghSetUser({ id: userData.id, login: userData.login, avatar_url: userData.avatar_url, name: userData.name || userData.login });
                                 }
                             } catch(e) {}
+                            await _ghSyncMarketSession().catch(() => {});
                             closeDlg(tokenData.access_token);
                             return;
                         }
@@ -9607,14 +9578,15 @@ async function ghDeviceLogin() {
 
 // Ensure user is logged in; returns token or null
 async function ghEnsureAuth() {
+    await _ghRestoreSharedSession();
     const token = _ghGetToken();
     if (token) {
         // Verify token is still valid
         try {
             const resp = await _ghFetch('https://api.github.com/user', { headers: { 'Authorization': `token ${token}`, 'Accept': 'application/vnd.github.v3+json' } }, { retries: 1, timeoutMs: 5000 });
-            if (resp.ok) return token;
+            if (resp.ok) { await _ghSyncMarketSession().catch(() => {}); return token; }
             // Token expired/revoked
-            _ghClearAuth();
+            await _ghClearAuth();
         } catch(e) {}
     }
     return await ghDeviceLogin();
@@ -9629,17 +9601,19 @@ function openCommunityTab(opts) {
         let currentCategoryId = 'all';
         let currentIssueState = 'all';
         let categoryList = [];
+        let categoryRequest = null;
+        let feedRequestId = 0;
         const zh = currentLang === 'zh';
         const isZh = () => currentLang === 'zh';
 
         contentEl.innerHTML = `
             <div class="tool-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
-                <div class="tool-title"><i class="fas fa-comments" style="color:#2196F3"></i> ${t('community-title')}</div>
+                <div class="tool-title"><i class="fas fa-comments"></i> ${t('community-title')}</div>
                 <div class="community-toolbar">
-                    <button class="community-refresh-btn" title="Refresh"><i class="fas fa-sync-alt"></i></button>
                     <div class="community-filters"></div>
                     <button class="community-new-btn"><i class="fas fa-plus"></i> ${zh?'发起讨论':'New'}</button>
                     <span class="community-user-status"></span>
+                    <button class="community-refresh-btn" title="Refresh"><i class="fas fa-sync-alt"></i></button>
                 </div>
             </div>
             <div class="community-panel">
@@ -9670,7 +9644,7 @@ function openCommunityTab(opts) {
                     </div>
                     <textarea class="community-form-body" rows="5" placeholder="${zh?'描述详情…支持 Markdown 格式':'Details… Supports Markdown'}"></textarea>
                     <div class="community-form-actions">
-                        <button class="community-open-native-btn" style="margin-right:auto;border:1px solid #90caf9;background:#e3f2fd;color:#1565c0;border-radius:8px;padding:8px 10px;cursor:pointer;">${zh?'使用 GitHub 原版编辑器':'Use GitHub Native Editor'}</button>
+                        <button class="community-open-native-btn" style="margin-right:auto;border:1px solid #a5d6a7;background:#e8f5e9;color:#388e3c;border-radius:8px;padding:8px 10px;cursor:pointer;">${zh?'使用 GitHub 原版编辑器':'Use GitHub Native Editor'}</button>
                         <button class="community-form-cancel">${zh?'取消':'Cancel'}</button>
                         <button class="community-form-submit"><i class="fas fa-paper-plane"></i> ${zh?'提交':'Submit'}</button>
                     </div>
@@ -10040,10 +10014,23 @@ function openCommunityTab(opts) {
                 renderCategorySelect();
                 return false;
             }
-            if (!_ghCommunityMeta) _ghCommunityMeta = await _ghLoadCommunityMeta();
+            if (!_ghCommunityMeta) {
+                if (!categoryRequest) categoryRequest = _ghLoadCommunityMeta().finally(() => { categoryRequest = null; });
+                await categoryRequest;
+            }
+            if (token !== _ghGetToken()) return false;
             categoryList = _ghCommunityMeta.categories || [];
             renderCategorySelect();
             return true;
+        }
+
+        function refreshDiscussionCategories() {
+            ensureDiscussionCategories().then(loaded => {
+                if (loaded && contentEl.isConnected) {
+                    renderCategoryFilters();
+                    syncFormMode();
+                }
+            }).catch(() => {}); // Optional metadata must not block public feed reads.
         }
 
         function renderCategoryFilters() {
@@ -10099,28 +10086,12 @@ function openCommunityTab(opts) {
             const user = _ghGetUser();
             const token = _ghGetToken();
             if (token && user) {
-                userStatusEl.innerHTML = `
-                    <img src="${user.avatar_url || ''}" style="width:20px;height:20px;border-radius:50%;vertical-align:middle;">
-                    <span style="font-size:12px;color:#333;font-weight:600;">${escapeHtml(user.login)}</span>
-                    <button class="community-logout-btn" title="${zh?'退出登录':'Sign out'}" style="background:none;border:none;color:#999;cursor:pointer;font-size:12px;padding:2px 4px;"><i class="fas fa-sign-out-alt"></i></button>
-                `;
-                const logoutBtn = userStatusEl.querySelector('.community-logout-btn');
-                if (logoutBtn) logoutBtn.onclick = async () => {
-                    _ghClearAuth();
-                    _ghCommunityMeta = null;
-                    _ghPinnedDiscussionCache = { ts: 0, numbers: [] };
-                    categoryList = [];
-                    currentSource = 'issue';
-                    currentCategoryId = 'all';
-                    renderCategorySelect();
-                    renderCategoryFilters();
-                    syncFormMode();
-                    updateUserStatus();
-                    await loadFeed(true);
-                };
+                userStatusEl.replaceChildren(createAccountMenu({ account: user, language: () => currentLang,
+                    logout: () => _ghClearAuth(),
+                    profile: () => ipcRenderer.invoke('market-open', { url: 'https://github.com/' + encodeURIComponent(user.login) }) }));
             } else {
                 userStatusEl.innerHTML = `
-                    <button class="community-login-btn" style="background:none;border:1px solid #ccc;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px;color:#555;display:flex;align-items:center;gap:4px;"><i class="fab fa-github"></i> ${zh?'登录':'Sign in'}</button>
+                    <button class="community-login-btn github-login-button"><i class="fab fa-github"></i> ${zh?'登录':'Sign in'}</button>
                 `;
                 const loginBtn = userStatusEl.querySelector('.community-login-btn');
                 if (loginBtn) loginBtn.onclick = async () => {
@@ -10138,6 +10109,19 @@ function openCommunityTab(opts) {
             }
         }
 
+        tabs[tabId].renderAccount = updateUserStatus;
+        let lastAuthToken = _ghGetToken();
+        tabs[tabId].onGithubAuthChanged = () => {
+            updateUserStatus();
+            const token = _ghGetToken();
+            if (lastAuthToken === token) return;
+            lastAuthToken = token;
+            _ghCommunityMeta = null; _ghPinnedDiscussionCache = { ts: 0, numbers: [] };
+            categoryList = []; currentSource = token ? 'discussion' : 'issue'; currentCategoryId = 'all';
+            renderCategorySelect(); renderCategoryFilters(); syncFormMode();
+            if (token) refreshDiscussionCategories();
+            return loadFeed(true);
+        };
         function getFeedCache(key, forceRefresh) {
             if (forceRefresh) return null;
             const item = _ghCommunityFeedCache.get(key);
@@ -10229,10 +10213,12 @@ function openCommunityTab(opts) {
         }
 
         async function loadIssueList(forceRefresh) {
+            const requestId = ++feedRequestId;
             listEl.style.display = '';
             detailEl.style.display = 'none';
             try {
                 const mode = await _ghGetNetworkMode();
+                if (requestId !== feedRequestId) return;
                 const policy = _ghNetworkPolicyByMode(mode);
                 const state = (currentIssueState === 'open' || currentIssueState === 'closed') ? currentIssueState : 'all';
                 const perPage = Math.min(Number(policy.perPage || GITHUB_COMMUNITY.perPage), Number(GITHUB_COMMUNITY.perPage || 20));
@@ -10245,13 +10231,15 @@ function openCommunityTab(opts) {
                 listEl.innerHTML = `<div class="community-status"><i class="fas fa-spinner fa-spin"></i> ${t('community-loading')}</div>`;
                 const bust = forceRefresh ? `&_t=${Date.now()}` : '';
                 const url = `https://api.github.com/repos/${GITHUB_COMMUNITY.owner}/${GITHUB_COMMUNITY.repo}/issues?state=${state}&sort=updated&direction=desc&per_page=${perPage}${bust}`;
-                const resp = await _ghFetch(url, { headers: _ghHeaders(), cache: forceRefresh ? 'no-store' : 'default' }, { retries: policy.retries, timeoutMs: policy.timeoutMs, backoffMs: policy.backoffMs });
+                const resp = await _ghFetch(url, { headers: _ghHeaders(true), cache: forceRefresh ? 'no-store' : 'default' }, { retries: policy.retries, timeoutMs: policy.timeoutMs, backoffMs: policy.backoffMs });
                 if (!resp.ok) throw _ghHttpError(resp);
                 let issues = await resp.json();
+                if (requestId !== feedRequestId) return;
                 issues = (issues || []).filter(it => !it.pull_request);
                 setFeedCache(cacheKey, issues);
                 renderIssueRows(issues);
             } catch(e) {
+                if (requestId !== feedRequestId) return;
                 listEl.innerHTML = `<div class="community-status community-error" style="cursor:pointer"><i class="fas fa-exclamation-triangle"></i> ${t('community-error')}<br><small>${e.message}</small></div>`;
                 const errEl = listEl.querySelector('.community-error');
                 if (errEl) errEl.onclick = () => loadIssueList(true);
@@ -10259,18 +10247,19 @@ function openCommunityTab(opts) {
         }
 
         async function loadDiscussionList(forceRefresh) {
+            const requestId = ++feedRequestId;
             listEl.style.display = '';
             detailEl.style.display = 'none';
             try {
                 const token = _ghGetToken();
                 const mode = await _ghGetNetworkMode();
+                if (requestId !== feedRequestId) return;
                 const policy = _ghNetworkPolicyByMode(mode);
                 if (!token) {
                     listEl.innerHTML = `<div class="community-status">${currentLang === 'zh' ? '请先登录后查看 Discussions。' : 'Please sign in to view Discussions.'}</div>`;
                     return;
                 }
-                await ensureDiscussionCategories();
-                renderCategoryFilters();
+                refreshDiscussionCategories();
 
                 const perPage = Math.min(Number(policy.perPage || GITHUB_COMMUNITY.perPage), Number(GITHUB_COMMUNITY.perPage || 20));
                 const cacheKey = `discussion:${currentCategoryId}:${perPage}`;
@@ -10287,10 +10276,12 @@ function openCommunityTab(opts) {
                     if (slug) apiUrl += `&category=${encodeURIComponent(slug)}`;
                 }
                 if (forceRefresh) apiUrl += `${apiUrl.includes('?') ? '&' : '?'}_t=${Date.now()}`;
-                const resp = await _ghFetch(apiUrl, { headers: _ghHeaders(), cache: forceRefresh ? 'no-store' : 'default' }, { retries: policy.retries, timeoutMs: policy.timeoutMs, backoffMs: policy.backoffMs });
+                const resp = await _ghFetch(apiUrl, { headers: _ghHeaders(true), cache: forceRefresh ? 'no-store' : 'default' }, { retries: policy.retries, timeoutMs: policy.timeoutMs, backoffMs: policy.backoffMs });
                 if (!resp.ok) throw _ghHttpError(resp);
                 let discussions = await resp.json();
-                const pinnedNumbers = new Set(await _ghLoadPinnedDiscussionNumbers(!!forceRefresh));
+                if (requestId !== feedRequestId || token !== _ghGetToken()) return;
+                const apiPinnedNumbers = new Set((discussions || []).filter(d => d.pinned || d.isPinned).map(d => Number(d.number)));
+                const pinnedNumbers = new Set(_ghPinnedDiscussionCache.numbers);
                 discussions = (discussions || []).map(d => ({
                     ...d,
                     pinned: !!(d && (d.pinned || d.isPinned || pinnedNumbers.has(Number(d.number))))
@@ -10319,7 +10310,17 @@ function openCommunityTab(opts) {
 
                 setFeedCache(cacheKey, discussions);
                 renderDiscussionRows(discussions);
+                _ghLoadPinnedDiscussionNumbers(!!forceRefresh).then(numbers => {
+                    if (requestId !== feedRequestId || token !== _ghGetToken()) return;
+                    const pinned = new Set(numbers);
+                    discussions = discussions.map(d => ({ ...d, pinned: pinned.has(Number(d.number)) || apiPinnedNumbers.has(Number(d.number)) }));
+                    discussions.sort((a, b) => discussionRankScore(b) - discussionRankScore(a)
+                        || new Date(b.updated_at || b.created_at) - new Date(a.updated_at || a.created_at));
+                    setFeedCache(cacheKey, discussions);
+                    if (contentEl.isConnected && listEl.style.display !== 'none') renderDiscussionRows(discussions);
+                }).catch(() => {});
             } catch(e) {
+                if (requestId !== feedRequestId) return;
                 handleScopeError(e.message);
                 listEl.innerHTML = `<div class="community-status community-error" style="cursor:pointer"><i class="fas fa-exclamation-triangle"></i> ${t('community-error')}<br><small>${e.message}</small></div>`;
                 const errEl = listEl.querySelector('.community-error');
@@ -10344,7 +10345,7 @@ function openCommunityTab(opts) {
             try {
                 let commentsHtml = '';
                 if ((issue.comments || 0) > 0) {
-                    const resp = await _ghFetch(issue.comments_url + `?_t=${Date.now()}`, { headers: _ghHeaders(), cache: 'no-store' }, { retries: 2, timeoutMs: 6500 });
+                    const resp = await _ghFetch(issue.comments_url + `?_t=${Date.now()}`, { headers: _ghHeaders(true), cache: 'no-store' }, { retries: 2, timeoutMs: 6500 });
                     if (resp.ok) {
                         const coms = await resp.json();
                         commentsHtml = coms.map(c => `
@@ -10562,10 +10563,10 @@ function openCommunityTab(opts) {
                         ? '当前无法读取该 Poll 的选项数据，可能与仓库权限或 API 字段兼容性有关。'
                         : 'Poll options are currently unavailable due to repository permissions or API field compatibility.');
                 const pollBlockHtml = isPollDiscussion ? `
-                    <div class="community-poll-block" style="margin:10px 0 14px;padding:12px;border:1px solid #dbe7ff;border-radius:10px;background:#f8fbff;">
+                    <div class="community-poll-block" style="margin:10px 0 14px;padding:12px;border:1px solid #a5d6a7;border-radius:10px;background:#e8f5e9;">
                         <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
-                            <i class="fas fa-square-poll-vertical" style="color:#1565c0;"></i>
-                            <strong style="color:#0d47a1;">${zh ? '投票' : 'Poll'}</strong>
+                            <i class="fas fa-square-poll-vertical" style="color:#388e3c;"></i>
+                            <strong style="color:#2e7d32;">${zh ? '投票' : 'Poll'}</strong>
                             <span style="margin-left:auto;color:#607d8b;font-size:12px;">${zh ? '总票数' : 'Total votes'}: ${pollVoteCount}</span>
                         </div>
                         ${pollQuestion ? `<div style="margin-bottom:8px;font-size:13px;color:#334;">${escapeHtml(pollQuestion)}</div>` : ''}
@@ -10583,7 +10584,7 @@ function openCommunityTab(opts) {
                                 }).join('')}
                             </div>
                             <div style="display:flex;align-items:center;gap:10px;margin-top:10px;">
-                                <button class="community-poll-vote-submit" style="border:1px solid #90caf9;background:#e3f2fd;color:#1565c0;border-radius:8px;padding:8px 10px;cursor:pointer;"><i class="fas fa-check-square"></i> ${zh ? '提交投票' : 'Submit Vote'}</button>
+                                <button class="community-poll-vote-submit" style="border:1px solid #a5d6a7;background:#e8f5e9;color:#388e3c;border-radius:8px;padding:8px 10px;cursor:pointer;"><i class="fas fa-check-square"></i> ${zh ? '提交投票' : 'Submit Vote'}</button>
                                 <span class="community-poll-vote-tip" style="font-size:12px;color:#607d8b;">${pollHasVoted ? (zh ? '你已投过至少一个选项，可继续补充其他选项。' : 'You have already voted for at least one option.') : (zh ? '可勾选一个或多个选项后提交。' : 'Select one or more options and submit.')}</span>
                             </div>
                         ` : `<div style="font-size:12px;color:#78909c;line-height:1.6;">${escapeHtml(pollUnavailableTip)}${pollFetchError ? `<br><span style="color:#90a4ae;">${escapeHtml(zh ? '技术详情: ' : 'Details: ')}${escapeHtml(pollFetchError)}</span>` : ''}</div>`}
@@ -10787,7 +10788,8 @@ function openCommunityTab(opts) {
 
         (async () => {
             try {
-                if (_ghGetToken()) await ensureDiscussionCategories();
+                await _ghRestoreSharedSession();
+                if (_ghGetToken()) refreshDiscussionCategories();
                 renderCategoryFilters();
                 syncFormMode();
                 updateUserStatus();
@@ -10809,7 +10811,7 @@ function renderMarkdown(md) {
             headerIds: false,
             mangle: false
         });
-        return marked.parse(md);
+        return require('./preview-sanitize').default.sanitize(marked.parse(md));
     } catch (e) {
         // fallback: escape and return
         const div = document.createElement('div');
@@ -10840,8 +10842,8 @@ function openRPackagesTab(opts) {
         const zh = currentLang === 'zh';
 
         // Gather R plugin info
-        const rPluginList = allPlugins.filter(p => p.type && String(p.type).toLowerCase().startsWith('r'));
-        const pluginInfoList = rPluginList.map(p => ({
+        let rPluginList = allPlugins.filter(p => p.type && String(p.type).toLowerCase().startsWith('r'));
+        let pluginInfoList = rPluginList.map(p => ({
             id: p.id,
             name: p.name,
             icon: p.icon || 'fa-cube',
@@ -10855,7 +10857,7 @@ function openRPackagesTab(opts) {
 
         contentEl.innerHTML = `
             <div class="tool-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
-                <div class="tool-title rpkg-title-el"><i class="fas fa-cubes" style="color:#2196F3"></i> ${t('r-packages-title')}</div>
+                <div class="tool-title rpkg-title-el"><i class="fas fa-cubes"></i> ${t('r-packages-title')}</div>
                 <button class="rpkg-refresh-btn" title="${t('r-pkg-refresh-btn')}"><i class="fas fa-sync-alt"></i> <span class="rpkg-refresh-label">${t('r-pkg-refresh-btn')}</span></button>
             </div>
             <div class="rpkg-panel">
@@ -10875,11 +10877,14 @@ function openRPackagesTab(opts) {
                             </select>
                         </div>
                         <div class="rpkg-install-input-wrap">
-                            <input type="text" class="rpkg-install-input" placeholder="${t('r-pkg-install-placeholder')}">
-                            <button class="rpkg-main-install-btn"><i class="fas fa-download"></i> ${t('r-pkg-install-btn')}</button>
+                            <input type="search" class="rpkg-install-input" autocomplete="off" aria-label="${zh ? '检索 R 包名称' : 'Search R package names'}" placeholder="${t('r-pkg-install-placeholder')}">
+                            <button class="rpkg-search-btn" type="button"><i class="fas fa-search"></i> <span>${zh ? '搜索' : 'Search'}</span></button>
+                            <button class="rpkg-main-install-btn" disabled><i class="fas fa-download"></i> ${zh ? '安装所选' : 'Install Selected'} (0)</button>
                         </div>
                     </div>
-                    <div class="rpkg-install-log" id="rpkg-install-log-${tabId}" style="display:none">
+                    <div class="rpkg-selected-packages"></div>
+                    <div class="rpkg-package-search-results" aria-live="polite"></div>
+                    <div class="rpkg-install-log" data-auto-close-log="true" id="rpkg-install-log-${tabId}" style="display:none">
                         <div class="rpkg-log-header">
                             <span><i class="fas fa-terminal"></i> <span class="rpkg-log-title-el">${t('r-pkg-install-log')}</span></span>
                             <button class="rpkg-log-close"><i class="fas fa-times"></i></button>
@@ -10922,13 +10927,110 @@ function openRPackagesTab(opts) {
         let builtinSet = new Set();
         let _installing = false;
 
+        const searchBtn = contentEl.querySelector('.rpkg-search-btn');
+        const searchResults = contentEl.querySelector('.rpkg-package-search-results');
+        const selectedWrap = contentEl.querySelector('.rpkg-selected-packages');
+        const selectedPackages = new Map();
+        let candidatePackages = [], searchState = 'idle', searchMessage = '';
+        let searchSequence = 0, searchTimer = null, searchController = null;
+
+        function renderPackageSearch() {
+            const zh = currentLang === 'zh';
+            const installed = new Set([...installedSet].map(name => name.toLowerCase()));
+            for (const name of selectedPackages.keys()) {
+                if (installed.has(name)) selectedPackages.delete(name);
+            }
+            installBtn.disabled = _installing || selectedPackages.size === 0;
+            installBtn.innerHTML = `<i class="fas fa-download"></i> ${zh ? '安装所选' : 'Install Selected'} (${selectedPackages.size})`;
+            searchBtn.querySelector('span').textContent = zh ? '搜索' : 'Search';
+            installInput.setAttribute('aria-label', zh ? '检索 R 包名称' : 'Search R package names');
+            selectedWrap.innerHTML = [...selectedPackages.values()].map(name =>
+                `<button type="button" class="rpkg-selected-chip" data-package="${escapeHtml(name)}" ${_installing ? 'disabled' : ''} aria-label="${zh ? '取消选择' : 'Deselect'} ${escapeHtml(name)}">${escapeHtml(name)} ×</button>`).join('');
+            let status = zh ? '输入包名检索，勾选后安装。可跨次搜索选择多个包。' : 'Search by package name, then select and install. Selections are kept across searches.';
+            if (searchState === 'loading') status = zh ? '正在检索，请稍候…' : 'Searching…';
+            if (searchState === 'error') status = zh ? '在线检索失败，请检查网络或切换镜像源后重试。' : (searchMessage || 'Search failed. Check the network or change the mirror and retry.');
+            if (searchState === 'done') status = candidatePackages.length
+                ? `${zh ? '找到' : 'Found'} ${candidatePackages.length} ${zh ? '个匹配包' : 'matching packages'}`
+                : (zh ? '没有找到匹配的包，请尝试更完整的包名。' : 'No matching packages. Try a more complete package name.');
+            if (searchState === 'done' && candidatePackages.length) status += zh ? '。仅展示部分在线候选，安装时使用所选镜像中适用的版本。' : '. Showing a selection of online matches; installation uses an applicable version from the selected mirror.';
+            searchResults.innerHTML = `<div class="rpkg-search-message ${searchState === 'error' ? 'is-error' : ''}" role="status">${escapeHtml(status)}</div>`;
+            if (searchState === 'done') {
+                const rows = candidatePackages.map(item => {
+                    const name = item.package, isInstalled = installed.has(name.toLowerCase());
+                    return `<label class="rpkg-package-result">
+                        <input type="checkbox" data-package="${escapeHtml(name)}" ${selectedPackages.has(name.toLowerCase()) ? 'checked' : ''} ${isInstalled || _installing ? 'disabled' : ''}>
+                        <span class="rpkg-package-name">${escapeHtml(name)}<small>${escapeHtml(item.title || '')}</small></span>
+                        <span class="rpkg-package-source">${escapeHtml(item.source)}</span>
+                        <span class="rpkg-package-state">${isInstalled ? (zh ? '已安装' : 'Installed') : (zh ? '未安装' : 'Not installed')}</span>
+                    </label>`;
+                }).join('');
+                searchResults.insertAdjacentHTML('beforeend', `<div class="rpkg-package-result-list">${rows}</div>`);
+            }
+        }
+
+        async function searchPackages() {
+            clearTimeout(searchTimer);
+            if (searchController) searchController.abort();
+            const sequence = ++searchSequence, query = installInput.value.trim();
+            candidatePackages = [];
+            if (query.length < 2) { searchState = 'idle'; renderPackageSearch(); return; }
+            searchState = 'loading'; renderPackageSearch();
+            const controller = new AbortController();
+            searchController = controller;
+            const timeout = setTimeout(() => controller.abort(), 20000);
+            try {
+                const params = new URLSearchParams({q: query});
+                const response = await fetch(API_BASE + '/r/search-packages?' + params, {signal: controller.signal});
+                const data = await response.json();
+                if (sequence !== searchSequence || !contentEl.isConnected) return;
+                if (data.status !== 'success') throw new Error(data.message || 'Search failed');
+                candidatePackages = data.packages || [];
+                searchState = 'done';
+            } catch (error) {
+                if (sequence !== searchSequence || !contentEl.isConnected) return;
+                searchState = 'error';
+                searchMessage = error.name === 'AbortError' ? (currentLang === 'zh' ? '请求超时' : 'Request timed out') : error.message;
+            } finally {
+                clearTimeout(timeout);
+                if (sequence === searchSequence && contentEl.isConnected) renderPackageSearch();
+            }
+        }
+
+        installInput.oninput = (event) => {
+            if (event.isComposing) return;
+            clearTimeout(searchTimer); ++searchSequence;
+            if (searchController) searchController.abort();
+            candidatePackages = []; searchState = 'idle'; renderPackageSearch();
+            if (installInput.value.trim().length >= 2) searchTimer = setTimeout(() => searchPackages(), 300);
+        };
+        installInput.oncompositionend = () => installInput.oninput({isComposing: false});
+        searchBtn.onclick = () => searchPackages();
+        installInput.onkeydown = event => {
+            if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); searchPackages(); }
+        };
+        searchResults.onchange = event => {
+            const input = event.target.closest('input[data-package]');
+            if (!input || _installing) return;
+            const key = input.dataset.package.toLowerCase();
+            if (input.checked) selectedPackages.set(key, input.dataset.package);
+            else selectedPackages.delete(key);
+            renderPackageSearch();
+        };
+        selectedWrap.onclick = event => {
+            const chip = event.target.closest('[data-package]');
+            if (chip && !_installing) { selectedPackages.delete(chip.dataset.package.toLowerCase()); renderPackageSearch(); }
+        };
+        contentEl._refreshRPackageSearch = renderPackageSearch;
+        renderPackageSearch();
+
         // Load mirror
-        fetch(API_BASE + '/r/check-runtime').then(r=>r.json()).then(d => {
+        fetch(API_BASE + '/r/repo', {signal: AbortSignal.timeout(5000)}).then(r=>r.json()).then(d => {
             if (d.repo_mode) mirrorSelect.value = d.repo_mode;
             else if (d.repos) mirrorSelect.value = d.repos;
         }).catch(()=>{});
-        mirrorSelect.onchange = () => {
-            fetch(API_BASE + '/r/set-repo', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo: mirrorSelect.value}) });
+        mirrorSelect.onchange = async () => {
+            const result = await post('/r/set-repo', {repo: mirrorSelect.value}, 10000);
+            if (result.status === 'success') notifyStatusChanged('r-runtime');
         };
 
         function renderTable() {
@@ -11097,6 +11199,8 @@ function openRPackagesTab(opts) {
                     btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
                     logPanel.style.display = 'block';
                     logContent.innerHTML = '';
+                    delete logContent.dataset.logRunId;
+                    logContent._lastLogSeq = 0;
                     scheduleWebContentsFocusRestore('r-package-tab-missing-start');
                     fetch(API_BASE + '/r/install-packages', {
                         method: 'POST',
@@ -11107,13 +11211,15 @@ function openRPackagesTab(opts) {
                             scheduleWebContentsFocusRestore('r-package-tab-missing-job-created');
                             pollInstallJob(d.job_id, d.run_id);
                         } else {
-                            logContent.innerHTML += `<div style="color:#e53935">${escapeHtml(d.message || 'Error')}</div>`;
+                            logContent.insertAdjacentHTML('beforeend', `<div style="color:#e53935">${escapeHtml(d.message || 'Error')}</div>`);
+                            finishAutoCloseInstallLog(logPanel, {...d, state:'failed'}, logContent);
                             _installing = false;
                             btn.classList.remove('rpkg-btn-busy');
                             scheduleWebContentsFocusRestore('r-package-tab-missing-error');
                         }
                     }).catch(err => {
-                        logContent.innerHTML += `<div style="color:#e53935">${escapeHtml(err.message)}</div>`;
+                        logContent.insertAdjacentHTML('beforeend', `<div style="color:#e53935">${escapeHtml(err.message)}</div>`);
+                        finishAutoCloseInstallLog(logPanel, {state:'failed', message:err.message}, logContent);
                         _installing = false;
                         btn.classList.remove('rpkg-btn-busy');
                         scheduleWebContentsFocusRestore('r-package-tab-missing-exception');
@@ -11150,6 +11256,7 @@ function openRPackagesTab(opts) {
                         body: JSON.stringify({packages: otherPkgs})
                     }).then(r => r.json()).then(d => {
                         if (d.deleted) d.deleted.forEach(pk => installedSet.delete(typeof pk === 'string' ? pk : pk.package || pk));
+                        notifyStatusChanged('r-packages');
                         scheduleWebContentsFocusRestore('r-package-tab-delete-all-finished');
                         renderTable();
                     }).catch(() => {
@@ -11201,6 +11308,7 @@ function openRPackagesTab(opts) {
                     const d = await res.json();
                     if (d.deleted && d.deleted.length > 0) {
                         installedSet.delete(pkgName);
+                        notifyStatusChanged('r-packages');
                         scheduleWebContentsFocusRestore('r-package-delete-success');
                         renderTable();
                     } else {
@@ -11219,12 +11327,24 @@ function openRPackagesTab(opts) {
             setTimeout(() => document.addEventListener('click', closeMenu), 0);
         }
 
+        let packageLoadSequence = 0;
+        let packageRenderKey = '';
         async function loadPackages() {
+            const sequence = ++packageLoadSequence;
+            if (!tableWrap.querySelector('table')) {
             tableWrap.innerHTML = `<div class="rpkg-status"><i class="fas fa-spinner fa-spin"></i> ${t('r-pkg-loading')}</div>`;
             otherWrap.innerHTML = `<div class="rpkg-status"><i class="fas fa-spinner fa-spin"></i> ${t('r-pkg-loading')}</div>`;
+            }
             try {
-                const resp = await fetch(API_BASE + '/r/list-packages', { signal: AbortSignal.timeout(15000) });
-                const data = await resp.json();
+                const data = await fetchRPackages();
+                if (!contentEl.isConnected || sequence !== packageLoadSequence) return;
+                const renderKey = JSON.stringify([data.packages, allPlugins.map(p => [p.id, p.name, p.packages, p.type]), currentLang]);
+                if (renderKey === packageRenderKey && tableWrap.querySelector('table')) return;
+                packageRenderKey = renderKey;
+                rPluginList = allPlugins.filter(p => String(p.type || '').toLowerCase().startsWith('r'));
+                pluginInfoList = rPluginList.map(p => ({id:p.id, name:p.name, icon:p.icon || 'fa-cube', icon_color:p.icon_color || '#e91e63', packages:p.packages || [], source:p}));
+                allPluginPkgs.clear();
+                pluginInfoList.forEach(p => p.packages.forEach(pkg => allPluginPkgs.add(pkg)));
                 if (data.status === 'success') {
                     installedSet = new Set((data.packages || []).map(p => p.package));
                     builtinSet = new Set((data.packages || []).filter(p => p.builtin).map(p => p.package));
@@ -11233,25 +11353,45 @@ function openRPackagesTab(opts) {
                     tableWrap.innerHTML = `<div class="rpkg-status" style="color:#e53935"><i class="fas fa-exclamation-triangle"></i> ${escapeHtml(data.message || 'Error')}</div>`;
                 }
             } catch(err) {
+                if (!contentEl.isConnected || sequence !== packageLoadSequence) return;
                 tableWrap.innerHTML = `<div class="rpkg-status" style="color:#e53935"><i class="fas fa-exclamation-triangle"></i> ${escapeHtml(err.message)}</div>`;
+            } finally {
+                if (contentEl.isConnected && sequence === packageLoadSequence) renderPackageSearch();
             }
         }
 
-        refreshBtn.onclick = () => loadPackages();
+        refreshBtn.onclick = async () => {
+            refreshBtn.disabled = true;
+            try {
+                await readStatusJson('/r/list-packages?refresh=1', 15000);
+                notifyStatusChanged('r-packages');
+            } catch (error) { _showToast(String(error.message || error), 'error'); }
+            finally { refreshBtn.disabled = false; }
+        };
+        viewStatus.bind(contentEl, ['r-packages', 'plugins', 'r-runtime'], async () => {
+            await Promise.allSettled([loadPackages(), fetchRRuntimeStatus().then(data => {
+                if (contentEl.isConnected && (data.repo_mode || data.repos)) mirrorSelect.value = data.repo_mode || data.repos;
+            })]);
+        }, () => {
+            clearTimeout(searchTimer);
+            if (searchController) searchController.abort();
+            window.removeEventListener('resize', contentEl._rpkgResizeHandler);
+            window.removeEventListener('app-tab-switched', contentEl._rpkgTabSwitchHandler);
+        });
         pluginSearchInput.oninput = renderTable;
 
-        // Install packages from input
-        installBtn.setAttribute('tabindex', '-1');
+        // Install only explicitly selected search results.
         function startInstall() {
-            const raw = installInput.value.trim();
-            if (!raw || _installing) return;
-            const pkgs = raw.split(',').map(s => s.trim()).filter(Boolean);
+            if (_installing) return;
+            const pkgs = [...selectedPackages.values()];
             if (pkgs.length === 0) return;
             _installing = true;
-            installInput.value = '';
+            renderPackageSearch();
             installBtn.classList.add('rpkg-btn-busy');
             logPanel.style.display = 'block';
             logContent.innerHTML = '';
+            delete logContent.dataset.logRunId;
+            logContent._lastLogSeq = 0;
             scheduleWebContentsFocusRestore('r-package-tab-start');
 
             fetch(API_BASE + '/r/install-packages', {
@@ -11263,21 +11403,24 @@ function openRPackagesTab(opts) {
                     scheduleWebContentsFocusRestore('r-package-tab-job-created');
                     pollInstallJob(d.job_id, d.run_id);
                 } else {
-                    logContent.innerHTML += `<div style="color:#e53935">${escapeHtml(d.message || 'Error')}</div>`;
+                    logContent.insertAdjacentHTML('beforeend', `<div style="color:#e53935">${escapeHtml(d.message || 'Error')}</div>`);
+                    finishAutoCloseInstallLog(logPanel, {...d, state:'failed'}, logContent);
                     _installing = false;
                     installBtn.classList.remove('rpkg-btn-busy');
+                    renderPackageSearch();
                     scheduleWebContentsFocusRestore('r-package-tab-error');
                 }
             }).catch(err => {
-                logContent.innerHTML += `<div style="color:#e53935">${escapeHtml(err.message)}</div>`;
+                logContent.insertAdjacentHTML('beforeend', `<div style="color:#e53935">${escapeHtml(err.message)}</div>`);
+                finishAutoCloseInstallLog(logPanel, {state:'failed', message:err.message}, logContent);
                 _installing = false;
                 installBtn.classList.remove('rpkg-btn-busy');
+                renderPackageSearch();
                 scheduleWebContentsFocusRestore('r-package-tab-exception');
             });
         }
 
         installBtn.onclick = startInstall;
-        installInput.onkeydown = (e) => { if (e.key === 'Enter') startInstall(); };
 
         function pollInstallJob(jobId, sseRunId) {
             if (sseRunId) {
@@ -11286,42 +11429,31 @@ function openRPackagesTab(opts) {
                     try {
                         const d = JSON.parse(ev.data);
                         if (d.type === 'log' && d.line) {
-                            const cls = d.line.includes('ERROR') || d.line.includes('ERR:') ? 'color:#e53935' : d.line.includes('VERIFY_OK') ? 'color:#2e7d32;font-weight:bold' : '';
-                            logContent.innerHTML += `<div style="${cls}">${escapeHtml(d.line)}</div>`;
-                            if (logContent.children.length > 500) logContent.removeChild(logContent.firstChild);
-                            logContent.scrollTop = logContent.scrollHeight;
+                            appendArchivedInstallEvent(logContent, d, 500);
                         }
                     } catch(e){}
                 };
-                const statusTimer = setInterval(async () => {
+                const statusTimer = setNonOverlappingInterval(async () => {
                     try {
-                        const resp = await fetch(auxApiUrl(`/r/install-status?job_id=${encodeURIComponent(jobId)}`), { cache: 'no-store' });
-                        const d = await resp.json();
-                        if (d.log && d.log.length > 0) {
-                            logContent.innerHTML = d.log.map(l => {
-                                const cls = l.includes('ERROR') || l.includes('ERR:') || l.includes('VERIFY_FAIL') ? 'color:#e53935' : l.includes('VERIFY_OK') || l.includes('SUCCESS:') ? 'color:#2e7d32;font-weight:bold' : '';
-                                return `<div style="${cls}">${escapeHtml(l)}</div>`;
-                            }).join('');
-                            logContent.scrollTop = logContent.scrollHeight;
-                        }
+                        const d = await readInstallStatus(jobId, logContent);
                         if (d.state === 'done' || d.state === 'failed') {
                             clearInterval(statusTimer);
                             es.close();
                             _installing = false;
                             installBtn.classList.remove('rpkg-btn-busy');
                             scheduleWebContentsFocusRestore('r-package-tab-finished');
-                            loadPackages();
-                            setTimeout(() => { if (logPanel) logPanel.style.display = 'none'; }, 3000);
+                            packageRenderKey = '';
+                            notifyStatusChanged('r-packages');
+                            finishAutoCloseInstallLog(logPanel, {...d, run_id:d.run_id || sseRunId}, logContent);
                         }
                     } catch(err) {
-                        clearInterval(statusTimer);
-                        es.close();
+                        console.warn('Install log reconnect pending:', err);
                     }
-                }, 900);
+                }, 900, contentEl, () => es.close());
             } else {
-                const timer = setInterval(async () => {
+                const timer = setNonOverlappingInterval(async () => {
                     try {
-                        const resp = await fetch(auxApiUrl(`/r/install-status?job_id=${encodeURIComponent(jobId)}`), { cache: 'no-store' });
+                        const resp = await fetch(auxApiUrl(`/r/install-status?job_id=${encodeURIComponent(jobId)}`), { cache: 'no-store', signal: AbortSignal.timeout(10000) });
                         const d = await resp.json();
                         if (d.log && d.log.length > 0) {
                             logContent.innerHTML = d.log.map(l => {
@@ -11335,17 +11467,20 @@ function openRPackagesTab(opts) {
                             _installing = false;
                             installBtn.classList.remove('rpkg-btn-busy');
                             scheduleWebContentsFocusRestore('r-package-tab-finished');
-                            loadPackages();
-                            setTimeout(() => { if (logPanel) logPanel.style.display = 'none'; }, 3000);
+                            packageRenderKey = '';
+                            notifyStatusChanged('r-packages');
+                            finishAutoCloseInstallLog(logPanel, d, logContent);
                         }
                     } catch(err) {
                         clearInterval(timer);
                         _installing = false;
                         installBtn.classList.remove('rpkg-btn-busy');
-                        logContent.innerHTML += `<div style="color:#e53935">${escapeHtml(err.message)}</div>`;
+                        renderPackageSearch();
+                        logContent.insertAdjacentHTML('beforeend', `<div style="color:#e53935">${escapeHtml(err.message)}</div>`);
+                        finishAutoCloseInstallLog(logPanel, {state:'failed', message:err.message}, logContent);
                         scheduleWebContentsFocusRestore('r-package-tab-poll-exception');
                     }
-                }, 900);
+                }, 900, contentEl);
             }
         }
 
@@ -11363,7 +11498,7 @@ function openDockerImagesTab(opts) {
     createTabFrame(tabId, t('nav-docker'), (contentEl) => {
         tabs[tabId] = { id: tabId, type: 'docker-images' };
         contentEl.innerHTML = `
-            <div class="tool-header"><div class="tool-title"><i class="fas fa-cube" style="color:#1976d2"></i> ${t('docker-title')}</div></div>
+            <div class="tool-header"><div class="tool-title"><i class="fas fa-cube"></i> ${t('docker-title')}</div></div>
             <div class="docker-panel">
                 <div class="docker-info-bar" id="docker-info-bar"></div>
                 <div class="docker-section docker-containers-section">
@@ -11445,7 +11580,6 @@ function openDockerImagesTab(opts) {
         contentEl.__dockerReflowBadges = reflowDockerBadges;
 
         let _cachedDockerInfo = null;
-        const DOCKER_DEFAULT_CONFIG = '[containers]\n\n[engine]\n\n[machine]\n';
         const _dockerPanelRequestCache = new Map();
 
         function _dockerTimeoutSignal(timeoutMs) {
@@ -11479,11 +11613,15 @@ function openDockerImagesTab(opts) {
             const promise = fetch(url, opts)
                 .then(resp => resp.json())
                 .then(data => {
-                    _dockerPanelRequestCache.set(cacheKey, { data, time: Date.now() });
+                    if (_dockerPanelRequestCache.get(cacheKey)?.promise === promise) {
+                        _dockerPanelRequestCache.set(cacheKey, { data, time: Date.now() });
+                    }
                     return data;
                 })
                 .catch(err => {
-                    _dockerPanelRequestCache.delete(cacheKey);
+                    if (_dockerPanelRequestCache.get(cacheKey)?.promise === promise) {
+                        _dockerPanelRequestCache.delete(cacheKey);
+                    }
                     throw err;
                 });
             _dockerPanelRequestCache.set(cacheKey, { promise, time: now });
@@ -11509,9 +11647,9 @@ function openDockerImagesTab(opts) {
             dlg.style.cssText = `border:none;border-radius:12px;padding:0;background:#fff;box-shadow:0 8px 32px rgba(0,0,0,0.3);z-index:200000;min-width:${minWidth};max-width:${maxWidth};overflow:hidden;`;
             dlg.innerHTML = `
                 <div style="padding:16px 20px 10px;font-size:16px;font-weight:700;color:#333;border-bottom:1px solid #eee;display:flex;align-items:center;gap:8px;">
-                    <i class="${iconClass}" style="color:#1976d2"></i>
+                    <i class="${iconClass}" style="color:#e65100"></i>
                     ${title}
-                    <button class="dlg-close-x" title="Close" style="margin-left:auto;width:34px;height:34px;border:none;border-radius:8px;background:#ef5350;color:#fff;cursor:pointer;font-size:18px;line-height:1;display:flex;align-items:center;justify-content:center;">x</button>
+                    <button class="dlg-close-x" title="Close" style="margin-left:auto;width:34px;height:34px;border:none;border-radius:8px;cursor:pointer;font-size:18px;line-height:1;display:flex;align-items:center;justify-content:center;">x</button>
                 </div>
                 <div style="padding:22px 20px;color:#607d8b;font-size:14px;display:flex;align-items:center;gap:10px;">
                     <i class="fas fa-spinner fa-spin"></i>
@@ -11543,22 +11681,12 @@ function openDockerImagesTab(opts) {
             const infoValue = infoBar.querySelector('.docker-machine-card .info-value');
             if (infoValue) {
                 const d = _cachedDockerInfo;
-                const parts = [];
-                if (d.wsl2Enabled) parts.push('WSL2 ✓');
-                else parts.push('WSL2 ✗');
-                if (d.machineRunning) parts.push(zh ? '运行中' : 'Running');
-                else if (d.machineExists) parts.push(zh ? '已停止' : 'Stopped');
-                else parts.push(zh ? '未创建' : 'Not Created');
-                infoValue.textContent = parts.join(' | ');
+                infoValue.textContent = runtimeStateLabel(d.runtime);
             }
             const machineLabel = infoBar.querySelector('.docker-machine-label');
-            if (machineLabel) machineLabel.textContent = zh ? 'Machine 状态' : 'Machine Status';
+            if (machineLabel) machineLabel.textContent = zh ? '运行环境' : 'Runtime';
             const machineCard = infoBar.querySelector('.docker-machine-card');
-            if (machineCard) machineCard.title = zh ? 'Podman Machine 状态' : 'Podman Machine Status';
-            const configValue = infoBar.querySelector('.docker-config-value');
-            if (configValue) configValue.textContent = zh ? '引擎配置' : 'Engine Config';
-            const configCard = infoBar.querySelector('.docker-config-card');
-            if (configCard) configCard.title = zh ? '点击编辑 Podman Engine 配置' : 'Click to edit Podman Engine config';
+            if (machineCard) machineCard.title = zh ? '运行环境' : 'Runtime';
             const storageLabel = infoBar.querySelector('.docker-storage-card .info-label');
             if (storageLabel) storageLabel.textContent = zh ? '镜像安装' : 'Image Installation';
             const storageValue = infoBar.querySelector('.docker-storage-card .info-value');
@@ -11611,7 +11739,7 @@ function openDockerImagesTab(opts) {
         async function openImageInstallationDialog(storagePath) {
             const zh = currentLang === 'zh';
             const dlg = document.createElement('dialog');
-            dlg.className = 'image-install-dialog';
+            dlg.className = 'image-install-dialog image-storage-dialog';
             dlg.innerHTML = `
                 <div class="image-install-header">
                     <div><i class="fas fa-box-open"></i> ${zh ? '镜像安装' : 'Image Installation'}</div>
@@ -11626,7 +11754,7 @@ function openDockerImagesTab(opts) {
                     </section>
                     <section class="image-install-section">
                         <div class="image-install-section-title"><i class="fas fa-file-import"></i> ${zh ? '从本地安装镜像' : 'Install from Local Archive'}</div>
-                        <div class="image-install-help">${zh ? '选择由 Podman 或 Docker 导出的 .tar 镜像包。' : 'Select a .tar image archive exported by Podman or Docker.'}</div>
+                        <div class="image-install-help">${zh ? '选择兼容的容器引擎导出的 .tar 镜像包。' : 'Select a .tar image archive exported by a compatible container engine.'}</div>
                         <button class="image-install-action image-load-btn"><i class="fas fa-folder-open"></i> ${zh ? '选择 tar 并安装' : 'Choose tar and Install'}</button>
                     </section>
                     <section class="image-install-section">
@@ -11699,10 +11827,10 @@ function openDockerImagesTab(opts) {
                 const newPath = picked.filePaths[0];
                 if (newPath === storagePath) return;
                 const confirmed = window.confirm(zh
-                    ? `确认将全部 Podman 镜像和 Machine 数据迁移到：\n${newPath}\n\n迁移期间容器将暂时停止。`
-                    : `Move all Podman images and Machine data to:\n${newPath}\n\nContainers will be temporarily stopped during migration?`);
+                    ? `确认将全部镜像和运行环境数据迁移到：\n${newPath}\n\n迁移期间容器将暂时停止。`
+                    : `Move all images and runtime data to:\n${newPath}\n\nContainers will be temporarily stopped during migration?`);
                 if (!confirmed) return;
-                setBusy(true, zh ? '正在迁移并验证 Podman Machine，请勿关闭程序…' : 'Migrating and validating Podman Machine. Keep the app open…');
+                setBusy(true, zh ? '正在迁移并验证 运行环境，请勿关闭程序…' : 'Migrating and validating Runtime. Keep the app open…');
                 const result = await post('/podman/machine/relocate', { path: newPath }, 0);
                 if (result.status !== 'success') {
                     setBusy(false, (zh ? '迁移失败：' : 'Migration failed: ') + (result.message || ''), true);
@@ -11713,13 +11841,13 @@ function openDockerImagesTab(opts) {
                 _lastDockerInfoData = null;
                 _lastDockerInfoTime = 0;
                 invalidateDockerPanelCache('podman-info', 'wsl-status');
-                setBusy(false, zh ? '迁移完成，Podman 已恢复运行。' : 'Migration complete. Podman is running.');
+                setBusy(false, zh ? '迁移完成，运行环境 已恢复运行。' : 'Migration complete. Runtime is running.');
                 loadDockerInfo();
             };
 
             loadBtn.onclick = async () => {
                 const picked = await ipcRenderer.invoke('open-file-dialog', {
-                    title: zh ? '选择 Podman/Docker 镜像 tar 文件' : 'Choose a Podman/Docker image tar file',
+                    title: zh ? '选择 容器镜像 tar 文件' : 'Choose a container image tar file',
                     buttonLabel: zh ? '安装镜像' : 'Install Image',
                     properties: ['openFile'],
                     filters: [{ name: zh ? '镜像归档' : 'Image Archives', extensions: ['tar'] }]
@@ -11774,7 +11902,7 @@ function openDockerImagesTab(opts) {
                 ]);
                 if (infoResult.status === 'fulfilled') data = infoResult.value;
                 if (msResult.status === 'fulfilled') msData = msResult.value;
-                if (!data && !msData) throw new Error('Podman status unavailable');
+                if (!data && !msData) throw new Error('Runtime status unavailable');
             } catch(e) {
                 console.warn('loadDockerInfo failed:', e);
                 const infoBar = document.getElementById('docker-info-bar');
@@ -11791,40 +11919,18 @@ function openDockerImagesTab(opts) {
                 const isPodmanLoading = !!(data.loading || msData.setup_running);
                 const memGB = data.total_memory ? (data.total_memory / 1e9).toFixed(1) : '—';
                 const storagePath = data.disk_image_location || data.docker_root_dir || msData.data_dir || '—';
-                let machineStatus = '—';
-                let wsl2Enabled = false;
-                let machineRunning = false;
-                let machineExists = false;
-                if (msData.status === 'success') {
-                    wsl2Enabled = !!msData.wsl2_feature_enabled;
-                    machineRunning = !!msData.machine_running;
-                    machineExists = !!msData.machine_exists;
-                    const parts = [];
-                    if (wsl2Enabled) parts.push('WSL2 ✓');
-                    else parts.push('WSL2 ✗');
-                    if (isPodmanLoading && !machineRunning) parts.push(currentLang==='zh'?'部署中':'Deploying');
-                    else if (machineRunning) parts.push(currentLang==='zh'?'运行中':'Running');
-                    else if (machineExists) parts.push(currentLang==='zh'?'已停止':'Stopped');
-                    else parts.push(currentLang==='zh'?'未创建':'Not Created');
-                    machineStatus = parts.join(' | ');
-                } else if (data.status === 'success') {
-                    machineRunning = !!data.machine_running;
-                    machineExists = !!data.machine_exists;
-                    machineStatus = isPodmanLoading && !machineRunning
-                        ? (currentLang==='zh'?'部署中':'Deploying')
-                        : (machineRunning ? (currentLang==='zh'?'运行中':'Running') : '—');
-                }
-                _cachedDockerInfo = { wsl2Enabled, machineRunning, machineExists, storagePath };
+                const runtime = desktopRuntimeState || msData.runtime || data.runtime || { state: 'attention', engine_ready: false };
+                const machineStatus = runtimeStateLabel(runtime);
+                const wsl2Enabled = !!msData.wsl2_feature_enabled;
+                const machineRunning = runtime.engine_ready === true;
+                const machineExists = !!msData.machine_exists;
+                _cachedDockerInfo = { wsl2Enabled, machineRunning, machineExists, storagePath, runtime };
                 _lastDockerInfoData = { machineStatus, storagePath, memGB };
                 _lastDockerInfoTime = Date.now();
                 infoBar.innerHTML = `
-                    <div class="docker-info-card docker-machine-card" style="cursor:pointer;" title="${currentLang==='zh'?'Podman Machine 状态':'Podman Machine Status'}">
+                    <div class="docker-info-card docker-machine-card" style="cursor:pointer;" title="${currentLang==='zh'?'运行环境':'Runtime'}">
                         <i class="fas fa-server"></i>
-                        <div><div class="info-value">${machineStatus}</div><div class="info-label docker-machine-label">${currentLang==='zh'?'Machine 状态':'Machine Status'}</div></div>
-                    </div>
-                    <div class="docker-info-card docker-config-card" style="cursor:pointer;" title="${currentLang==='zh'?'点击编辑 Podman Engine 配置':'Click to edit Podman Engine config'}">
-                        <i class="fas fa-cog"></i>
-                        <div><div class="info-value docker-config-value">${currentLang==='zh'?'引擎配置':'Engine Config'}</div><div class="info-label docker-config-label">containers.conf <i class="fas fa-edit" style="font-size:10px;margin-left:4px;"></i></div></div>
+                        <div><div class="info-value">${machineStatus}</div><div class="info-label docker-machine-label">${currentLang==='zh'?'运行环境':'Runtime'}</div></div>
                     </div>
                     <div class="docker-info-card docker-mirror-card" style="cursor:pointer;" title="${t('docker-mirror-accel-title')}">
                         <i class="fas fa-tachometer-alt"></i>
@@ -11842,225 +11948,78 @@ function openDockerImagesTab(opts) {
                 if (machineCard) {
                     machineCard.onclick = async () => {
                         const zh = currentLang === 'zh';
-                        const loadingDialog = showDockerLoadingDialog(
-                            'machine',
-                            zh ? 'Podman Machine' : 'Podman Machine Management',
-                            'fas fa-server',
-                            { minWidth: '480px', maxWidth: '600px' }
-                        );
-                        let statusData = {};
-                        try {
-                            statusData = await fetchWslStatus();
-                        } catch(e) {}
-                        if (loadingDialog && loadingDialog.isClosed()) return;
-                        closeDockerLoadingDialog(loadingDialog);
-                        const sd = statusData.status === 'success' ? statusData : {};
                         const dlg = document.createElement('dialog');
                         dlg.dataset.dockerPanelDialog = 'machine';
                         dlg.style.cssText = 'border:none;border-radius:12px;padding:0;background:#fff;box-shadow:0 8px 32px rgba(0,0,0,0.3);z-index:200000;min-width:480px;max-width:600px;';
+                        const renderStatus = (sd) => {
                         dlg.innerHTML = `
-                            <div style="padding:16px 20px 10px;font-size:16px;font-weight:700;color:#333;border-bottom:1px solid #eee;display:flex;align-items:center;gap:8px;">
-                                <i class="fas fa-server" style="color:#1976d2"></i>
-                                ${zh?'Podman Machine 管理':'Podman Machine Management'}
-                                <button class="dlg-close-x" title="${zh?'关闭':'Close'}" style="margin-left:auto;width:34px;height:34px;border:none;border-radius:8px;background:#ef5350;color:#fff;cursor:pointer;font-size:18px;line-height:1;display:flex;align-items:center;justify-content:center;">×</button>
+                            <div style="padding:6px 16px;font-size:16px;font-weight:700;color:#333;border-bottom:1px solid #eee;display:flex;align-items:center;gap:8px;">
+                                <i class="fas fa-server" style="color:#e65100"></i>
+                                ${zh?'运行环境管理':'Runtime management'}
+                                <button class="dlg-close-x" title="${zh?'关闭':'Close'}" style="margin-left:auto;width:34px;height:34px;border:none;border-radius:8px;cursor:pointer;font-size:18px;line-height:1;display:flex;align-items:center;justify-content:center;">×</button>
                             </div>
                             <div style="padding:16px 20px;font-size:14px;color:#333;line-height:1.8;">
                                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px;">
                                     <div style="padding:10px;background:#f5f5f5;border-radius:8px;"><div style="font-size:12px;color:#888;">WSL2</div><div style="font-weight:600;color:${sd.wsl2_feature_enabled?'#2e7d32':'#e53935'};">${sd.wsl2_feature_enabled?'✓ '+(zh?'已启用':'Enabled'):'✗ '+(zh?'未启用':'Disabled')}</div></div>
-                                    <div style="padding:10px;background:#f5f5f5;border-radius:8px;"><div style="font-size:12px;color:#888;">${zh?'Podman 版本':'Podman Version'}</div><div style="font-weight:600;">${sd.podman_version||'—'}</div></div>
-                                    <div style="padding:10px;background:#f5f5f5;border-radius:8px;"><div style="font-size:12px;color:#888;">${zh?'Machine 状态':'Machine Status'}</div><div style="font-weight:600;color:${sd.machine_running?'#2e7d32':sd.machine_exists?'#e65100':'#999'};">${sd.machine_running?(zh?'运行中':'Running'):sd.machine_exists?(zh?'已停止':'Stopped'):(zh?'未创建':'Not Created')}</div></div>
-                                    <div style="padding:10px;background:#f5f5f5;border-radius:8px;"><div style="font-size:12px;color:#888;">${zh?'API 服务':'API Service'}</div><div style="font-weight:600;color:${sd.api_service_running?'#2e7d32':'#999'};">${sd.api_service_running?(zh?'运行中':'Running'):(zh?'未运行':'Stopped')}</div></div>
-                                    <div style="padding:10px;background:#f5f5f5;border-radius:8px;"><div style="font-size:12px;color:#888;">${zh?'客户端类型':'Client Type'}</div><div style="font-weight:600;color:#1976d2;">${sd.client_type==='podman-native'?(zh?'Podman 原生':'Podman Native'):sd.client_type==='docker-sdk'?(zh?'Docker SDK 兼容':'Docker SDK'):(zh?'未连接':'Disconnected')}</div></div>
-                                    <div style="padding:10px;background:#f5f5f5;border-radius:8px;"><div style="font-size:12px;color:#888;">${zh?'数据目录':'Data Dir'}</div><div style="font-weight:600;font-size:11px;word-break:break-all;">${sd.data_dir||'—'}</div></div>
+                                    <div style="padding:10px;background:#f5f5f5;border-radius:8px;"><div style="font-size:12px;color:#888;">${zh?'引擎版本':'Engine version'}</div><div style="font-weight:600;">${escapeHtml((sd.runtime||{}).engine_version||sd.podman_version||'—')}</div></div>
+                                    <div style="padding:10px;background:#f5f5f5;border-radius:8px;"><div style="font-size:12px;color:#888;">${zh?'运行环境':'Runtime'}</div><div style="font-weight:600;color:${sd.machine_running?'#2e7d32':sd.machine_exists?'#e65100':'#999'};">${runtimeStateLabel(sd.runtime)}</div></div>
+                                    <div style="padding:10px;background:#f5f5f5;border-radius:8px;"><div style="font-size:12px;color:#888;">${zh?'本地连接':'Local connection'}</div><div style="font-weight:600;color:${sd.api_service_running?'#2e7d32':'#999'};">${sd.engine_ready?(zh?'已连接':'Connected'):(zh?'未连接':'Disconnected')}</div></div>
+                                    <div style="padding:10px;background:#f5f5f5;border-radius:8px;"><div style="font-size:12px;color:#888;">${zh?'活动任务':'Active tasks'}</div><div style="font-weight:600;color:#1976d2;">${Object.values(sd.active||{}).reduce((sum, n) => sum + Number(n||0), 0)}</div></div>
+                                    <div style="padding:10px;background:#f5f5f5;border-radius:8px;"><div style="font-size:12px;color:#888;">${zh?'数据目录':'Data Dir'}</div><div style="font-weight:600;font-size:11px;word-break:break-all;">${escapeHtml(sd.data_dir||'—')}</div></div>
                                 </div>
-                                <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                                    ${sd.machine_running?`<button class="dlg-machine-stop" style="padding:8px 16px;border-radius:6px;border:none;background:#e65100;color:#fff;cursor:pointer;font-size:13px;font-weight:600;"><i class="fas fa-stop" style="margin-right:4px;"></i>${zh?'停止 Machine':'Stop Machine'}</button>`:''}
-                                    ${sd.machine_exists&&!sd.machine_running?`<button class="dlg-machine-start" style="padding:8px 16px;border-radius:6px;border:none;background:#2e7d32;color:#fff;cursor:pointer;font-size:13px;font-weight:600;"><i class="fas fa-play" style="margin-right:4px;"></i>${zh?'启动 Machine':'Start Machine'}</button>`:''}
-                                    ${!sd.machine_exists?`<button class="dlg-machine-init" style="padding:8px 16px;border-radius:6px;border:none;background:#1976d2;color:#fff;cursor:pointer;font-size:13px;font-weight:600;"><i class="fas fa-plus" style="margin-right:4px;"></i>${zh?'初始化 Machine':'Init Machine'}</button>`:''}
-                                    <button class="dlg-machine-reset" style="padding:8px 16px;border-radius:6px;border:1px solid #e53935;background:#fff;color:#e53935;cursor:pointer;font-size:13px;font-weight:600;"><i class="fas fa-redo" style="margin-right:4px;"></i>${zh?'重置 Machine':'Reset Machine'}</button>
+                                <div style="color:#b71c1c;overflow-wrap:anywhere;">${escapeHtml((sd.runtime||{}).last_error||'')}</div>
+                                <div style="display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;">
+                                    ${sd.machine_running?`<button class="dlg-machine-stop" style="padding:8px 16px;border-radius:6px;border:none;background:#e65100;color:#fff;cursor:pointer;font-size:13px;font-weight:600;"><i class="fas fa-stop" style="margin-right:4px;"></i>${zh?'停止运行环境':'Stop runtime'}</button>`:''}
+                                    ${sd.machine_exists&&!sd.machine_running?`<button class="dlg-machine-start" style="padding:8px 16px;border-radius:6px;border:none;background:#2e7d32;color:#fff;cursor:pointer;font-size:13px;font-weight:600;"><i class="fas fa-play" style="margin-right:4px;"></i>${zh?'启动运行环境':'Start runtime'}</button>`:''}
+                                    ${!sd.machine_exists?`<button class="dlg-machine-init" style="padding:8px 16px;border-radius:6px;border:none;background:#e65100;color:#fff;cursor:pointer;font-size:13px;font-weight:600;"><i class="fas fa-plus" style="margin-right:4px;"></i>${zh?'初始化运行环境':'Init runtime'}</button>`:''}
+                                    <button class="dlg-machine-reset" style="padding:8px 16px;border-radius:6px;border:1px solid #e53935;background:#fff;color:#e53935;cursor:pointer;font-size:13px;font-weight:600;"><i class="fas fa-redo" style="margin-right:4px;"></i>${zh?'重置运行环境':'Reset runtime'}</button>
                                 </div>
                             </div>
                         `;
                         const closeDlg = () => { try{dlg.close();}catch(e){} try{dlg.remove();}catch(e){} };
                         dlg.querySelector('.dlg-close-x').onclick = closeDlg;
-                        dlg.addEventListener('cancel', e => { e.preventDefault(); closeDlg(); });
-                        const stopBtn = dlg.querySelector('.dlg-machine-stop');
-                        if (stopBtn) stopBtn.onclick = async () => {
-                            stopBtn.disabled = true; stopBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
-                            try { await post('/podman/machine/stop', {}); } catch(e) {}
-                            invalidateDockerPanelCache('podman-info', 'wsl-status');
-                            closeDlg(); setTimeout(() => { loadDockerInfo(); loadLocalImages(); }, 5000);
-                        };
-                        const startBtn = dlg.querySelector('.dlg-machine-start');
-                        if (startBtn) startBtn.onclick = async () => {
-                            startBtn.disabled = true; startBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
-                            try { await post('/podman/machine/start', {}); } catch(e) {}
-                            invalidateDockerPanelCache('podman-info', 'wsl-status');
-                            closeDlg(); setTimeout(() => { loadDockerInfo(); loadLocalImages(); }, 10000);
-                        };
-                        const initBtn = dlg.querySelector('.dlg-machine-init');
-                        if (initBtn) initBtn.onclick = async () => {
-                            initBtn.disabled = true; initBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
-                            try { await post('/podman/machine/init', {}); } catch(e) {}
-                            invalidateDockerPanelCache('podman-info', 'wsl-status');
-                            closeDlg(); setTimeout(() => { loadDockerInfo(); loadLocalImages(); }, 15000);
-                        };
-                        const resetBtn = dlg.querySelector('.dlg-machine-reset');
-                        if (resetBtn) resetBtn.onclick = async () => {
-                            const confirmed = confirm(zh?'确认要重置 Podman Machine 吗？所有容器和镜像将被删除。':'Reset Podman Machine? All containers and images will be deleted.');
-                            if (!confirmed) return;
-                            resetBtn.disabled = true; resetBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
-                            try { await post('/podman/machine/reset', {}); } catch(e) {}
-                            invalidateDockerPanelCache('podman-info', 'wsl-status', 'podman-config');
-                            closeDlg(); setTimeout(() => { loadDockerInfo(); loadLocalImages(); }, 20000);
-                        };
-                        document.body.appendChild(dlg);
-                        dlg.showModal();
-                    };
-                }
-                // Bind Podman Engine config card
-                const configCard = infoBar.querySelector('.docker-config-card');
-                if (configCard) {
-                    configCard.onclick = async () => {
-                        const zh = currentLang === 'zh';
-                        const loadingDialog = showDockerLoadingDialog(
-                            'config',
-                            'Podman Engine',
-                            'fas fa-cog',
-                            { minWidth: '560px', maxWidth: '720px' }
-                        );
-                        // Load current containers.conf from backend
-                        let currentConfig = '';
-                        try {
-                            const data = await fetchPodmanConfig();
-                            if (data.status === 'success') {
-                                currentConfig = data.config || DOCKER_DEFAULT_CONFIG;
-                            } else {
-                                currentConfig = DOCKER_DEFAULT_CONFIG;
-                            }
-                        } catch(e) {
-                            currentConfig = DOCKER_DEFAULT_CONFIG;
-                        }
-                        if (loadingDialog && loadingDialog.isClosed()) return;
-                        closeDockerLoadingDialog(loadingDialog);
-                        // Show config editor dialog
-                        const dlg = document.createElement('dialog');
-                        dlg.dataset.dockerPanelDialog = 'config';
-                        dlg.style.cssText = 'border:none;border-radius:12px;padding:0;background:#fff;box-shadow:0 8px 32px rgba(0,0,0,0.3);z-index:200000;min-width:560px;max-width:720px;';
-                        dlg.innerHTML = `
-                            <div style="padding:16px 20px 10px;font-size:16px;font-weight:700;color:#333;border-bottom:1px solid #eee;display:flex;align-items:center;gap:8px;">
-                                <i class="fas fa-cog" style="color:#1976d2"></i>
-                                Podman Engine
-                                <button class="dlg-close-x" title="${zh?'关闭':'Close'}" style="margin-left:auto;width:34px;height:34px;border:none;border-radius:8px;background:#ef5350;color:#fff;cursor:pointer;font-size:18px;line-height:1;display:flex;align-items:center;justify-content:center;">×</button>
-                            </div>
-                            <div style="padding:14px 20px 4px;">
-                                <div style="font-size:13px;color:#666;margin-bottom:10px;line-height:1.6;">
-                                    ${zh
-                                        ?'编辑 Podman 配置文件 (containers.conf)。<br><span style="color:#e53935;font-weight:600;">⚠ 请确保配置格式正确，错误的配置可能导致 Podman 无法启动。</span><br><span style="color:#888;font-size:12px;">保存后需要重启 Podman Machine 才能生效。</span>'
-                                        :'Edit the Podman configuration file (containers.conf).<br><span style="color:#e53935;font-weight:600;">⚠ Ensure valid config format. Invalid config may prevent Podman from starting.</span><br><span style="color:#888;font-size:12px;">Podman Machine restart required after saving.</span>'}
-                                </div>
-                                <textarea class="docker-config-editor" style="width:100%;box-sizing:border-box;min-height:320px;padding:14px;border:2px solid #e0e0e0;border-radius:8px;font-size:13px;font-family:Consolas,'Courier New',monospace;resize:vertical;outline:none;transition:border-color 0.2s;line-height:1.6;tab-size:2;background:#fafafa;">${escapeHtml(currentConfig)}</textarea>
-                                <div class="docker-config-error" style="color:#e53935;font-size:12px;margin-top:6px;min-height:18px;"></div>
-                            </div>
-                            <div style="padding:8px 20px 16px;display:flex;justify-content:space-between;align-items:center;gap:10px;">
-                                <button class="dlg-format" style="padding:7px 14px;border-radius:6px;border:1px solid #ccc;background:#f5f5f5;cursor:pointer;font-size:12px;display:flex;align-items:center;gap:4px;"><i class="fas fa-magic"></i> ${zh?'格式化':'Format'}</button>
-                                <button class="dlg-save" style="padding:8px 18px;border-radius:6px;border:none;background:#1976d2;color:#fff;cursor:pointer;font-size:13px;font-weight:600;display:flex;align-items:center;gap:6px;"><i class="fas fa-save"></i> ${zh?'保存并重启 Podman':'Save & Restart Podman'}</button>
-                            </div>
-                        `;
-                        const editor = dlg.querySelector('.docker-config-editor');
-                        const errEl = dlg.querySelector('.docker-config-error');
-                        const closeDlg = () => { try{dlg.close();}catch(e){} try{dlg.remove();}catch(e){} };
-                        // Tab key inserts spaces
-                        editor.addEventListener('keydown', e => {
-                            if (e.key === 'Tab') {
-                                e.preventDefault();
-                                const s = editor.selectionStart, end = editor.selectionEnd;
-                                editor.value = editor.value.substring(0,s) + '  ' + editor.value.substring(end);
-                                editor.selectionStart = editor.selectionEnd = s + 2;
-                            }
-                        });
-                        editor.onfocus = () => { editor.style.borderColor = '#1976d2'; };
-                        editor.onblur = () => { editor.style.borderColor = '#e0e0e0'; };
-                        const validateToml = (text) => {
-                            if (!text.trim()) return zh ? '配置内容不能为空' : 'Config cannot be empty';
-                            const lines = text.split('\n');
-                            let hasSection = false;
-                            for (let i = 0; i < lines.length; i++) {
-                                const line = lines[i].trim();
-                                if (!line || line.startsWith('#')) continue;
-                                if (line.startsWith('[[') && line.endsWith(']]')) { hasSection = true; continue; }
-                                if (line.startsWith('[') && line.endsWith(']')) { hasSection = true; continue; }
-                                if (line.includes('=') && !line.startsWith('=')) {
-                                    const eqIdx = line.indexOf('=');
-                                    const key = line.substring(0, eqIdx).trim();
-                                    if (!key) return (zh ? `第 ${i+1} 行: 键名不能为空` : `Line ${i+1}: Empty key`);
-                                }
-                            }
-                            return '';
-                        };
-                        editor.oninput = () => {
-                            const err = validateToml(editor.value);
-                            errEl.textContent = err;
-                            editor.style.borderColor = err ? '#e53935' : '#1976d2';
-                        };
-                        dlg.querySelector('.dlg-format').onclick = () => {
-                            const lines = editor.value.split('\n');
-                            const formatted = [];
-                            let lastWasSection = false;
-                            for (const line of lines) {
-                                const trimmed = line.trim();
-                                if (!trimmed) { if (lastWasSection) continue; formatted.push(''); continue; }
-                                if (trimmed.startsWith('[[') || trimmed.startsWith('[')) {
-                                    if (formatted.length && formatted[formatted.length-1] !== '') formatted.push('');
-                                    formatted.push(trimmed);
-                                    lastWasSection = true;
-                                } else {
-                                    formatted.push(trimmed);
-                                    lastWasSection = false;
-                                }
-                            }
-                            editor.value = formatted.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
-                            const err = validateToml(editor.value);
-                            errEl.textContent = err;
-                            editor.style.borderColor = err ? '#e53935' : '#1976d2';
-                        };
-                        dlg.querySelector('.dlg-close-x').onclick = closeDlg;
-                        dlg.addEventListener('cancel', e => { e.preventDefault(); closeDlg(); });
-                        // Save button
-                        dlg.querySelector('.dlg-save').onclick = async () => {
-                            const val = editor.value.trim();
-                            if (!val || val.length < 5) {
-                                errEl.textContent = zh ? '配置内容不能为空' : 'Config cannot be empty';
-                                editor.style.borderColor = '#e53935';
-                                return;
-                            }
-                            const saveBtn = dlg.querySelector('.dlg-save');
-                            saveBtn.disabled = true;
-                            saveBtn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> ${zh?'保存中...':'Saving...'}`;
+                        dlg.oncancel = e => { e.preventDefault(); closeDlg(); };
+                        const runAction = async (button, action) => {
+                            button.disabled = true;
                             try {
-                                const res = await post('/podman/config', { config: val });
-                                if (res.status === 'success') {
-                                    invalidateDockerPanelCache('podman-config', 'podman-info', 'wsl-status');
-                                    closeDlg();
-                                    alert(zh ? 'Podman 配置已保存，Podman Machine 正在重启...' : 'Podman config saved. Podman Machine is restarting...');
-                                    setTimeout(() => { loadDockerInfo(); loadLocalImages(); }, 10000);
-                                } else {
-                                    errEl.textContent = (zh?'保存失败: ':'Save failed: ') + (res.message || '');
-                                    saveBtn.disabled = false;
-                                    saveBtn.innerHTML = `<i class="fas fa-save"></i> ${zh?'保存并重启 Podman':'Save & Restart Podman'}`;
-                                }
-                            } catch(e) {
-                                errEl.textContent = (zh?'保存失败: ':'Save failed: ') + e.message;
-                                saveBtn.disabled = false;
-                                saveBtn.innerHTML = `<i class="fas fa-save"></i> ${zh?'保存并重启 Podman':'Save & Restart Podman'}`;
+                                const result = await post('/podman/machine/' + action, {});
+                                if (result.status !== 'success') throw new Error(result.message || (zh ? '操作失败' : 'Operation failed'));
+                                invalidateDockerPanelCache('podman-info', 'wsl-status', 'podman-config');
+                                _lastDockerInfoTime = 0;
+                                closeDlg(); loadDockerInfo(); loadLocalImages();
+                            } catch (error) {
+                                button.disabled = false;
+                                alert(String(error.message || error));
                             }
                         };
+                        for (const action of ['stop', 'start', 'init', 'reset']) {
+                            const button = dlg.querySelector('.dlg-machine-' + action);
+                            if (button) button.onclick = () => {
+                                if (action === 'reset' && !confirm(zh ? '确认要重置运行环境吗？所有容器和镜像将被删除。' : 'Reset runtime? All containers and images will be deleted.')) return;
+                                runAction(button, action);
+                            };
+                        }
+                        };
+                        renderStatus(msData.status === 'success' ? msData : data);
                         document.body.appendChild(dlg);
                         dlg.showModal();
-                        editor.focus();
+                        // Open from the existing snapshot; IPC never delays the dialog.
+                        invalidateDockerPanelCache('wsl-status');
+                        fetchWslStatus().then(fresh => {
+                            if (!dlg.isConnected || dlg.querySelector('button:disabled')) return;
+                            if (fresh.status !== 'success') throw new Error(fresh.message || 'Status unavailable');
+                            msData = fresh;
+                            renderStatus(fresh);
+                        }).catch(error => {
+                            if (!dlg.isConnected || dlg.querySelector('button:disabled')) return;
+                            renderStatus({ ...msData, engine_ready: false, api_service_running: false,
+                                runtime: { ...msData.runtime, state: 'attention', engine_ready: false,
+                                    last_error: String(error.message || error) } });
+                        });
+
                     };
                 }
-                // Bind Mirror Acceleration card — show current mirrors & allow config
+                // Network mode controls the built-in download acceleration automatically.
                 const mirrorCard = infoBar.querySelector('.docker-mirror-card');
                 if (mirrorCard) {
                     const modeLabel = (mode) => {
@@ -12068,296 +12027,199 @@ function openDockerImagesTab(opts) {
                         if (mode === 'global') return t('docker-network-mode-global');
                         return t('docker-network-mode-auto');
                     };
-
-                    const fetchNetworkProfile = async () => {
-                        try {
-                            const jp = await fetchDockerNetworkProfile();
-                            if (jp && jp.status === 'success' && jp.mode) return jp;
-                        } catch (e) {}
-                        return { status: 'success', mode: 'auto' };
+                    const showModeStatus = (mode) => {
+                        const label = infoBar.querySelector('.docker-mirror-status-label');
+                        if (!label) return;
+                        label.dataset.networkMode = mode;
+                        label.textContent = modeLabel(mode);
                     };
-
-                    const saveNetworkProfile = async (mode) => {
-                        const res = await post('/podman/network-profile', { mode });
-                        invalidateDockerPanelCache('network-profile');
-                        return res;
-                    };
-
-                    // Load current mirror status
-                    (async () => {
-                        const mirrorLabel = infoBar.querySelector('.docker-mirror-status-label');
-                        try {
-                            const [data, profile] = await Promise.all([
-                                fetchPodmanConfig(),
-                                fetchNetworkProfile()
-                            ]);
-                            const modeText = modeLabel(profile.mode);
-                            if (data.status === 'success') {
-                                const mirrors = data['registry-mirrors'] || [];
-                                if (mirrors.length > 0) {
-                                    mirrorLabel.innerHTML = `<i class="fas fa-check-circle" style="color:#4fc3f7;font-size:10px;margin-right:2px;"></i>${currentLang==='zh'?'已配置':'Configured'} · ${modeText}`;
-                                } else {
-                                    mirrorLabel.textContent = `${t('docker-mirror-accel-none')} · ${modeText}`;
-                                }
-                            } else {
-                                mirrorLabel.textContent = `${t('docker-mirror-accel-none')} · ${modeText}`;
-                            }
-                        } catch(e) {
-                            mirrorLabel.textContent = t('docker-mirror-accel-none');
+                    fetchDockerNetworkProfile().then(profile => {
+                        if (profile?.status === 'success' && ['auto', 'cn', 'global'].includes(profile.mode)) {
+                            showModeStatus(profile.mode);
+                        } else {
+                            throw new Error('Invalid network settings');
                         }
-                    })();
+                    }).catch(() => {
+                        const label = infoBar.querySelector('.docker-mirror-status-label');
+                        if (label) label.textContent = currentLang === 'zh' ? '读取失败' : 'Read failed';
+                    });
                     mirrorCard.onclick = async () => {
+                        if (document.querySelector('dialog[data-docker-panel-dialog="mirror"]')) return;
                         const zh = currentLang === 'zh';
-                        const loadingDialog = showDockerLoadingDialog(
-                            'mirror',
-                            t('docker-mirror-accel-title'),
-                            'fas fa-tachometer-alt',
-                            { minWidth: '500px', maxWidth: '640px' }
-                        );
-                        // Load current containers.conf
-                        let currentMirrors = [];
-                        try {
-                            const data = await fetchPodmanConfig();
-                            if (data.status === 'success') {
-                                currentMirrors = data['registry-mirrors'] || [];
-                            }
-                        } catch(e) {}
-                        const profileData = await fetchNetworkProfile();
-                        if (loadingDialog && loadingDialog.isClosed()) return;
-                        closeDockerLoadingDialog(loadingDialog);
-                        const currentMode = (profileData && profileData.mode) ? profileData.mode : 'auto';
-                        currentMirrors = currentMirrors.map(m => m.startsWith('http') ? m : 'https://' + m);
-                        const mirrorOptions = [
-                            { label: 'DynIM', url: 'https://dytt.online' },
-                            { label: 'Unsee', url: 'https://docker-0.unsee.tech' },
-                            { label: 'Lispy', url: 'https://lispy.org' },
-                            { label: 'DaoCloud', url: 'https://docker.m.daocloud.io' },
-                            { label: 'Huawei SWR', url: 'https://05f073ad3c0010ea0f4bc00b7105ec20.mirror.swr.myhuaweicloud.com' }
-                        ];
                         const dlg = document.createElement('dialog');
                         dlg.dataset.dockerPanelDialog = 'mirror';
-                        dlg.style.cssText = 'border:none;border-radius:12px;padding:0;background:#fff;box-shadow:0 8px 32px rgba(0,0,0,0.3);z-index:200000;min-width:500px;max-width:640px;max-height:86vh;overflow:hidden;display:flex;flex-direction:column;';
+                        dlg.style.cssText = 'border:none;border-radius:12px;padding:0;background:#fff;box-shadow:0 8px 32px rgba(0,0,0,0.3);z-index:200000;width:min(520px,calc(100vw - 40px));max-height:86vh;overflow:hidden;display:flex;flex-direction:column;';
                         dlg.innerHTML = `
-                            <div style="padding:16px 20px 10px;font-size:16px;font-weight:700;color:#333;border-bottom:1px solid #eee;display:flex;align-items:center;gap:8px;">
-                                <i class="fas fa-tachometer-alt" style="color:#4fc3f7"></i>
+                            <div style="padding:6px 16px;font-size:16px;font-weight:700;color:#333;border-bottom:1px solid #eee;display:flex;align-items:center;gap:8px;flex-shrink:0;">
+                                <i class="fas fa-tachometer-alt" style="color:#e65100"></i>
                                 ${t('docker-mirror-accel-title')}
-                                <button class="dlg-close-x" title="${zh?'关闭':'Close'}" style="margin-left:auto;width:34px;height:34px;border:none;border-radius:8px;background:#ef5350;color:#fff;cursor:pointer;font-size:18px;line-height:1;display:flex;align-items:center;justify-content:center;">×</button>
+                                <button class="dlg-close-x" title="${zh?'关闭':'Close'}" style="margin-left:auto;width:32px;height:32px;border:none;border-radius:8px;cursor:pointer;font-size:18px;">×</button>
                             </div>
-                            <div style="padding:16px 20px;line-height:1.8;font-size:14px;color:#333;overflow-y:auto;overflow-x:hidden;flex:1;min-height:0;">
-                                <p style="color:#666;font-size:13px;margin:0 0 12px 0;">${t('docker-mirror-accel-desc')}</p>
-                                <div style="font-size:13px;font-weight:600;color:#555;margin-bottom:8px;">${t('docker-network-mode')}:</div>
-                                <div style="margin-bottom:14px;">
-                                    <select class="docker-network-mode-select" style="width:100%;padding:9px 10px;border:1px solid #d0d0d0;border-radius:6px;font-size:13px;background:#fff;">
-                                        <option value="auto" ${currentMode==='auto'?'selected':''}>${t('docker-network-mode-auto')}</option>
-                                        <option value="cn" ${currentMode==='cn'?'selected':''}>${t('docker-network-mode-cn')}</option>
-                                        <option value="global" ${currentMode==='global'?'selected':''}>${t('docker-network-mode-global')}</option>
-                                    </select>
-                                    <div style="margin-top:6px;color:#777;font-size:12px;line-height:1.5;">${t('docker-network-mode-desc')}</div>
+                            <div style="padding:16px 20px;line-height:1.6;font-size:14px;color:#333;overflow-y:auto;min-height:0;">
+                                <p style="color:#666;font-size:13px;margin:0 0 14px;">${t('docker-mirror-accel-desc')}</p>
+                                <label for="download-network-mode" style="display:block;font-size:13px;font-weight:600;color:#555;margin-bottom:6px;">${t('docker-network-mode')}</label>
+                                <select id="download-network-mode" class="docker-network-mode-select" disabled style="width:100%;padding:9px 10px;border:1px solid #d0d0d0;border-radius:6px;font-size:13px;background:#fff;">
+                                    <option value="auto">${t('docker-network-mode-auto')}</option>
+                                    <option value="cn">${t('docker-network-mode-cn')}</option>
+                                    <option value="global">${t('docker-network-mode-global')}</option>
+                                </select>
+                                <label for="custom-download-mirror" style="display:block;font-size:13px;font-weight:600;color:#555;margin:16px 0 6px;">${t('docker-mirror-custom')}</label>
+                                <div class="custom-mirror-row" style="display:flex;align-items:center;gap:8px;">
+                                    <input id="custom-download-mirror" class="custom-mirror-input" type="text" disabled placeholder="${t('docker-mirror-custom-placeholder')}" style="flex:1;min-width:0;height:36px;margin:0;padding:0 10px;box-sizing:border-box;border:1px solid #d0d0d0;border-radius:6px;font-size:13px;">
+                                    <button class="custom-mirror-add-btn" disabled style="height:36px;margin:0;padding:0 14px;box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;border:none;border-radius:6px;background:#e65100;color:#fff;cursor:pointer;font-size:13px;white-space:nowrap;">${t('docker-mirror-custom-add')}</button>
                                 </div>
-                                <div style="font-size:13px;font-weight:600;color:#555;margin-bottom:8px;">${t('docker-mirror-accel-current')}:</div>
-                                <div style="margin-bottom:14px;padding:8px 12px;background:#f5f5f5;border-radius:6px;font-family:Consolas,monospace;font-size:12px;color:${currentMirrors.length>0?'#333':'#999'};">${currentMirrors.length > 0 ? currentMirrors.join('<br>') : t('docker-mirror-accel-none')}</div>
-                                <div style="font-size:13px;font-weight:600;color:#555;margin-bottom:8px;">${zh?'选择加速源:':'Select mirror:'}</div>
-                                <div class="mirror-options" style="display:flex;flex-direction:column;gap:6px;">
-                                    ${mirrorOptions.map((m, i) => `<label style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-radius:6px;border:1px solid #e0e0e0;cursor:pointer;font-size:13px;transition:border-color 0.2s;${currentMirrors.includes(m.url)?'border-color:#1976d2;background:#e3f2fd;':''}"><input type="checkbox" name="mirror" value="${m.url}" ${currentMirrors.includes(m.url)?'checked':''}><span style="font-weight:600;">${m.label}</span><span style="color:#999;font-size:11px;margin-left:auto;font-family:Consolas,monospace;">${m.url}</span></label>`).join('')}
-                                </div>
-                                <div style="margin-top:16px;font-size:13px;font-weight:600;color:#555;margin-bottom:8px;">${t('docker-mirror-custom')} <span style="font-weight:400;color:#999;font-size:11px;">(${t('docker-mirror-custom-hint')})</span></div>
-                                <div style="display:flex;gap:8px;margin-bottom:8px;">
-                                    <input type="text" class="custom-mirror-input" placeholder="${t('docker-mirror-custom-placeholder')}" style="flex:1;padding:8px 10px;border:1px solid #d0d0d0;border-radius:6px;font-size:13px;font-family:Consolas,monospace;outline:none;" />
-                                    <button class="custom-mirror-add-btn" style="padding:8px 14px;border:none;border-radius:6px;background:#1976d2;color:#fff;cursor:pointer;font-size:13px;white-space:nowrap;">${t('docker-mirror-custom-add')}</button>
-                                </div>
-                                <div class="custom-mirror-list" style="display:flex;flex-direction:column;gap:4px;"></div>
+                                <div style="margin:6px 0 10px;color:#777;font-size:12px;">${t('docker-mirror-custom-hint')}</div>
+                                <div class="custom-mirror-list" style="display:flex;flex-direction:column;gap:6px;"></div>
+                                <div class="network-settings-status" role="status" style="margin-top:10px;font-size:13px;color:#666;">${zh?'正在读取本地设置…':'Reading local settings…'}</div>
                             </div>
-                            <div style="padding:10px 20px 16px;display:flex;justify-content:flex-end;gap:10px;border-top:1px solid #eee;background:#fff;flex-shrink:0;">
-                                <button class="dlg-remove" style="padding:8px 16px;border-radius:6px;border:1px solid #e53935;background:#fff;color:#e53935;cursor:pointer;font-size:13px;margin-right:auto;${currentMirrors.length===0?'display:none;':''}">${t('docker-mirror-accel-remove')}</button>
-                                <button class="dlg-save-mode" style="padding:8px 16px;border-radius:6px;border:1px solid #1976d2;background:#fff;color:#1976d2;cursor:pointer;font-size:13px;">${t('docker-network-mode-save')}</button>
-                                <button class="dlg-apply" style="padding:8px 18px;border-radius:6px;border:none;background:#1976d2;color:#fff;cursor:pointer;font-size:13px;font-weight:600;"><i class="fas fa-save" style="margin-right:4px;"></i>${t('docker-mirror-accel-apply')}</button>
+                            <div style="padding:12px 20px;display:flex;justify-content:flex-end;gap:10px;border-top:1px solid #eee;flex-shrink:0;">
+                                <button class="dlg-cancel" style="padding:8px 16px;border-radius:6px;border:1px solid #d0d0d0;background:#fff;color:#555;cursor:pointer;font-size:13px;">${zh?'取消':'Cancel'}</button>
+                                <button class="dlg-apply" disabled style="padding:8px 18px;border-radius:6px;border:none;background:#e65100;color:#fff;cursor:pointer;font-size:13px;font-weight:600;">${t('docker-mirror-accel-apply')}</button>
                             </div>
                         `;
-                        const closeDlg = () => { try{dlg.close();}catch(e){} try{dlg.remove();}catch(e){} };
-                        const closeX = dlg.querySelector('.dlg-close-x');
-                        if (closeX) closeX.onclick = closeDlg;
-                        dlg.addEventListener('cancel', e => { e.preventDefault(); closeDlg(); });
-                        // Highlight selected mirrors
-                        dlg.querySelectorAll('.mirror-options label').forEach(lbl => {
-                            const cb = lbl.querySelector('input');
-                            cb.onchange = () => {
-                                lbl.style.borderColor = cb.checked ? '#1976d2' : '#e0e0e0';
-                                lbl.style.background = cb.checked ? '#e3f2fd' : '';
-                            };
-                        });
-
-                        const customMirrorList = dlg.querySelector('.custom-mirror-list');
-                        const customMirrorInput = dlg.querySelector('.custom-mirror-input');
-                        const customMirrorAddBtn = dlg.querySelector('.custom-mirror-add-btn');
+                        const closeDlg = () => { try { dlg.close(); } catch (e) {} dlg.remove(); };
+                        dlg.querySelector('.dlg-close-x').onclick = closeDlg;
+                        dlg.querySelector('.dlg-cancel').onclick = closeDlg;
+                        dlg.oncancel = event => { event.preventDefault(); closeDlg(); };
+                        const select = dlg.querySelector('.docker-network-mode-select');
+                        const applyBtn = dlg.querySelector('.dlg-apply');
+                        const status = dlg.querySelector('.network-settings-status');
+                        const customInput = dlg.querySelector('.custom-mirror-input');
+                        const addBtn = dlg.querySelector('.custom-mirror-add-btn');
+                        const customList = dlg.querySelector('.custom-mirror-list');
                         let customMirrors = [];
-                        try {
-                            const cmData = await fetchCustomMirrors();
-                            if (cmData.status === 'success') {
-                                customMirrors = cmData.mirrors || [];
-                            }
-                        } catch(e) {}
-
-                        function renderCustomMirrors() {
-                            customMirrorList.innerHTML = customMirrors.map((m, i) => `
-                                <div class="custom-mirror-item" draggable="true" data-custom-idx="${i}" style="display:flex;align-items:center;gap:8px;padding:6px 12px;border-radius:6px;border:1px solid #ff9800;background:#fff8e1;font-size:13px;cursor:grab;">
-                                    <i class="fas fa-grip-vertical" style="color:#bbb;cursor:grab;font-size:11px;"></i>
-                                    <i class="fas fa-star" style="color:#ff9800;font-size:10px;"></i>
-                                    <span style="flex:1;font-family:Consolas,monospace;word-break:break-all;">${m}</span>
-                                    <button data-custom-idx="${i}" class="custom-mirror-del-btn" style="border:none;background:none;color:#e53935;cursor:pointer;font-size:14px;padding:2px 6px;">×</button>
-                                </div>
-                            `).join('');
-                            customMirrorList.querySelectorAll('.custom-mirror-del-btn').forEach(btn => {
-                                btn.onclick = async () => {
-                                    const idx = parseInt(btn.dataset.customIdx);
-                                    customMirrors.splice(idx, 1);
-                                    try {
-                                        await post('/podman/custom-mirrors', { mirrors: customMirrors });
-                                        invalidateDockerPanelCache('custom-mirrors');
-                                    } catch(e) {}
-                                    renderCustomMirrors();
-                                };
-                            });
-                            const items = customMirrorList.querySelectorAll('.custom-mirror-item');
-                            let dragSrcIdx = null;
-                            items.forEach(item => {
-                                item.addEventListener('dragstart', (e) => {
-                                    dragSrcIdx = parseInt(item.dataset.customIdx);
-                                    item.style.opacity = '0.4';
-                                    e.dataTransfer.effectAllowed = 'move';
-                                });
-                                item.addEventListener('dragend', () => {
-                                    item.style.opacity = '1';
-                                    dragSrcIdx = null;
-                                    items.forEach(it => { it.style.borderTop = ''; it.style.borderBottom = ''; });
-                                });
-                                item.addEventListener('dragover', (e) => {
-                                    e.preventDefault();
-                                    e.dataTransfer.dropEffect = 'move';
-                                    items.forEach(it => { it.style.borderTop = ''; it.style.borderBottom = ''; });
-                                    const targetIdx = parseInt(item.dataset.customIdx);
-                                    if (dragSrcIdx !== null && dragSrcIdx !== targetIdx) {
-                                        item.style.borderTop = dragSrcIdx > targetIdx ? '2px solid #1976d2' : '';
-                                        item.style.borderBottom = dragSrcIdx < targetIdx ? '2px solid #1976d2' : '';
-                                    }
-                                });
-                                item.addEventListener('drop', async (e) => {
-                                    e.preventDefault();
-                                    const targetIdx = parseInt(item.dataset.customIdx);
-                                    if (dragSrcIdx !== null && dragSrcIdx !== targetIdx) {
-                                        const moved = customMirrors.splice(dragSrcIdx, 1)[0];
-                                        customMirrors.splice(targetIdx, 0, moved);
-                                        try {
-                                            await post('/podman/custom-mirrors', { mirrors: customMirrors });
-                                            invalidateDockerPanelCache('custom-mirrors');
-                                        } catch(e2) {}
+                        let customMirrorsDirty = false;
+                        let editorDisabled = true;
+                        const renderCustomMirrors = () => {
+                            customList.replaceChildren();
+                            customMirrors.forEach((mirror, index) => {
+                                const row = document.createElement('div');
+                                row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:8px 10px;border:1px solid #e0e0e0;border-radius:6px;';
+                                const address = document.createElement('span');
+                                address.textContent = mirror;
+                                address.style.cssText = 'flex:1;min-width:0;overflow-wrap:anywhere;font-size:12px;font-family:Consolas,monospace;';
+                                row.appendChild(address);
+                                for (const [symbol, delta, title] of [
+                                    ['↑', -1, zh ? '上移' : 'Move up'],
+                                    ['↓', 1, zh ? '下移' : 'Move down'],
+                                    ['×', 0, zh ? '删除' : 'Remove']
+                                ]) {
+                                    const button = document.createElement('button');
+                                    button.textContent = symbol;
+                                    button.title = title;
+                                    button.setAttribute('aria-label', title);
+                                    button.style.cssText = 'width:28px;height:28px;padding:0;border:1px solid #d0d0d0;border-radius:5px;background:#fff;cursor:pointer;flex-shrink:0;';
+                                    button.disabled = editorDisabled || (delta !== 0 && !customMirrors[index + delta]);
+                                    button.onclick = () => {
+                                        if (delta) [customMirrors[index], customMirrors[index + delta]] = [customMirrors[index + delta], customMirrors[index]];
+                                        else customMirrors.splice(index, 1);
+                                        customMirrorsDirty = true;
                                         renderCustomMirrors();
-                                    }
-                                });
+                                    };
+                                    row.appendChild(button);
+                                }
+                                customList.appendChild(row);
                             });
-                        }
-                        renderCustomMirrors();
-
-                        function addCustomMirror() {
-                            let val = customMirrorInput.value.trim();
-                            if (!val) return;
-                            val = val.replace(/^https?:\/\//, '').replace(/\/+$/, '');
-                            if (!val) return;
-                            if (customMirrors.includes(val)) { customMirrorInput.value = ''; return; }
-                            const presetUrls = mirrorOptions.map(m => m.url.replace(/^https?:\/\//, '').replace(/\/+$/, ''));
-                            if (presetUrls.includes(val)) { customMirrorInput.value = ''; return; }
-                            customMirrors.push(val);
-                            customMirrorInput.value = '';
-                            post('/podman/custom-mirrors', { mirrors: customMirrors })
-                                .then(() => {
-                                    invalidateDockerPanelCache('custom-mirrors');
+                        };
+                        const setEditorDisabled = (disabled) => {
+                            editorDisabled = disabled;
+                            for (const control of [select, applyBtn, customInput, addBtn]) control.disabled = disabled;
+                            renderCustomMirrors();
+                        };
+                        const addCustomMirror = () => {
+                            const raw = customInput.value.trim();
+                            if (!raw) return true;
+                            try {
+                                const parsed = new URL(raw.includes('://') ? raw : 'https://' + raw);
+                                if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname || parsed.username || parsed.password || parsed.search || parsed.hash || /\s/.test(raw)) {
+                                    throw new Error(zh ? '请输入有效的镜像源地址' : 'Enter a valid mirror address');
+                                }
+                                const mirror = parsed.href.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+                                if (!customMirrors.some(value => value.replace(/^https?:\/\//, '').replace(/\/+$/, '') === mirror)) {
+                                    customMirrors.push(mirror);
+                                    customMirrorsDirty = true;
                                     renderCustomMirrors();
-                                })
-                                .catch(() => renderCustomMirrors());
-                        }
-                        customMirrorAddBtn.onclick = addCustomMirror;
-                        customMirrorInput.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); addCustomMirror(); } };
-
-                        dlg.querySelector('.dlg-save-mode').onclick = async () => {
-                            const mode = dlg.querySelector('.docker-network-mode-select').value;
-                            const btn = dlg.querySelector('.dlg-save-mode');
-                            btn.disabled = true;
-                            btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i>`;
-                            try {
-                                const res = await saveNetworkProfile(mode);
-                                if (res && res.status === 'success') {
-                                    _showToast(t('docker-network-mode-saved'), 'success', 2200);
-                                    loadDockerInfo();
-                                } else {
-                                    await _showInlineAlert((zh ? '保存失败: ' : 'Save failed: ') + ((res && res.message) || ''));
                                 }
-                            } catch (e) {
-                                await _showInlineAlert((zh ? '保存失败: ' : 'Save failed: ') + e.message);
-                            }
-                            btn.disabled = false;
-                            btn.textContent = t('docker-network-mode-save');
-                        };
-
-                        // Apply button
-                        dlg.querySelector('.dlg-apply').onclick = async () => {
-                            const selected = Array.from(dlg.querySelectorAll('input[name="mirror"]:checked')).map(cb => cb.value);
-                            const allMirrors = [...selected, ...customMirrors.map(m => m.startsWith('http') ? m : 'https://' + m)];
-                            if (allMirrors.length === 0) { await _showInlineAlert(zh?'请至少选择一个加速源或添加自定义加速源':'Please select at least one mirror or add a custom mirror'); return; }
-                            const mode = dlg.querySelector('.docker-network-mode-select').value;
-                            const applyBtn = dlg.querySelector('.dlg-apply');
-                            applyBtn.disabled = true;
-                            applyBtn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> ${zh?'应用中...':'Applying...'}`;
-                            try {
-                                const modeRes = await saveNetworkProfile(mode);
-                                if (!modeRes || modeRes.status !== 'success') {
-                                    throw new Error((modeRes && modeRes.message) || 'network profile update failed');
-                                }
-                                const res = await post('/podman/mirror', { mirrors: allMirrors });
-                                if (res.status === 'success') {
-                                    invalidateDockerPanelCache('podman-config', 'podman-info', 'wsl-status');
-                                    closeDlg();
-                                    _showToast(t('docker-mirror-accel-success'), 'success', 2600);
-                                    setTimeout(() => { loadDockerInfo(); }, 15000);
-                                } else {
-                                    await _showInlineAlert((zh?'失败: ':'Failed: ') + (res.message || ''));
-                                    applyBtn.disabled = false;
-                                    applyBtn.innerHTML = `<i class="fas fa-save" style="margin-right:4px;"></i>${t('docker-mirror-accel-apply')}`;
-                                }
-                            } catch(e) {
-                                await _showInlineAlert((zh?'失败: ':'Failed: ') + e.message);
-                                applyBtn.disabled = false;
-                                applyBtn.innerHTML = `<i class="fas fa-save" style="margin-right:4px;"></i>${t('docker-mirror-accel-apply')}`;
+                                customInput.value = '';
+                                status.hidden = true;
+                                return true;
+                            } catch (error) {
+                                status.hidden = false;
+                                status.textContent = zh ? '请输入有效的镜像源地址，例如 docker.example.com' : 'Enter a valid mirror address, e.g. docker.example.com';
+                                return false;
                             }
                         };
-                        // Remove button
-                        dlg.querySelector('.dlg-remove').onclick = async () => {
-                            const mode = dlg.querySelector('.docker-network-mode-select').value;
-                            const removeBtn = dlg.querySelector('.dlg-remove');
-                            removeBtn.disabled = true;
-                            removeBtn.innerHTML = `<i class="fas fa-spinner fa-spin"></i>`;
+                        addBtn.onclick = addCustomMirror;
+                        customInput.onkeydown = event => {
+                            if (event.key === 'Enter') { event.preventDefault(); addCustomMirror(); }
+                        };
+                        const loadSettings = async () => {
+                            setEditorDisabled(true);
+                            status.hidden = false;
+                            status.textContent = zh ? '正在读取本地设置…' : 'Reading local settings…';
                             try {
-                                const modeRes = await saveNetworkProfile(mode);
-                                if (!modeRes || modeRes.status !== 'success') {
-                                    throw new Error((modeRes && modeRes.message) || 'network profile update failed');
+                                const [profile, custom] = await Promise.all([fetchDockerNetworkProfile(), fetchCustomMirrors()]);
+                                if (profile?.status !== 'success' || !['auto', 'cn', 'global'].includes(profile.mode)) {
+                                    throw new Error(profile?.message || (zh ? '设置数据无效' : 'Invalid settings response'));
                                 }
-                                const res = await post('/podman/mirror', { mirrors: [] });
-                                if (res.status === 'success') {
-                                    invalidateDockerPanelCache('podman-config', 'podman-info', 'wsl-status');
-                                    closeDlg();
-                                    _showToast(t('docker-mirror-accel-removed'), 'success', 2600);
-                                    setTimeout(() => { loadDockerInfo(); }, 15000);
-                                } else {
-                                    await _showInlineAlert((zh?'失败: ':'Failed: ') + (res.message || ''));
-                                    removeBtn.disabled = false;
-                                    removeBtn.textContent = t('docker-mirror-accel-remove');
+                                if (custom?.status !== 'success' || !Array.isArray(custom.mirrors) || !custom.mirrors.every(value => typeof value === 'string')) {
+                                    throw new Error(custom?.message || (zh ? '自定义镜像源读取失败' : 'Failed to read custom mirrors'));
                                 }
-                            } catch(e) {
-                                await _showInlineAlert((zh?'失败: ':'Failed: ') + e.message);
-                                removeBtn.disabled = false;
-                                removeBtn.textContent = t('docker-mirror-accel-remove');
+                                if (!dlg.isConnected) return;
+                                select.value = profile.mode;
+                                customMirrors = custom.mirrors.slice();
+                                customMirrorsDirty = false;
+                                setEditorDisabled(false);
+                                status.hidden = true;
+                            } catch (error) {
+                                if (!dlg.isConnected) return;
+                                status.textContent = (zh ? '读取失败：' : 'Read failed: ') + error.message + ' ';
+                                const retry = document.createElement('button');
+                                retry.textContent = zh ? '重试' : 'Retry';
+                                retry.onclick = () => { invalidateDockerPanelCache('network-profile', 'custom-mirrors'); loadSettings(); };
+                                status.appendChild(retry);
                             }
                         };
+                        applyBtn.onclick = async () => {
+                            if (!addCustomMirror()) return;
+                            const mode = select.value;
+                            setEditorDisabled(true);
+                            applyBtn.textContent = zh ? '应用中…' : 'Applying…';
+                            try {
+                                if (customMirrorsDirty) {
+                                    const customResult = await post('/podman/custom-mirrors', { mirrors: customMirrors.slice() });
+                                    if (customResult?.status !== 'success') throw new Error(customResult?.message || (zh ? '自定义镜像源保存失败' : 'Failed to save custom mirrors'));
+                                    customMirrorsDirty = false;
+                                    invalidateDockerPanelCache('custom-mirrors');
+                                }
+                                const result = await post('/podman/network-profile', { mode });
+                                if (result?.status !== 'success') throw new Error(result?.message || (zh ? '保存失败' : 'Save failed'));
+                                invalidateDockerPanelCache('network-profile');
+                                showModeStatus(mode);
+                                closeDlg();
+                                _showToast(t('docker-network-mode-saved'), 'success', 2200);
+                                loadDockerInfo();
+                            } catch (error) {
+                                if (!dlg.isConnected) return;
+                                status.hidden = false;
+                                status.textContent = (zh ? '保存失败：' : 'Save failed: ') + error.message;
+                                setEditorDisabled(false);
+                                applyBtn.textContent = t('docker-mirror-accel-apply');
+                            }
+                        };
+                        // Populate the dialog before showing it so loading cannot resize/recenter it.
+                        dlg.style.display = 'none';
                         document.body.appendChild(dlg);
-                        dlg.showModal();
+                        mirrorCard.setAttribute('aria-busy', 'true');
+                        try {
+                            await loadSettings();
+                            if (dlg.isConnected) {
+                                dlg.style.display = 'flex';
+                                dlg.showModal();
+                            }
+                        } finally {
+                            mirrorCard.removeAttribute('aria-busy');
+                        }
                     };
                 }
                 if (isPodmanLoading && isDockerViewActive()) {
@@ -12366,7 +12228,7 @@ function openDockerImagesTab(opts) {
             } catch(e) {
                 console.error('[loadDockerInfo] error:', e);
                 const zh = currentLang === 'zh';
-                infoBar.innerHTML = `<div class="docker-status docker-error" style="padding:12px;"><i class="fas fa-exclamation-triangle"></i> ${zh ? '无法连接 Podman 服务' : 'Cannot connect to Podman service'}<span style="font-size:11px;color:#999;margin-left:8px;">${e.message || e}</span></div>`;
+                infoBar.innerHTML = `<div class="docker-status docker-error" style="padding:12px;"><i class="fas fa-exclamation-triangle"></i> ${zh ? '无法连接 运行环境 服务' : 'Cannot connect to Runtime service'}<span style="font-size:11px;color:#999;margin-left:8px;">${e.message || e}</span></div>`;
             }
         }
         contentEl.__loadDockerInfo = loadDockerInfo;
@@ -12388,9 +12250,11 @@ function openDockerImagesTab(opts) {
             return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
         }
 
-        function _renderContainers(data, translateStatus, zh) {
+        function _renderContainers(data, zh) {
             const containers = data.containers || [];
             if (containers.length === 0) {
+                stopContainerLogStream();
+                _expandedContainerIds.clear();
                 containerList.innerHTML = `<div class="docker-status" style="color:#999;"><i class="fas fa-info-circle"></i> ${zh ? '当前没有容器' : 'No containers'}</div>`;
                 if (_containerStatsTimer) { clearInterval(_containerStatsTimer); _containerStatsTimer = null; }
                 return;
@@ -12406,11 +12270,11 @@ function openDockerImagesTab(opts) {
                     <div class="docker-container-card" data-container-id="${c.full_id}" style="${isExited ? 'opacity:0.7;' : ''}">
                         <div class="docker-container-card-header" data-toggle-stats="${c.full_id}">
                             <div class="docker-container-card-info">
-                                <span class="docker-container-name"><i class="fas fa-cube" style="color:${isExited ? '#999' : '#1976d2'};margin-right:4px;"></i>${c.name}</span>
+                                <span class="docker-container-name"><i class="fas fa-cube" style="color:${isExited ? '#999' : '#e65100'};margin-right:4px;"></i>${c.name}</span>
                                 <span class="docker-container-image" style="color:#888;font-size:11px;margin-left:8px;">${c.image}</span>
                             </div>
                             <div class="docker-container-card-actions">
-                                <span class="docker-container-status-badge status-${c.status}">${translateStatus(c.status)}</span>
+                                <span class="docker-container-status-badge status-${c.status}">${containerStatusLabel(c.status)}</span>
                                 ${c.run_id ? `<span class="docker-container-run-id" style="color:#999;font-size:10px;margin-left:6px;">${c.run_id}</span>` : ''}
                                 ${actionBtn}
                                 <i class="fas fa-chevron-${isExpanded ? 'up' : 'down'}" style="color:#999;font-size:10px;margin-left:4px;"></i>
@@ -12491,71 +12355,40 @@ function openDockerImagesTab(opts) {
             }
         }
 
-        let _bgContainerRefreshInProgress = false;
-        function _refreshContainersBackground(forceFresh = false) {
-            if (_bgContainerRefreshInProgress) return;
-            _bgContainerRefreshInProgress = true;
-            const zh = currentLang === 'zh';
-            const statusMap = {
-                'running': zh ? '运行中' : 'Running',
-                'created': zh ? '已创建' : 'Created',
-                'exited': zh ? '已退出' : 'Exited',
-                'stopped': zh ? '已停止' : 'Stopped',
-                'dead': zh ? '已死亡' : 'Dead',
-                'paused': zh ? '已暂停' : 'Paused',
-                'restarting': zh ? '重启中' : 'Restarting',
-                'removing': zh ? '删除中' : 'Removing'
-            };
-            const translateStatus = (s) => statusMap[s] || s;
-            fetch(auxApiUrl('/podman/containers' + (forceFresh ? '?fresh=1' : ''))).then(r => r.json()).then(data => {
-                if (data.status === 'success') {
-                    _lastContainersData = data;
-                    _lastContainersTime = Date.now();
-                    _renderContainers(data, translateStatus, zh);
-                }
-            }).catch(() => {}).finally(() => { _bgContainerRefreshInProgress = false; });
+        let _containerRefreshPromise = null;
+        let _containerRefreshPending = false;
+        function _refreshContainersBackground() { return loadContainerList(true); }
+
+        function loadContainerList() {
+            _containerRefreshPending = true;
+            if (_containerRefreshPromise) return _containerRefreshPromise;
+            _containerRefreshPromise = (async () => {
+                do {
+                    _containerRefreshPending = false;
+                    await _readContainerList();
+                } while (_containerRefreshPending && contentEl.isConnected);
+            })().finally(() => { _containerRefreshPromise = null; });
+            return _containerRefreshPromise;
         }
 
-        async function loadContainerList(forceFresh = false) {
+        async function _readContainerList() {
             const zh = currentLang === 'zh';
-            const statusMap = {
-                'running': zh ? '运行中' : 'Running',
-                'created': zh ? '已创建' : 'Created',
-                'exited': zh ? '已退出' : 'Exited',
-                'stopped': zh ? '已停止' : 'Stopped',
-                'dead': zh ? '已死亡' : 'Dead',
-                'paused': zh ? '已暂停' : 'Paused',
-                'restarting': zh ? '重启中' : 'Restarting',
-                'removing': zh ? '删除中' : 'Removing'
-            };
-            const translateStatus = (s) => statusMap[s] || s;
-            if (_lastContainersData && !forceFresh) {
-                _renderContainers(_lastContainersData, translateStatus, zh);
-                if (Date.now() - _lastContainersTime > 3000) {
-                    _refreshContainersBackground();
-                }
-                return;
-            }
             const hasExistingContent = containerList.querySelector('.docker-container-card, .docker-status:not(.docker-loading-temp)');
             if (!hasExistingContent) {
                 containerList.innerHTML = `<div class="docker-status docker-loading-temp"><i class="fas fa-spinner fa-spin"></i> ${t('docker-loading')}</div>`;
             }
             try {
-                const resp = await fetch(auxApiUrl('/podman/containers' + (forceFresh ? '?fresh=1' : '')), { signal: AbortSignal.timeout(10000) });
+                const resp = await fetch(auxApiUrl('/podman/containers?fresh=1'), { signal: AbortSignal.timeout(5000), cache: 'no-store' });
                 const data = await resp.json();
                 if (data.status === 'success') {
                     _lastContainersData = data;
                     _lastContainersTime = Date.now();
-                    _renderContainers(data, translateStatus, zh);
-                    if (data.containers && data.containers.length === 0 && !_lastContainersData._retry_count) {
-                        data._retry_count = 1;
-                        setTimeout(() => { _refreshContainersBackground(); }, 2000);
-                    }
+                    _renderContainers(data, currentLang === 'zh');
                 } else {
                     const msg = data.message || '';
                     const isNotRunning = msg.toLowerCase().includes('not running') || msg.toLowerCase().includes('docker') || msg.includes('Podman');
                     if (isNotRunning) {
-                        containerList.innerHTML = `<div class="docker-status" style="color:#ff9800;"><i class="fas fa-hourglass-half"></i> ${zh ? 'Podman 引擎启动中，请稍候...' : 'Podman engine starting, please wait...'}</div>`;
+                        containerList.innerHTML = `<div class="docker-status" style="color:#ff9800;"><i class="fas fa-hourglass-half"></i> ${zh ? '容器引擎启动中，请稍候...' : 'Runtime engine starting, please wait...'}</div>`;
                         setTimeout(() => { if (!_lastContainersData) loadContainerList(); }, 3000);
                     } else {
                         containerList.innerHTML = `<div class="docker-status docker-error"><i class="fas fa-exclamation-triangle"></i> ${zh ? '无法获取容器列表' : 'Failed to list containers'}</div>`;
@@ -12563,7 +12396,7 @@ function openDockerImagesTab(opts) {
                 }
             } catch(e) {
                 console.error('[loadContainerList] error:', e);
-                containerList.innerHTML = `<div class="docker-status" style="color:#ff9800;"><i class="fas fa-hourglass-half"></i> ${zh ? 'Podman 引擎启动中，请稍候...' : 'Podman engine starting, please wait...'}</div>`;
+                containerList.innerHTML = `<div class="docker-status" style="color:#ff9800;"><i class="fas fa-hourglass-half"></i> ${zh ? '容器引擎启动中，请稍候...' : 'Runtime engine starting, please wait...'}</div>`;
                 setTimeout(() => { if (!_lastContainersData) loadContainerList(); }, 3000);
             }
         }
@@ -12597,24 +12430,13 @@ function openDockerImagesTab(opts) {
         }
 
         async function loadContainerDetail(containerId) {
-            const zh = currentLang === 'zh';
-            const statusMap = {
-                'running': zh ? '运行中' : 'Running',
-                'created': zh ? '已创建' : 'Created',
-                'exited': zh ? '已退出' : 'Exited',
-                'stopped': zh ? '已停止' : 'Stopped',
-                'dead': zh ? '已死亡' : 'Dead',
-                'paused': zh ? '已暂停' : 'Paused',
-                'restarting': zh ? '重启中' : 'Restarting',
-                'removing': zh ? '删除中' : 'Removing'
-            };
-            const translateStatus = (s) => statusMap[s] || s;
             const shortId = containerId.substring(0, 12);
             const infoEl = containerList.querySelector(`#container-info-${shortId}`);
             if (!infoEl) return;
             try {
-                const resp = await fetch(auxApiUrl(`/podman/containers/${containerId}/detail`));
+                const resp = await fetch(auxApiUrl(`/podman/containers/${containerId}/detail`), { signal: AbortSignal.timeout(5000) });
                 const data = await resp.json();
+                const zh = currentLang === 'zh';
                 if (data.status !== 'success') {
                     infoEl.innerHTML = `<div style="color:#999;font-size:11px;">${zh ? '无法获取容器详情' : 'Detail unavailable'}</div>`;
                     return;
@@ -12636,14 +12458,14 @@ function openDockerImagesTab(opts) {
                     <div class="docker-info-grid">
                         <div class="docker-info-row"><span class="docker-info-key">${zh ? '名称' : 'Name'}</span><span class="docker-info-val">${escapeHtml(c.name)}</span></div>
                         <div class="docker-info-row"><span class="docker-info-key">${zh ? '镜像' : 'Image'}</span><span class="docker-info-val">${escapeHtml(c.image)}</span></div>
-                        <div class="docker-info-row"><span class="docker-info-key">${zh ? '状态' : 'Status'}</span><span class="docker-info-val"><span class="docker-container-status-badge status-${c.runtime?.status || 'unknown'}" style="font-size:10px;">${translateStatus(c.runtime?.status || 'unknown')}</span></span></div>
+                        <div class="docker-info-row"><span class="docker-info-key">${zh ? '状态' : 'Status'}</span><span class="docker-info-val"><span class="docker-container-status-badge status-${c.runtime?.status || 'unknown'}" style="font-size:10px;">${containerStatusLabel(c.runtime?.status || 'unknown')}</span></span></div>
                         ${c.command ? `<div class="docker-info-row"><span class="docker-info-key">${zh ? '命令' : 'Command'}</span><span class="docker-info-val docker-info-cmd">${escapeHtml(c.command)}</span></div>` : ''}
                         ${portsHtml ? `<div class="docker-info-row"><span class="docker-info-key">${zh ? '端口' : 'Ports'}</span><span class="docker-info-val">${portsHtml}</span></div>` : ''}
                         ${mountsHtml ? `<div class="docker-info-row"><span class="docker-info-key">${zh ? '挂载' : 'Mounts'}</span><span class="docker-info-val">${mountsHtml}</span></div>` : ''}
                         ${c.created ? `<div class="docker-info-row"><span class="docker-info-key">${zh ? '创建时间' : 'Created'}</span><span class="docker-info-val">${escapeHtml(c.created.substring(0, 19).replace('T', ' '))}</span></div>` : ''}
                     </div>`;
             } catch(e) {
-                infoEl.innerHTML = `<div style="color:#999;font-size:11px;">${zh ? '容器详情加载失败' : 'Detail load failed'}</div>`;
+                infoEl.innerHTML = `<div style="color:#999;font-size:11px;">${currentLang === 'zh' ? '容器详情加载失败' : 'Detail load failed'}</div>`;
             }
         }
 
@@ -12655,6 +12477,7 @@ function openDockerImagesTab(opts) {
         }
 
         function startContainerStatsStream(containerId) {
+            if (!contentEl.isConnected || !isDockerViewActive() || document.hidden) return;
             const shortId = containerId.substring(0, 12);
 
             if (_containerStatsEventSource) {
@@ -12737,6 +12560,9 @@ function openDockerImagesTab(opts) {
                 es.onerror = () => {
                     es.close();
                     _containerStatsEventSource = null;
+                    const grid = containerList.querySelector(`#container-stats-grid-${shortId}`);
+                    if (grid) grid.textContent = currentLang === 'zh' ? '统计连接已中断' : 'Statistics connection interrupted';
+                    loadContainerList(true);
                 };
             } catch(e) {}
         }
@@ -12746,68 +12572,47 @@ function openDockerImagesTab(opts) {
         // Load local Docker images
         let _lastLocalImagesData = null;
         let _lastLocalImagesTime = 0;
-        let _bgRefreshInProgress = false;
-
-        function _refreshLocalImagesBackground() {
-            if (_bgRefreshInProgress) return;
-            _bgRefreshInProgress = true;
-            fetch(auxApiUrl('/podman/images'), { cache: 'no-store' }).then(r => r.json()).then(data => {
-                if (data.loading) {
-                    setTimeout(() => { if (isDockerViewActive()) _refreshLocalImagesBackground(); }, 3000);
-                    return;
-                }
-                if (data.images) {
-                    _lastLocalImagesData = data;
-                    _lastLocalImagesTime = Date.now();
-                    _renderLocalImagesTable(data);
-                }
-            }).catch(() => {}).finally(() => { _bgRefreshInProgress = false; });
-        }
-
-        async function loadLocalImages() {
-            if (_lastLocalImagesData) {
-                _renderLocalImagesTable(_lastLocalImagesData);
-                if (Date.now() - _lastLocalImagesTime > 3000) {
-                    _refreshLocalImagesBackground();
-                }
-                return;
+        let imageRequest = null, imageRefreshAgain = false, imageRetryTimer = null;
+        let imageRetryDelay = 1000;
+        let imageRenderKey = '';
+        function _refreshLocalImagesBackground() { return loadLocalImages(true); }
+        function loadLocalImages(force = false) {
+            if (!contentEl.isConnected) return Promise.resolve();
+            if (imageRequest) {
+                if (force) imageRefreshAgain = true;
+                return imageRequest;
             }
-            const hasExistingContent = localList.querySelector('table, .docker-status:not(.docker-loading-temp)');
-            if (!hasExistingContent) {
-                localList.innerHTML = `<div class="docker-status docker-loading-temp"><i class="fas fa-spinner fa-spin"></i> ${t('docker-loading')}</div>`;
-            }
-            try {
-                const resp = await fetch(auxApiUrl('/podman/images'), { cache: 'no-store', signal: AbortSignal.timeout(10000) });
-                const data = await resp.json();
-                if (data.loading) {
-                    localList.innerHTML = `<div class="docker-status" style="color:#ff9800;"><i class="fas fa-hourglass-half"></i> ${zh ? 'Podman 引擎部署中，请稍候...' : 'Podman engine deployment in progress, please wait...'}</div>`;
-                    setTimeout(() => { if (!_lastLocalImagesData && isDockerViewActive()) loadLocalImages(); }, 3000);
-                    return;
-                }
-                if (data.status === 'error') {
-                    const msg = (data.message || '').toLowerCase();
-                    const isNotRunning = msg.includes('not running') || msg.includes('podman') || msg.includes('docker');
-                    if (isNotRunning) {
-                        localList.innerHTML = `<div class="docker-status" style="color:#ff9800;"><i class="fas fa-hourglass-half"></i> ${zh ? 'Podman 引擎启动中，请稍候...' : 'Podman engine starting, please wait...'}</div>`;
-                        setTimeout(() => { if (!_lastLocalImagesData) loadLocalImages(); }, 3000);
-                    } else {
-                        localList.innerHTML = `<div class="docker-status docker-error"><i class="fas fa-exclamation-triangle"></i> ${data.message || t('docker-not-running')}</div>`;
+            if (!force && _lastLocalImagesData && Date.now() - _lastLocalImagesTime < 3000) return Promise.resolve();
+            clearTimeout(imageRetryTimer);
+            imageRequest = (async () => {
+                try {
+                    const data = await readStatusJson('/podman/images');
+                    if (!contentEl.isConnected) return;
+                    if (data.status === 'error') throw new Error(data.message || t('docker-not-running'));
+                    if (!data.loading) {
+                        const key = JSON.stringify([data.images, currentLang, allPlugins.map(p => [p.id, p.name, p.docker_image])]);
+                        _lastLocalImagesData = data;
+                        _lastLocalImagesTime = data.refreshing ? 0 : Date.now();
+                        if (!data.refreshing) imageRetryDelay = 1000;
+                        if (key !== imageRenderKey) { _renderLocalImagesTable(data); imageRenderKey = key; }
+                    } else if (!_lastLocalImagesData) {
+                        localList.textContent = currentLang === 'zh' ? '容器引擎部署中，请稍候…' : 'Runtime engine deployment in progress…';
                     }
-                    return;
+                    if (data.loading || data.refreshing) {
+                        imageRetryTimer = setTimeout(() => {
+                            if (contentEl.isConnected && isDockerViewActive()) loadLocalImages(true);
+                        }, data.refreshing ? imageRetryDelay : 3000);
+                        imageRetryDelay = Math.min(10000, imageRetryDelay * 2);
+                    }
+                } catch(error) {
+                    if (!contentEl.isConnected) return;
+                    if (!_lastLocalImagesData) localList.textContent = String(error.message || error);
                 }
-                _lastLocalImagesData = data;
-                _lastLocalImagesTime = Date.now();
-                _renderLocalImagesTable(data);
-                if (data.images && data.images.length === 0 && !_lastLocalImagesData._retry_count) {
-                    data._retry_count = 1;
-                    setTimeout(() => { _refreshLocalImagesBackground(); }, 2000);
-                }
-            } catch(e) {
-                console.error('[loadLocalImages] error:', e);
-                const zh = currentLang === 'zh';
-                localList.innerHTML = `<div class="docker-status" style="color:#ff9800;"><i class="fas fa-hourglass-half"></i> ${zh ? 'Podman 引擎启动中，请稍候...' : 'Podman engine starting, please wait...'}</div>`;
-                setTimeout(() => { if (!_lastLocalImagesData) loadLocalImages(); }, 3000);
-            }
+            })().finally(() => {
+                imageRequest = null;
+                if (imageRefreshAgain) { imageRefreshAgain = false; loadLocalImages(true); }
+            });
+            return imageRequest;
         }
 
         function _renderLocalImagesTable(data) {
@@ -12868,14 +12673,14 @@ function openDockerImagesTab(opts) {
                         const displayText = getPluginText(n);
                         return `<span class="docker-plugin-badge" data-name-zh="${escapeHtml(zh2)}" data-name-en="${escapeHtml(en)}" data-plugin-id="${escapeHtml(info.id)}" title="${escapeHtml(displayText)}">${escapeHtml(displayText)}</span>`;
                     }).join('')
-                    : `<span style="color:#999;font-size:12px;">${currentLang==='zh'?'无':'None'}</span>`;
+                    : `<span style="color:#999;font-size:12px;">${img.is_builtin_r_environment ? (currentLang==='zh'?'内置 R 环境（所有 R 插件共用）':'Built-in R environment (shared by R plugins)') : (currentLang==='zh'?'无':'None')}</span>`;
                 const pluginCellHtml = matchedPlugins.length > 0
                     ? `<div class="docker-badges-wrap">${pluginBadges}<span class="docker-badges-ellipsis" style="display:none" title="${currentLang==='zh'?'展开':'Expand'}">${currentLang==='zh'?'展开':'Expand'}</span></div>`
                     : pluginBadges;
-                const actionHtml = `<button class="docker-del-btn" data-id="${escapeHtml(img.id)}" data-repo="${escapeHtml(img.local_ref || img.original_ref || img.original_repo || img.repo)}" title="${t('docker-delete-btn')}"><i class="fas fa-trash-alt"></i> ${t('docker-delete-btn')}</button>`;
+                const actionHtml = `<button class="docker-del-btn" data-r-environment="${img.is_builtin_r_environment ? '1' : '0'}" data-id="${escapeHtml(img.id)}" data-repo="${escapeHtml(img.local_ref || img.original_ref || img.original_repo || img.repo)}" title="${t('docker-delete-btn')}"><i class="fas fa-trash-alt"></i> ${t('docker-delete-btn')}</button>`;
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
-                    <td class="docker-img-name" data-image-repo="${escapeHtml(displayName)}" data-image-tag="${escapeHtml(img.tag || '')}" data-image-full="${escapeHtml(fullName)}" title="${escapeHtml(imageTooltip)}"><i class="fas fa-cube" style="color:#90a4ae;margin-right:6px;font-size:11px"></i>${escapeHtml(displayName)}</td>
+                    <td class="docker-img-name" data-image-repo="${escapeHtml(displayName)}" data-image-tag="${escapeHtml(img.tag || '')}" data-image-full="${escapeHtml(fullName)}" title="${escapeHtml(imageTooltip)}"><i class="fas fa-cube" style="color:#e65100;margin-right:6px;font-size:11px"></i>${escapeHtml(displayName)}</td>
                     <td class="docker-plugins-col">${pluginCellHtml}</td>
                     <td class="docker-img-size" style="text-align:center">${img.size}</td>
                     <td style="text-align:center">${actionHtml}</td>
@@ -12908,7 +12713,11 @@ function openDockerImagesTab(opts) {
                 btn.onclick = async () => {
                     const imageId = btn.dataset.id;
                     const imageRepo = btn.dataset.repo || '';
-                    const ok = await _showInlineConfirm(t('docker-confirm-delete'), {
+                    const builtinR = btn.dataset.rEnvironment === '1';
+                    const warning = builtinR ? (currentLang === 'zh'
+                        ? '这是内置 R 运行环境。确定删除吗？删除后 R 分析将暂不可用，已有 R 包和分析结果不会删除。软件会先保存离线恢复归档（需要额外磁盘空间），失败则不会删除。之后可在 R 环境窗口恢复。'
+                        : 'Delete the built-in R environment? R analyses will be unavailable until restored. Packages and results are preserved. An offline recovery archive will be saved first (requires disk space); deletion is cancelled if this fails. Restore it from the R environment dialog.') : t('docker-confirm-delete');
+                    const ok = await _showInlineConfirm(warning, {
                         title: currentLang === 'zh' ? '删除镜像' : 'Delete Image',
                         okText: currentLang === 'zh' ? '删除' : 'Delete',
                         cancelText: currentLang === 'zh' ? '取消' : 'Cancel',
@@ -12918,8 +12727,9 @@ function openDockerImagesTab(opts) {
                     btn.disabled = true;
                     btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
                     try {
-                        const res = await post('/podman/images/remove', { image_id: imageId, repo: imageRepo }, 60000);
+                        const res = await post('/podman/images/remove', { image_id: imageId, repo: imageRepo, confirm_r_environment: builtinR }, builtinR ? 1800000 : 60000);
                         if (res.status === 'success') {
+                            if (res.r_environment_removed) showRImageInstallDialog('', () => loadLocalImages());
                             _lastLocalImagesData = null;
                             _lastLocalImagesTime = 0;
                             await loadLocalImages();
@@ -12977,9 +12787,7 @@ function openDockerImagesTab(opts) {
                         try {
                             const res = await post('/uninstall-plugin', { pluginId });
                             if (res.status === 'success') {
-                                const resp2 = await fetch(API_BASE + '/plugins');
-                                const data2 = await resp2.json();
-                                allPlugins = data2.plugins || [];
+                                await init();
                                 loadLocalImages();
                             } else {
                                 await _showInlineAlert((currentLang==='zh'?'卸载失败：':'Uninstall failed: ') + (res.message || ''));
@@ -13173,7 +12981,7 @@ function openDockerImagesTab(opts) {
                     const official = r.is_official ? `<span class="docker-official"><i class="fas fa-check-circle"></i> Official</span>` : '';
                     card.innerHTML = `
                         <div class="docker-search-card-header">
-                            <span class="docker-search-name"><i class="fas fa-cube" style="color:#1976d2;margin-right:4px"></i>${escapeHtml(resultImageRef)}</span>
+                            <span class="docker-search-name"><i class="fas fa-cube" style="color:#e65100;margin-right:4px"></i>${escapeHtml(resultImageRef)}</span>
                             <span class="docker-search-size" style="color:#888;font-size:12px;margin-left:6px;"><i class="fas fa-spinner fa-spin" style="font-size:10px;"></i></span>
                             ${official}
                             <span class="docker-stars"><i class="fas fa-star"></i> ${stars}</span>
@@ -13347,12 +13155,21 @@ function openDockerImagesTab(opts) {
         let _dockerEventsDebounce = null;
         let _dockerEventsReconnectTimer = null;
         let _dockerEventsReconnectDelay = 3000;
+        let _pendingContainerRefresh = false;
+        let _pendingImageRefresh = false;
+        let _pendingForceFresh = false;
 
         function _dockerEventsNeeded() {
             return contentEl.isConnected && isDockerViewActive() && !document.hidden;
         }
 
         function _stopDockerEventsListener() {
+            stopContainerLogStream();
+            if (_dockerEventsDebounce) {
+                clearTimeout(_dockerEventsDebounce);
+                _dockerEventsDebounce = null;
+            }
+            _pendingContainerRefresh = _pendingImageRefresh = _pendingForceFresh = false;
             if (_dockerEventsReconnectTimer) {
                 clearTimeout(_dockerEventsReconnectTimer);
                 _dockerEventsReconnectTimer = null;
@@ -13373,18 +13190,30 @@ function openDockerImagesTab(opts) {
             }, delay);
         }
         function _onDockerEvent(evt) {
-            if (_dockerEventsDebounce) clearTimeout(_dockerEventsDebounce);
+            const action = String(evt?.Action || evt?.action || '').toLowerCase();
+            const type = String(evt?.Type || evt?.type || '').toLowerCase();
+            if (type === 'container') {
+                _pendingContainerRefresh = true;
+                _pendingForceFresh = true;
+            } else if (type === 'image') {
+                _pendingImageRefresh = true;
+                _lastLocalImagesTime = 0;
+                statusResources['r-runtime'].invalidate();
+            } else return;
+            // Keep a fixed flush deadline: continuous events must not starve updates.
+            if (_dockerEventsDebounce) return;
             _dockerEventsDebounce = setTimeout(() => {
                 _dockerEventsDebounce = null;
-                const action = (evt && (evt.Action || evt.action) || '').toLowerCase();
-                const typ = (evt && (evt.Type || evt.type) || '').toLowerCase();
-                const forceFresh = typ === 'container' && /die|stop|destroy|remove|rm|cleanup/.test(action);
+                const containers = _pendingContainerRefresh, images = _pendingImageRefresh;
+                const forceFresh = _pendingForceFresh;
+                _pendingContainerRefresh = _pendingImageRefresh = _pendingForceFresh = false;
+                if (!_dockerEventsNeeded()) return;
                 if (forceFresh) {
                     _lastContainersData = null;
                     _lastContainersTime = 0;
                 }
-                loadContainerList(forceFresh);
-                loadLocalImages();
+                if (containers) loadContainerList(forceFresh);
+                if (images) loadLocalImages();
             }, 250);
         }
         function _startDockerEventsListener() {
@@ -13393,11 +13222,15 @@ function openDockerImagesTab(opts) {
                 _dockerEventsSource = new EventSource(auxApiUrl('/podman/events'));
                 _dockerEventsSource.onopen = () => {
                     _dockerEventsReconnectDelay = 3000;
+                    loadContainerList(true);
+                    _lastLocalImagesTime = 0;
+                    loadLocalImages();
                 };
                 _dockerEventsSource.onmessage = (event) => {
                     try {
                         const evt = JSON.parse(event.data);
-                        if (evt.type === 'heartbeat' || evt.type === 'hello') return;
+                        if (evt.type === 'hello') return;
+                        if (evt.type === 'heartbeat') { loadContainerList(true); return; }
                         const action = evt.Action || evt.action || '';
                         const typ = evt.Type || evt.type || '';
                         if (typ === 'container' || typ === 'image') {
@@ -13424,6 +13257,21 @@ function openDockerImagesTab(opts) {
             document.addEventListener('visibilitychange', contentEl._dockerVisibilityHandler);
         }
         _startDockerEventsListener();
+        viewStatus.bind(contentEl, ['plugins', 'r-runtime', 'runtime'], () => {
+            _lastLocalImagesData = null;
+            _lastLocalImagesTime = 0;
+            _lastDockerInfoData = null;
+            _lastDockerInfoTime = 0;
+            invalidateDockerPanelCache();
+            return Promise.allSettled([loadLocalImages(true), loadDockerInfo()]);
+        }, () => {
+            _stopDockerEventsListener();
+            clearTimeout(imageRetryTimer);
+            if (_containerStatsEventSource) _containerStatsEventSource.close();
+            window.removeEventListener('resize', contentEl._dockerResizeHandler);
+            window.removeEventListener('app-tab-switched', contentEl._dockerTabSwitchHandler);
+            document.removeEventListener('visibilitychange', contentEl._dockerVisibilityHandler);
+        });
     }, opts);
 }
 
@@ -13478,6 +13326,7 @@ function _tabIdFromElement(tabEl) {
 }
 
 function _refreshTabSelection() {
+    if (!tabBar) return; // Standalone editor windows have no application tab bar.
     tabBar.querySelectorAll('.tab').forEach(tabEl => {
         tabEl.classList.toggle('tab-selected', _selectedTabIds.has(_tabIdFromElement(tabEl)));
     });
@@ -13979,85 +13828,6 @@ function _restoreTabRunState(tabId) {
         return;
     }
 
-    // Java app install gate (native_gui + java_app)
-    if (p.run_mode === 'native_gui' && p.java_app && !p.is_installed) {
-        const kernelText = (currentLang === 'zh')
-            ? `☕ 将 <b>${p.main_jar}</b> 拖到此处安装<br><span style="font-size:12px;color:#999;">支持 .jar / .zip 压缩包</span>`
-            : `☕ Drop <b>${p.main_jar}</b> here to install<br><span style="font-size:12px;color:#999;">Supports .jar / .zip archives</span>`;
-        container.innerHTML += `<div class="kernel-zone">${kernelText}</div>`;
-        const zone = container.querySelector('.kernel-zone');
-        let installPollTimer = null;
-
-        const renderInstallProgress = (progress, message) => {
-            const pct = Math.max(0, Math.min(100, Number(progress) || 0));
-            const msg = message || (currentLang === 'zh' ? '正在安装...' : 'Installing...');
-            zone.innerHTML = `
-                <div style="display:flex;align-items:center;gap:10px;justify-content:center;color:#ef6c00;font-size:28px;">
-                    <i class="fas fa-cog fa-spin"></i>
-                    <span style="font-size:18px;font-weight:700;">${msg}</span>
-                </div>
-                <div style="max-width:680px;margin:14px auto 2px;">
-                    <div style="height:12px;border-radius:999px;background:#ffe0b2;border:1px solid #ffcc80;overflow:hidden;">
-                        <div style="height:100%;width:${pct}%;background:linear-gradient(90deg,#ff9800,#fb8c00);transition:width .28s ease;"></div>
-                    </div>
-                    <div style="margin-top:7px;text-align:center;color:#8d6e63;font-size:12px;">${pct}%</div>
-                </div>`;
-        };
-
-        const clearInstallPoll = () => {
-            if (installPollTimer) { clearInterval(installPollTimer); installPollTimer = null; }
-        };
-
-        zone.ondragover = e => { e.preventDefault(); zone.style.borderColor = '#2196F3'; zone.style.background = '#e3f2fd'; };
-        zone.ondragleave = e => { zone.style.borderColor = ''; zone.style.background = ''; };
-        zone.ondrop = async e => {
-            e.preventDefault();
-            zone.style.borderColor = ''; zone.style.background = '';
-            const file = e.dataTransfer.files[0];
-            if (!file || !file.path) { alert('无法获取文件路径'); return; }
-            renderInstallProgress(1, currentLang === 'zh' ? '准备安装...' : 'Preparing install...');
-            const startRes = await post('/setup-plugin-binary-start', { pluginId: p.id, zipPath: file.path });
-            if (!startRes || startRes.status !== 'success' || !startRes.job_id) {
-                zone.innerHTML = kernelText;
-                alert(t('failed_prefix') + ((startRes && startRes.message) || 'start install failed'));
-                return;
-            }
-            const jobId = startRes.job_id;
-            clearInstallPoll();
-            installPollTimer = setInterval(async () => {
-                try {
-                    const resp = await fetch(`${API_BASE}/setup-plugin-binary-status?job_id=${encodeURIComponent(jobId)}`);
-                    const stat = await resp.json();
-                    if (!stat || stat.status !== 'success' || !stat.job) return;
-                    const st = stat.job.status || 'running';
-                    const pct = Number(stat.job.progress) || 0;
-                    const msg = stat.job.message || (currentLang === 'zh' ? '正在安装...' : 'Installing...');
-                    renderInstallProgress(pct, msg);
-                    if (st === 'success') {
-                        clearInstallPoll();
-                        renderInstallProgress(100, currentLang === 'zh' ? '安装完成' : 'Install complete');
-                        _showToast(t('install_success_reopen'), 'success', 3000);
-                        await init();
-                        const tabId = activeTabId;
-                        if (tabId && tabs[tabId]) {
-                            const refreshedPlugins = allPlugins || [];
-                            const newCfg = refreshedPlugins.find(pp => pp.id === p.id);
-                            if (newCfg) {
-                                const inst = tabs[tabId];
-                                inst.config = JSON.parse(JSON.stringify(newCfg));
-                                renderPluginUI(inst, container);
-                            }
-                        }
-                    } else if (st === 'failed') {
-                        clearInstallPoll();
-                        zone.innerHTML = kernelText;
-                        alert(t('failed_prefix') + (stat.job.error || stat.job.message || 'install failed'));
-                    }
-                } catch (err) {}
-            }, 350);
-        };
-        return;
-    }
     btn.disabled = true;
     if (rs.type === 'linux') {
         btn.innerHTML = '<i class="fas fa-spinner fa-spin" style="margin-right:6px;"></i>' + (currentLang === 'zh' ? '运行中...' : 'Running...');
@@ -14108,6 +13878,7 @@ window.closeTab = function(tabId, event) {
         }
     }
 
+    if (view) viewStatus.dispose(view);
     if (btn) btn.remove();
     if (view && tabId !== 'welcome') view.remove();
     for (const [runId, targetTabId] of runLogTargets.entries()) {
@@ -14533,6 +14304,7 @@ function syncRInstallAllButtonLabel(button) {
 }
 
 function renderRPanelUI(instance, container) {
+    viewStatus.dispose(container);
     const p = instance.config;
     if (!Array.isArray(p.parameters)) p.parameters = [];
     let requiredPkgs = p.packages || [];
@@ -14601,7 +14373,7 @@ function renderRPanelUI(instance, container) {
                 </div>
                 <div class="r-pkg-body">
                     <div class="r-pkg-grid"></div>
-                    <div class="r-install-log"></div>
+                    <div class="r-install-log" data-auto-close-log="true"></div>
                 </div>
             </div>
 
@@ -14782,35 +14554,40 @@ function renderRPanelUI(instance, container) {
     };
 
     // ------ R Docker Runtime ------
+    let rPreparationTimer = null;
     async function checkRuntime() {
-        runtimeStatus.innerHTML = `<span style="color:#78909c;font-size:12px;"><i class="fas fa-spinner fa-spin"></i> ${currentLang==='zh'?'正在检测 R 镜像...':'Checking R image...'}</span>`;
+        clearTimeout(rPreparationTimer);
         try {
-            const res = await fetch(API_BASE + '/r/check-runtime', { cache: 'no-store' });
-            const j = await res.json();
-            if (j.status === 'success') {
-                runtimeStatus.innerHTML = `<span style="color:#66bb6a;font-size:12px;"><i class="fas fa-cube"></i> <i class="fas fa-check-circle"></i> ${currentLang==='zh'?'R 镜像已就绪':'R image ready'}</span>`;
-                if (j.repos) {
-                    const selectedRepoMode = j.repo_mode || j.repos;
-                    mirrorSelect.querySelectorAll('option').forEach(o => { if (o.value === selectedRepoMode) o.selected = true; });
-                }
-            } else if (j.status === 'image_missing') {
-                const imageName = j.docker_image || 'rocker/r-ver:4.6.1 (digest pinned)';
-                runtimeStatus.innerHTML = `<span class="r-image-missing-hint" style="color:#9e9e9e;font-size:12px;cursor:pointer;text-decoration:underline dotted;" title="${currentLang==='zh'?'点击安装 R 镜像':'Click to install R image'}"><i class="fas fa-cube"></i> <i class="fas fa-exclamation-circle"></i> ${currentLang==='zh'?'R 镜像未安装 (点击安装)':'R image not installed (click to install)'}</span>`;
-                runtimeStatus.querySelector('.r-image-missing-hint').onclick = () => {
-                    showRImageInstallDialog(imageName, async () => {
-                        await checkRuntime();
-                        await loadPackages(true);
-                    });
-                };
-                rlog(currentLang==='zh' ? `⚠ R Docker 镜像 ${imageName} 未安装，可前往镜像管理或使用备用下载安装` : `⚠ R Docker image ${imageName} is not installed; use Image Manager or Backup Download`);
-            } else {
-                runtimeStatus.innerHTML = `<span style="color:#ef5350;font-size:12px;"><i class="fas fa-times-circle"></i> ${currentLang==='zh'?'Podman 未启动或 R 镜像不可用':'Podman not running or R image unavailable'}</span>`;
-                rlog('❌ ' + j.message);
-                return false;
+            const j = await fetchRRuntimeStatus();
+            if (!runtimeStatus.isConnected) return false;
+            runtimeStatus.onclick = null;
+            runtimeStatus.title = '';
+            const zh = currentLang === 'zh';
+            if (j.ready || j.status === 'success') {
+                runtimeStatus.innerHTML = `<span style="color:#66bb6a;font-size:12px;"><i class="fas fa-check-circle"></i> ${zh?'R 环境就绪':'R environment ready'}</span>`;
+                runtimeStatus.onclick = () => showRImageInstallDialog('', checkRuntime);
+                runtimeStatus.style.cursor = 'pointer';
+                if (j.repo_mode || j.repos) mirrorSelect.value = j.repo_mode || j.repos;
+                return true;
             }
-            return j.status === 'success';
-        } catch(e) {
-            runtimeStatus.innerHTML = `<span style="color:#ef5350;font-size:12px;"><i class="fas fa-times-circle"></i> ${currentLang==='zh'?'无法连接后端':'Backend offline'}</span>`;
+            if (j.runtime_state === 'attention') {
+                runtimeStatus.innerHTML = `<button class="r-environment-repair">${zh?'R 环境需处理':'R environment needs attention'}</button>`;
+                runtimeStatus.title = j.message || '';
+                runtimeStatus.querySelector('button').onclick = () => showRImageInstallDialog('', checkRuntime);
+            } else {
+                const phase = j.preparation?.phase;
+                const deploying = ['verifying-archive', 'importing', 'validating', 'validating-existing'].includes(phase);
+                const label = deploying
+                    ? (zh ? '正在完成 R 环境安装验证…' : 'Completing R installation verification…')
+                    : (zh ? '正在连接 R 运行环境…' : 'Connecting to R environment…');
+                runtimeStatus.innerHTML = `<span style="color:#78909c;font-size:12px;"><i class="fas fa-spinner fa-spin"></i> ${label}</span>`;
+                if (runtimeStatus.isConnected && !document.hidden && container.closest('.page-view.active')) rPreparationTimer = setTimeout(() => {
+                    if (runtimeStatus.isConnected && !document.hidden && container.closest('.page-view.active')) checkRuntime();
+                }, document.hidden ? 10000 : 1500);
+            }
+            return false;
+        } catch (error) {
+            runtimeStatus.textContent = currentLang === 'zh' ? '无法连接后端' : 'Backend unavailable';
             return false;
         }
     }
@@ -14821,16 +14598,12 @@ function renderRPanelUI(instance, container) {
         try {
             const r = await fetch(API_BASE + '/r/set-repo', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({repo})});
             const j = await r.json();
-            if (j.status==='success') rlog((currentLang==='zh'?'镜像已切换为: ':'Mirror set to: ') + j.repos);
+            if (j.status==='success') {
+                notifyStatusChanged('r-runtime');
+                rlog((currentLang==='zh'?'镜像已切换为: ':'Mirror set to: ') + (j.repos || (currentLang==='zh'?'自动选择（后台测速中）':'Auto (testing in background)')));
+            }
         } catch(e) { rlog('Error: '+e); }
     };
-    // Auto-sync default mirror to backend on panel load
-    (async () => {
-        try {
-            await fetch(API_BASE + '/r/set-repo', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({repo: mirrorSelect.value})});
-        } catch(e) {}
-    })();
-
     // ------ Packages ------
     async function scanDeps() {
         try {
@@ -14847,17 +14620,32 @@ function renderRPanelUI(instance, container) {
             }
         } catch(e){}
     }
+    let packageLoadSequence = 0;
+    let packageRenderKey = '';
     async function loadPackages(skipScanDeps) {
+        const sequence = ++packageLoadSequence;
         if (!skipScanDeps) await scanDeps();
         let installed = _lastKnownInstalled; // fallback to last known on error
         try {
-            const r = await fetch(API_BASE + '/r/list-packages');
-            const j = await r.json();
+            const j = await fetchRPackages();
+            if (!container.isConnected || sequence !== packageLoadSequence) return;
             if (j.status==='success') {
                 installed = (j.packages||[]).map(x=>x.package);
                 _lastKnownInstalled = installed;
             }
-        } catch(e){}
+        } catch(e){
+            const button = container.querySelector('.r-install-all-btn');
+            if (button && !_lastKnownInstalled.length) {
+                button.dataset.state = 'retry';
+                syncRInstallAllButtonLabel(button);
+                button.onclick = () => loadPackages(true);
+            }
+            return;
+        }
+        if (!container.isConnected || sequence !== packageLoadSequence) return;
+        const renderKey = JSON.stringify([requiredPkgs, installed, currentLang]);
+        if (renderKey === packageRenderKey && !container.querySelector('.r-pkg-btn .fa-spinner')) return;
+        packageRenderKey = renderKey;
 
         // Update Install All button state
         const installAllBtn = container.querySelector('.r-install-all-btn');
@@ -14913,6 +14701,7 @@ function renderRPanelUI(instance, container) {
             }
             else {
                 rlog((currentLang==='zh'?'安装失败: ':'Install failed: ')+j.message, true);
+                finishAutoCloseInstallLog(installLogEl, {...j, state:'failed'});
                 btn.dataset.busy = '0';
                 btn.disabled = false;
                 btn.classList.remove('rpkg-btn-busy');
@@ -14921,35 +14710,13 @@ function renderRPanelUI(instance, container) {
             }
         } catch(e){
             rlog('Error: '+e, true);
+            finishAutoCloseInstallLog(installLogEl, {state:'failed', message:String(e)});
             btn.dataset.busy = '0';
             btn.disabled = false;
             btn.classList.remove('rpkg-btn-busy');
             btn.innerHTML = currentLang==='zh'?'一键安装':'Install';
             scheduleWebContentsFocusRestore('r-plugin-install-exception');
         }
-    }
-
-    function appendInstallLogLine(logBody, line, maxLines) {
-        if (!logBody || !line) return;
-        if (!logBody._seenInstallLogLines) logBody._seenInstallLogLines = new Set();
-        const key = String(line);
-        if (logBody._seenInstallLogLines.has(key)) return;
-        logBody._seenInstallLogLines.add(key);
-        if (logBody._seenInstallLogLines.size > 1000) logBody._seenInstallLogLines.clear();
-        const cls = line.includes('ERROR') || line.includes('ERR:') || line.includes('VERIFY_FAIL')
-            ? 'color:#e53935'
-            : (line.includes('VERIFY_OK') || line.includes('SUCCESS:') ? 'color:#2e7d32;font-weight:bold' : '');
-        logBody.innerHTML += `<div class="r-install-log-line" style="${cls}">${escapeHtml(line)}</div>`;
-        while (logBody.children.length > (maxLines || 250)) logBody.removeChild(logBody.firstChild);
-        installLogEl.scrollTop = installLogEl.scrollHeight;
-    }
-
-    function syncInstallLogFromStatus(logBody, lines, maxLines) {
-        if (!logBody || !Array.isArray(lines)) return;
-        const seen = Number(logBody.dataset.syncedLines || '0') || 0;
-        const fresh = lines.slice(seen);
-        fresh.forEach(line => appendInstallLogLine(logBody, line, maxLines));
-        logBody.dataset.syncedLines = String(lines.length);
     }
 
     function setPackageButtonsInstalling(installing) {
@@ -14993,15 +14760,13 @@ function renderRPanelUI(instance, container) {
                         try {
                             const d = JSON.parse(ev.data);
                             if (d.type === 'log' && d.line) {
-                                appendInstallLogLine(logBody, d.line, 300);
+                                appendArchivedInstallEvent(logBody, d, 300);
                             }
                         } catch(e){}
                     };
-                    const statusTimer = setInterval(async () => {
+                    const statusTimer = setNonOverlappingInterval(async () => {
                         try {
-                            const r2 = await fetch(auxApiUrl('/r/install-status?job_id='+encodeURIComponent(j.job_id)), { cache: 'no-store' });
-                            const j2 = await r2.json();
-                            syncInstallLogFromStatus(logBody, j2.log || [], 300);
+                            const j2 = await readInstallStatus(j.job_id, logBody);
                             if(j2.state==='done'||j2.state==='failed'){
                                 clearInterval(statusTimer);
                                 es.close();
@@ -15015,15 +14780,17 @@ function renderRPanelUI(instance, container) {
                                     installAllBtn.style.pointerEvents = 'auto';
                                 }
                                 scheduleWebContentsFocusRestore('r-plugin-batch-install-finished');
-                                setTimeout(()=>{installLogEl.style.display='none';}, 4000);
-                                setTimeout(()=>loadPackages(true), 2000);
+                                finishAutoCloseInstallLog(installLogEl, {...j2, run_id:j2.run_id || j.run_id}, logBody);
+                                packageRenderKey = '';
+                                notifyStatusChanged('r-packages');
+                                loadPackages(true);
                             }
                         } catch(e){}
-                    }, 900);
+                    }, 900, container, () => es.close());
                 } else {
-                    const iv = setInterval(async ()=>{
+                    const iv = setNonOverlappingInterval(async ()=>{
                         try {
-                            const r2 = await fetch(auxApiUrl('/r/install-status?job_id='+encodeURIComponent(j.job_id)), { cache: 'no-store' });
+                            const r2 = await fetch(auxApiUrl('/r/install-status?job_id='+encodeURIComponent(j.job_id)), { cache: 'no-store', signal: AbortSignal.timeout(10000) });
                             const j2 = await r2.json();
                             if(j2.status!=='success'){clearInterval(iv);return;}
                             const lines = j2.log||[];
@@ -15041,14 +14808,17 @@ function renderRPanelUI(instance, container) {
                                     installAllBtn.style.pointerEvents = 'auto';
                                 }
                                 scheduleWebContentsFocusRestore('r-plugin-batch-install-finished');
-                                setTimeout(()=>{installLogEl.style.display='none';}, 4000);
-                                setTimeout(()=>loadPackages(true), 2000);
+                                finishAutoCloseInstallLog(installLogEl, j2);
+                                packageRenderKey = '';
+                                notifyStatusChanged('r-packages');
+                                loadPackages(true);
                             }
                         } catch(e){}
-                    }, 900);
+                    }, 900, container);
                 }
             } else {
                 rlog((currentLang==='zh'?'批量安装失败: ':'Batch install failed: ')+j.message, true);
+                finishAutoCloseInstallLog(installLogEl, {...j, state:'failed'});
                 if (installAllBtn) {
                     installAllBtn.dataset.busy = '0';
                     installAllBtn.style.pointerEvents = 'auto';
@@ -15060,6 +14830,7 @@ function renderRPanelUI(instance, container) {
             }
         } catch(e) {
             rlog('Error: '+e, true);
+            finishAutoCloseInstallLog(installLogEl, {state:'failed', message:String(e)});
             if (installAllBtn) {
                 installAllBtn.dataset.busy = '0';
                 installAllBtn.style.pointerEvents = 'auto';
@@ -15083,15 +14854,13 @@ function renderRPanelUI(instance, container) {
                 try {
                     const d = JSON.parse(ev.data);
                     if (d.type === 'log' && d.line) {
-                        appendInstallLogLine(logBody, d.line, 220);
+                        appendArchivedInstallEvent(logBody, d, 220);
                     }
                 } catch(e){}
             };
-            const statusTimer = setInterval(async () => {
+            const statusTimer = setNonOverlappingInterval(async () => {
                 try {
-                    const r = await fetch(auxApiUrl('/r/install-status?job_id='+encodeURIComponent(jobId)), { cache: 'no-store' });
-                    const j = await r.json();
-                    syncInstallLogFromStatus(logBody, j.log || [], 220);
+                    const j = await readInstallStatus(jobId, logBody);
                     if(j.state==='done'||j.state==='failed'){
                         clearInterval(statusTimer);
                         es.close();
@@ -15119,15 +14888,17 @@ function renderRPanelUI(instance, container) {
                             }
                         }
                         scheduleWebContentsFocusRestore('r-plugin-install-finished');
-                        setTimeout(()=>{installLogEl.style.display='none';}, 3000);
-                        setTimeout(()=>loadPackages(true), 1500);
+                        finishAutoCloseInstallLog(installLogEl, {...j, run_id:j.run_id || sseRunId}, logBody);
+                        packageRenderKey = '';
+                        notifyStatusChanged('r-packages');
+                        loadPackages(true);
                     }
                 } catch(e){}
-            }, 900);
+            }, 900, container, () => es.close());
         } else {
-            const iv = setInterval(async ()=>{
+            const iv = setNonOverlappingInterval(async ()=>{
                 try {
-                    const r = await fetch(auxApiUrl('/r/install-status?job_id='+encodeURIComponent(jobId)), { cache: 'no-store' });
+                    const r = await fetch(auxApiUrl('/r/install-status?job_id='+encodeURIComponent(jobId)), { cache: 'no-store', signal: AbortSignal.timeout(10000) });
                     const j = await r.json();
                     if(j.status!=='success'){clearInterval(iv);return;}
                     const lines = j.log||[];
@@ -15159,11 +14930,13 @@ function renderRPanelUI(instance, container) {
                             }
                         }
                         scheduleWebContentsFocusRestore('r-plugin-install-finished');
-                        setTimeout(()=>{installLogEl.style.display='none';}, 3000);
-                        setTimeout(()=>loadPackages(true), 1500);
+                        finishAutoCloseInstallLog(installLogEl, j);
+                        packageRenderKey = '';
+                        notifyStatusChanged('r-packages');
+                        loadPackages(true);
                     }
                 } catch(e){}
-            }, 900);
+            }, 900, container);
         }
     }
 
@@ -15456,18 +15229,18 @@ function renderRPanelUI(instance, container) {
                 // ====== MULTI-FILE INPUT ZONE ======
                 if (!param._files) param._files = [];
                 const mfWrap = document.createElement('div');
-                mfWrap.className = 'r-multifile-wrap';
-                mfWrap.style.cssText = 'border:1px dashed #555;border-radius:6px;padding:8px;background:rgba(20,20,40,0.3);min-height:48px;';
+                mfWrap.className = 'r-multifile-wrap file-list-container';
+                mfWrap.style.minHeight = '60px';
                 const chipList = document.createElement('div');
-                chipList.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px;';
+                chipList.className = 'r-upload-chip-list';
                 mfWrap.appendChild(chipList);
                 const addZone = document.createElement('div');
                 addZone.className = 'r-multifile-add-zone';
                 addZone.dataset.id = param.id || '';
-                addZone.style.cssText = 'display:flex;align-items:center;gap:6px;padding:6px 10px;background:rgba(30,30,60,0.35);border:1px dashed #666;border-radius:4px;cursor:pointer;color:#90caf9;font-size:13px;transition:border-color 0.2s;justify-content:center;';
-                addZone.innerHTML = '<i class="fas fa-plus-circle"></i> ' + (currentLang==='zh'?'拖入文件或点击添加（可多选）':'Drop or click to add files (multi)');
+                addZone.style.cssText = 'padding:6px 10px;cursor:pointer;color:#777;font-size:13px;text-align:center;';
+                addZone.textContent = (currentLang==='zh'?'拖入文件或点击添加（可多选）':'Drop or click to add files (multi)');
                 addZone.onmouseenter=()=>{addZone.style.borderColor='#90caf9';};
-                addZone.onmouseleave=()=>{addZone.style.borderColor='#666';};
+                addZone.onmouseleave=()=>{addZone.style.borderColor='#ccc';};
                 const mfInp = document.createElement('input');
                 mfInp.type='file';
                 mfInp.style.display='none';
@@ -15479,13 +15252,13 @@ function renderRPanelUI(instance, container) {
                 mfInp.multiple = true;
                 addZone.onclick=()=>mfInp.click();
                 addZone.ondragover=e=>{e.preventDefault();addZone.style.borderColor='#4caf50';addZone.style.background='rgba(76,175,80,0.08)';};
-                addZone.ondragleave=()=>{addZone.style.borderColor='#666';addZone.style.background='rgba(30,30,60,0.35)';};
+                addZone.ondragleave=()=>{addZone.style.borderColor='#ccc';addZone.style.background='transparent';};
                 const renderChips = () => {
                     chipList.innerHTML = '';
                     param._files.forEach((f, idx) => {
                         const chip = document.createElement('div');
-                        chip.className = 'r-multifile-chip';
-                        chip.style.cssText = 'display:inline-flex;align-items:center;gap:4px;background:#263850;border:1px solid #3a5a80;border-radius:16px;padding:3px 8px 3px 10px;font-size:12px;color:#cde;max-width:220px;';
+                        chip.className = 'r-multifile-chip file-chip';
+
                         if (param._files.length > 1) {
                             chip.draggable = true;
                             chip.classList.add('file-chip-draggable');
@@ -15528,15 +15301,15 @@ function renderRPanelUI(instance, container) {
                             });
                         }
                         const nameSpan = document.createElement('span');
-                        nameSpan.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+                        nameSpan.className = 'filename';
                         nameSpan.textContent = f.name;
                         nameSpan.title = f.name;
                         const delBtn = document.createElement('span');
-                        delBtn.className = 'r-multifile-remove';
+                        delBtn.className = 'r-multifile-remove del-btn';
                         delBtn.innerHTML = '×';
                         delBtn.title = currentLang==='zh'?'移除':'Remove';
                         delBtn.style.cssText = 'color:#e53935;font-size:15px;font-weight:bold;cursor:pointer;padding:0 2px;line-height:1;border-radius:50%;transition:background 0.15s;flex-shrink:0;margin-left:2px;';
-                        delBtn.onmouseenter=()=>{delBtn.style.background='rgba(229,57,53,0.18)';};
+                        delBtn.onmouseenter=()=>{delBtn.style.background='transparent';};
                         delBtn.onmouseleave=()=>{delBtn.style.background='transparent';};
                         delBtn.onclick=(ev)=>{
                             ev.stopPropagation();
@@ -15546,6 +15319,7 @@ function renderRPanelUI(instance, container) {
                             rStateChanged();
                         };
                         chip.appendChild(nameSpan);
+                        chip.appendChild(createFilePreviewEye(f.path));
                         chip.appendChild(delBtn);
                         chipList.appendChild(chip);
                     });
@@ -15562,7 +15336,7 @@ function renderRPanelUI(instance, container) {
                     rStateChanged();
                 };
                 addZone.ondrop=e=>{
-                    e.preventDefault();addZone.style.borderColor='#666';addZone.style.background='rgba(30,30,60,0.35)';
+                    e.preventDefault();addZone.style.borderColor='#ccc';addZone.style.background='transparent';
                     if(e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
                 };
                 mfInp.onchange=()=>{ if(mfInp.files.length) addFiles(mfInp.files); mfInp.value=''; };
@@ -15572,9 +15346,9 @@ function renderRPanelUI(instance, container) {
                 row.appendChild(mfWrap);
             } else if (param.type === 'file') {
                 const zone = document.createElement('div');
-                zone.className = 'r-file-drop';
+                zone.className = 'r-file-drop file-list-container';
                 zone.dataset.id = param.id;
-                zone.innerHTML = '<i class="fas fa-file-upload" style="margin-right:6px;color:#90caf9"></i>' + (currentLang==='zh'?'拖入文件或点击选择':'Drop file or click to choose');
+                zone.textContent = (currentLang==='zh'?'拖入文件或点击选择':'Drop file or click to choose');
                 const inp = document.createElement('input');
                 inp.type='file';
                 inp.style.display='none';
@@ -15590,26 +15364,30 @@ function renderRPanelUI(instance, container) {
                     param._file=f; param._filePath=f.path; S[param.id]=f.path;
                     zone.innerHTML='';
                     zone.classList.add('has-file');
+                    const chip = document.createElement('div');
+                    chip.className = 'file-chip';
                     const fileLabel = document.createElement('span');
-                    fileLabel.style.cssText='display:flex;align-items:center;gap:6px;flex:1;overflow:hidden;';
-                    fileLabel.innerHTML='<i class="fas fa-file-csv" style="color:#4caf50;flex-shrink:0"></i><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'+escapeHtml(f.name)+'</span>';
+                    fileLabel.className = 'filename';
+                    fileLabel.textContent = f.name;
                     const delBtn = document.createElement('span');
-                    delBtn.className = 'r-file-del-btn';
+                    delBtn.className = 'r-file-del-btn del-btn';
                     delBtn.innerHTML = '×';
                     delBtn.title = currentLang==='zh'?'移除文件':'Remove file';
                     delBtn.style.cssText='color:#e53935;font-size:16px;font-weight:bold;cursor:pointer;flex-shrink:0;padding:0 4px;line-height:1;border-radius:50%;transition:background 0.15s;';
-                    delBtn.onmouseenter=()=>{delBtn.style.background='rgba(229,57,53,0.12)';};
+                    delBtn.onmouseenter=()=>{delBtn.style.background='transparent';};
                     delBtn.onmouseleave=()=>{delBtn.style.background='transparent';};
                     delBtn.onclick=(ev)=>{
                         ev.stopPropagation();
                         param._file=null; param._filePath=null; S[param.id]='';
                         inp.value='';
-                        zone.innerHTML='<i class="fas fa-file-upload" style="margin-right:6px;color:#90caf9"></i>'+(currentLang==='zh'?'拖入文件或点击选择':'Drop file or click to choose');
+                        zone.textContent=(currentLang==='zh'?'拖入文件或点击选择':'Drop file or click to choose');
                         zone.classList.remove('has-file');
                         rStateChanged();
                     };
-                    zone.appendChild(fileLabel);
-                    zone.appendChild(delBtn);
+                    chip.appendChild(fileLabel);
+                    chip.appendChild(createFilePreviewEye(f.path));
+                    chip.appendChild(delBtn);
+                    zone.appendChild(chip);
                     rStateChanged();
                 };
                 zone.ondrop=e=>{
@@ -16308,7 +16086,8 @@ function renderRPanelUI(instance, container) {
                 // Click on item to preview - use appropriate viewer based on file type
                 item.querySelector('.r-preview-btn').onclick = (e) => {
                     e.stopPropagation();
-                    if (isImg) openImageViewer(f);
+                    if (['.tif','.tiff'].includes(f.ext)) openTextViewer(f);
+                    else if (isImg) openImageViewer(f);
                     else if (isPdf) openPdfViewer(f);
                     else if (isTable) openTableViewer(f);
                     else openTextViewer(f);
@@ -16325,7 +16104,8 @@ function renderRPanelUI(instance, container) {
                 };
                 // Double-click opens preview with appropriate viewer
                 item.ondblclick = () => {
-                    if (isImg) openVectorEditor(f);
+                    if (['.tif','.tiff'].includes(f.ext)) openTextViewer(f);
+                    else if (isImg) openVectorEditor(f);
                     else if (isPdf) openPdfViewer(f);
                     else if (isTable) openTableViewer(f);
                     else openTextViewer(f);
@@ -16339,66 +16119,21 @@ function renderRPanelUI(instance, container) {
 
     async function downloadFile(f) {
         try {
-            const url = API_BASE + '/r/serve-file?path=' + encodeURIComponent(f.path);
-            const resp = await fetch(url);
-            if (!resp.ok) { rlog('Download failed'); return; }
-            const blob = await resp.blob();
-            const a = document.createElement('a');
-            a.href = URL.createObjectURL(blob); a.download = f.name;
-            document.body.appendChild(a); a.click(); document.body.removeChild(a);
-            URL.revokeObjectURL(a.href);
+            const url = require('url').pathToFileURL(f.path).href;
+            const selected = await ipcRenderer.invoke('save-file-dialog', {defaultPath:f.name});
+            if (selected.canceled || !selected.filePath) return;
+            if (path.resolve(f.path) !== path.resolve(selected.filePath)) {
+                await require('fs').promises.copyFile(f.path, selected.filePath);
+            }
             rlog((currentLang==='zh'?'已下载: ':'Downloaded: ') + f.name);
         } catch(e) { rlog('Download error: ' + e); }
     }
 
     // ------ Preview Windows (resizable & draggable) ------
-    function makeWindowDraggable(overlay, win, header) {
-        let isDrag = false, startX = 0, startY = 0, origL = 0, origT = 0;
-        header.style.cursor = 'move';
-        header.addEventListener('mousedown', e => {
-            if (e.target.closest('button')) return;
-            isDrag = true;
-            const rect = win.getBoundingClientRect();
-            startX = e.clientX; startY = e.clientY;
-            origL = rect.left; origT = rect.top;
-            win.style.position = 'fixed';
-            win.style.margin = '0';
-            win.style.left = origL + 'px'; win.style.top = origT + 'px';
-            e.preventDefault();
-        });
-        document.addEventListener('mousemove', e => {
-            if (!isDrag) return;
-            win.style.left = (origL + e.clientX - startX) + 'px';
-            win.style.top = (origT + e.clientY - startY) + 'px';
-        });
-        document.addEventListener('mouseup', () => { isDrag = false; });
-    }
-
-    function makeWindowResizable(win) {
-        const handle = document.createElement('div');
-        handle.className = 'r-viewer-resize-handle';
-        win.appendChild(handle);
-        let isResize = false, startX = 0, startY = 0, origW = 0, origH = 0;
-        handle.addEventListener('mousedown', e => {
-            isResize = true;
-            startX = e.clientX; startY = e.clientY;
-            origW = win.offsetWidth; origH = win.offsetHeight;
-            e.preventDefault(); e.stopPropagation();
-        });
-        document.addEventListener('mousemove', e => {
-            if (!isResize) return;
-            const newW = Math.max(400, origW + e.clientX - startX);
-            const newH = Math.max(300, origH + e.clientY - startY);
-            win.style.width = newW + 'px';
-            win.style.height = newH + 'px';
-        });
-        document.addEventListener('mouseup', () => { isResize = false; });
-    }
-
     function openImageViewer(f) {
         const overlay = document.createElement('div');
         overlay.className = 'r-viewer-overlay';
-        const url = API_BASE + '/r/serve-file?path=' + encodeURIComponent(f.path);
+        const url = require('url').pathToFileURL(f.path).href;
         overlay.innerHTML = `
             <div class="r-viewer-window">
                 <div class="r-viewer-header">
@@ -16406,7 +16141,7 @@ function renderRPanelUI(instance, container) {
                     <button class="r-viewer-close"><i class="fas fa-times"></i></button>
                 </div>
                 <div class="r-viewer-body r-viewer-img-body">
-                    <img class="r-viewer-zoomable-img" src="${url}" />
+                    <img class="r-viewer-zoomable-img" />
                 </div>
                 <div class="r-viewer-footer">
                     <button class="r-viewer-action-btn" data-action="zoomout"><i class="fas fa-search-minus"></i></button>
@@ -16421,24 +16156,10 @@ function renderRPanelUI(instance, container) {
         `;
         const win = overlay.querySelector('.r-viewer-window');
         const header = overlay.querySelector('.r-viewer-header');
+        decoratePreviewHeader(header,f.path,currentLang);
         const img = overlay.querySelector('.r-viewer-zoomable-img');
-        const zoomLabel = overlay.querySelector('.r-viewer-zoom-label');
-        let imgScale = 1;
-
-        function updateZoom() {
-            img.style.transform = `scale(${imgScale})`;
-            zoomLabel.textContent = Math.round(imgScale * 100) + '%';
-        }
-
-        overlay.querySelector('[data-action="zoomin"]').onclick = () => { imgScale = Math.min(imgScale * 1.25, 10); updateZoom(); };
-        overlay.querySelector('[data-action="zoomout"]').onclick = () => { imgScale = Math.max(imgScale / 1.25, 0.1); updateZoom(); };
-        overlay.querySelector('[data-action="zoomfit"]').onclick = () => { imgScale = 1; updateZoom(); };
-        overlay.querySelector('.r-viewer-body').addEventListener('wheel', e => {
-            e.preventDefault();
-            imgScale *= e.deltaY > 0 ? 0.9 : 1.1;
-            imgScale = Math.max(0.1, Math.min(imgScale, 10));
-            updateZoom();
-        }, { passive: false });
+        queueMicrotask(() => loadPreviewImage(img, f.path, currentLang));
+        mountImageZoom(overlay, img);
 
         overlay.querySelector('.r-viewer-close').onclick = () => overlay.remove();
         overlay.onclick = e => { if (e.target === overlay) overlay.remove(); };
@@ -16470,140 +16191,17 @@ function renderRPanelUI(instance, container) {
         `;
         const win = overlay.querySelector('.r-viewer-window');
         const header = overlay.querySelector('.r-viewer-header');
+        decoratePreviewHeader(header,f.path,currentLang);
         overlay.querySelector('.r-viewer-close').onclick = () => overlay.remove();
         overlay.onclick = e => { if (e.target === overlay) overlay.remove(); };
         document.body.appendChild(overlay);
         makeWindowDraggable(overlay, win, header);
         makeWindowResizable(win);
         
-        // Load and parse table file
-        const isExcel = ['.xlsx', '.xls'].includes(f.ext);
-        
-        if (isExcel) {
-            const tableContent = overlay.querySelector('.r-table-content');
-            const loading = overlay.querySelector('.r-table-loading');
-            try {
-                const preview = readSpreadsheetPreviewRows(f.path);
-                loading.style.display = 'none';
-                tableContent.style.display = 'block';
-                renderTable(tableContent, preview.rows, null, preview);
-                const dimsEl = overlay.querySelector('.r-table-dims');
-                if (dimsEl) {
-                    const sheetSuffix = preview.sheetName ? ` - ${preview.sheetName}` : '';
-                    dimsEl.textContent = `(${preview.totalRows} x ${preview.totalCols})${sheetSuffix}`;
-                }
-            } catch (e) {
-                loading.style.display = 'none';
-                tableContent.style.display = 'block';
-                tableContent.innerHTML = `<div style="padding:20px;color:#f44336;">Error: ${escapeHtml(e.message || String(e))}</div>`;
-            }
-            return;
-            // For Excel files, fetch as binary and use SheetJS-like parsing
-            // For simplicity, show message that Excel files need special handling
-            fetch(API_BASE + '/r/read-file?path=' + encodeURIComponent(f.path))
-                .then(r => r.json())
-                .then(j => {
-                    const tableContent = overlay.querySelector('.r-table-content');
-                    const loading = overlay.querySelector('.r-table-loading');
-                    loading.style.display = 'none';
-                    tableContent.style.display = 'block';
-                    
-                    if (j.status === 'success') {
-                        const content = j.content;
-                        const delimiter = f.ext === '.tsv' ? '\t' : ',';
-                        const rows = parseDelimitedRows(content, delimiter);
-                        renderTable(tableContent, rows);
-                    } else {
-                        tableContent.innerHTML = `<div style="padding:20px;color:#f44336;">${currentLang==='zh'?'无法读取 Excel 文件，请下载后查看':'Cannot read Excel file, please download to view'}</div>`;
-                        tableContent.style.display = 'block';
-                    }
-                })
-                .catch(e => {
-                    const tableContent = overlay.querySelector('.r-table-content');
-                    const loading = overlay.querySelector('.r-table-loading');
-                    loading.style.display = 'none';
-                    tableContent.style.display = 'block';
-                    tableContent.innerHTML = `<div style="padding:20px;color:#f44336;">Error: ${e}</div>`;
-                });
-        } else {
-            // CSV/TSV files
-            fetch(API_BASE + '/r/read-file?path=' + encodeURIComponent(f.path))
-                .then(r => r.json())
-                .then(j => {
-                    const tableContent = overlay.querySelector('.r-table-content');
-                    const loading = overlay.querySelector('.r-table-loading');
-                    loading.style.display = 'none';
-                    tableContent.style.display = 'block';
-                    
-                    if (j.status === 'success') {
-                        const content = j.content;
-                        const delimiter = f.ext === '.tsv' ? '\t' : ',';
-                        const rows = parseDelimitedRows(content, delimiter);
-                        renderTable(tableContent, rows);
-                    } else {
-                        tableContent.innerHTML = `<div style="padding:20px;color:#f44336;">${currentLang==='zh'?'读取失败：'+(j.message||'未知错误'):'Failed to read: '+(j.message||'unknown')}</div>`;
-                        tableContent.style.display = 'block';
-                    }
-                })
-                .catch(e => {
-                    const tableContent = overlay.querySelector('.r-table-content');
-                    const loading = overlay.querySelector('.r-table-loading');
-                    loading.style.display = 'none';
-                    tableContent.style.display = 'block';
-                    tableContent.innerHTML = `<div style="padding:20px;color:#f44336;">Error: ${e}</div>`;
-                });
-        }
+        mountFilePreview(overlay.querySelector('.r-viewer-body'), f.path, {lang:currentLang,showExternalOpen:false,
+            onDimensions:text=>{overlay.querySelector('.r-table-dims').textContent=text;}});
     }
     
-    function renderTable(container, rows, contentLen) {
-        if (!rows || rows.length === 0) {
-            container.innerHTML = `<div style="padding:20px;color:#999;">${currentLang==='zh'?'表格为空':'Table is empty'}</div>`;
-            return;
-        }
-        
-        // Update dimensions display in header
-        const dimsEl = container.closest('.r-viewer-window').querySelector('.r-table-dims');
-        if (dimsEl) {
-            const numRows = rows.length;
-            const numCols = rows[0] ? rows[0].length : 0;
-            dimsEl.textContent = `(${numRows} × ${numCols})`;
-        }
-        
-        // Use same style as workflow preview-data-table
-        const table = document.createElement('table');
-        table.className = 'preview-data-table';
-        const thead = document.createElement('thead');
-        const tbody = document.createElement('tbody');
-        
-        rows.forEach((row, rowIndex) => {
-            const tr = document.createElement('tr');
-            // Row number column
-            const numTd = document.createElement(rowIndex === 0 ? 'th' : 'td');
-            numTd.className = 'row-num';
-            numTd.innerText = rowIndex === 0 ? '#' : String(rowIndex);
-            tr.appendChild(numTd);
-            
-            row.forEach(cell => {
-                const td = document.createElement(rowIndex === 0 ? 'th' : 'td');
-                const val = cell.trim();
-                td.innerText = val;
-                if (val.length > 100) {
-                    td.title = val;
-                    td.style.maxWidth = '300px';
-                    td.style.overflow = 'hidden';
-                    td.style.textOverflow = 'ellipsis';
-                    td.style.whiteSpace = 'nowrap';
-                }
-                tr.appendChild(td);
-            });
-            if (rowIndex === 0) thead.appendChild(tr);
-            else tbody.appendChild(tr);
-        });
-        table.appendChild(thead);
-        table.appendChild(tbody);
-        container.appendChild(table);
-    }
-
     function openTextViewer(f) {
         const overlay = document.createElement('div');
         overlay.className = 'r-viewer-overlay';
@@ -16620,49 +16218,33 @@ function renderRPanelUI(instance, container) {
         `;
         const win = overlay.querySelector('.r-viewer-window');
         const header = overlay.querySelector('.r-viewer-header');
+        decoratePreviewHeader(header,f.path,currentLang);
         overlay.querySelector('.r-viewer-close').onclick = () => overlay.remove();
         overlay.onclick = e => { if (e.target === overlay) overlay.remove(); };
         document.body.appendChild(overlay);
         makeWindowDraggable(overlay, win, header);
         makeWindowResizable(win);
-        // Load content
-        fetch(API_BASE + '/r/read-file?path=' + encodeURIComponent(f.path))
-            .then(r => r.json())
-            .then(j => {
-                const pre = overlay.querySelector('.r-text-content');
-                const dimsEl = overlay.querySelector('.r-text-dims');
-                if (j.status === 'success') {
-                    const lines = j.content.split('\n').length;
-                    if (dimsEl) dimsEl.textContent = `(${lines} ${currentLang==='zh'?'行':'lines'})`;
-                    pre.textContent = j.content;
-                } else {
-                    if (dimsEl) dimsEl.textContent = '';
-                    pre.textContent = 'Error: ' + (j.message || 'unknown');
-                }
-            })
-            .catch(e => {
-                const pre = overlay.querySelector('.r-text-content');
-                pre.textContent = 'Error: ' + e;
-            });
+        mountFilePreview(overlay.querySelector('.r-viewer-body'), f.path, {kind:'text',lang:currentLang,showExternalOpen:false});
     }
 
     function openPdfViewer(f) {
         const overlay = document.createElement('div');
         overlay.className = 'r-viewer-overlay';
-        const fileUrl = API_BASE + '/r/serve-file?path=' + encodeURIComponent(f.path);
+        const fileUrl = require('url').pathToFileURL(f.path).href;
         overlay.innerHTML = `
             <div class="r-viewer-window" style="width:85%;max-width:1100px;height:85%;">
                 <div class="r-viewer-header">
                     <span><i class="fas fa-file-pdf" style="color:#ef5350;"></i> ${escapeHtml(f.name)}</span>
                     <button class="r-viewer-close"><i class="fas fa-times"></i></button>
                 </div>
-                <div class="r-viewer-body r-pdf-body" style="padding:0;background:#525659;flex:1;overflow:hidden;">
+                <div class="r-viewer-body r-pdf-body" style="padding:0;background:#e5e7eb;flex:1;overflow:hidden;">
                     <iframe src="${fileUrl}" style="width:100%;height:100%;border:none;"></iframe>
                 </div>
             </div>
         `;
         const win = overlay.querySelector('.r-viewer-window');
         const header = overlay.querySelector('.r-viewer-header');
+        decoratePreviewHeader(header,f.path,currentLang);
         
         overlay.querySelector('.r-viewer-close').onclick = () => overlay.remove();
         overlay.onclick = e => { if (e.target === overlay) overlay.remove(); };
@@ -16677,7 +16259,10 @@ function renderRPanelUI(instance, container) {
     loadPackages();
     renderParams();
 
-    window.__checkRRuntime = checkRuntime;
+    viewStatus.bind(container, ['r-packages', 'r-runtime'], async () => {
+        await Promise.allSettled([checkRuntime(),
+            container.querySelector('.r-pkg-btn .fa-spinner') ? Promise.resolve() : loadPackages(true)]);
+    }, () => clearTimeout(rPreparationTimer));
 
     } // end if (!isStandaloneEditor) — R panel UI setup
 
@@ -16698,6 +16283,9 @@ function renderRPanelUI(instance, container) {
             }
         }
 
+        const editorEvents = new AbortController();
+        const listen = (target, type, callback, options = {}) => target.addEventListener(type, callback,
+            {...(typeof options === 'boolean' ? {capture:options} : options), signal:editorEvents.signal});
         const overlay = document.createElement('div');
         overlay.className = 'r-vector-editor-overlay' + (liveMode ? ' r-ve-live-mode' : '') + (window.__editorStandalone ? ' r-ve-standalone' : '');
         const imgUrl = API_BASE + '/r/serve-file?path=' + encodeURIComponent(f.path);
@@ -16853,12 +16441,13 @@ function renderRPanelUI(instance, container) {
         let scale = 1, panX = 0, panY = 0;
         let selectedEl = null;
         let selectedEls = []; // multi-selection array
-        let isDrawing = false, drawStart = null, tempEl = null, freehandPoints = [], drawAxisLock = null;
+        let isDrawing = false, drawStart = null, tempEl = null, drawAxisLock = null;
         let isMarquee = false, marqueeStartPt = null, marqueeRect = null;
         let fillIsNone = false, strokeIsNone = false;
         // Full SVG source text for undo (lightweight: just the raw string, not DOM)
         let svgSourceText = '';
-        let undoStack = [], redoStack = [];
+        const history = new TextHistory(30);
+        let textHitIndex = null;
         // The actual embedded SVG element (loaded from file)
         let liveSvg = null;
         // An overlay SVG for drawing new shapes + selection box
@@ -17401,21 +16990,24 @@ function renderRPanelUI(instance, container) {
             saveState();
             // Delay zoomFit to ensure container is laid out
             requestAnimationFrame(() => {
+                if (editorEvents.signal.aborted) return;
                 zoomFit();
                 rlog(currentLang==='zh' ? '✅ SVG 矢量图已加载（实时渲染模式）' : '✅ SVG loaded (live rendering mode)');
             });
         } else if (isSvgFile) {
-            fetch(imgUrl).then(r => r.text()).then(text => {
+            fetch(imgUrl, {signal: editorEvents.signal}).then(r => r.text()).then(text => {
+                if (editorEvents.signal.aborted) return;
                 svgSourceText = text;
                 renderSvgFromText(text);
                 saveState();
                 rlog(currentLang==='zh' ? '✅ SVG 矢量图已加载，点击元素即可选择编辑' : '✅ SVG loaded — click elements to select and edit');
-            }).catch(e => rlog('[ERROR] ' + e));
+            }).catch(e => { if (!editorEvents.signal.aborted) rlog('[ERROR] ' + e); });
         } else {
             // Non-SVG: load as raster
             const img = new Image();
             img.crossOrigin = 'anonymous';
             img.onload = () => {
+                if (editorEvents.signal.aborted) return;
                 imgW = img.naturalWidth || 800;
                 imgH = img.naturalHeight || 600;
                 const rasterSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -17451,9 +17043,10 @@ function renderRPanelUI(instance, container) {
             img.src = imgUrl;
         }
 
-        function renderSvgFromText(text) {
+        function renderSvgFromText(text, restoring = false) {
             const parser = new DOMParser();
-            const doc = parser.parseFromString(text, 'image/svg+xml');
+            const clean = require('./preview-sanitize').default.sanitize(text,{USE_PROFILES:{svg:true,svgFilters:true}});
+            const doc = parser.parseFromString(clean, 'image/svg+xml');
             const srcSvg = doc.querySelector('svg');
             if (!srcSvg) return;
 
@@ -17481,6 +17074,7 @@ function renderRPanelUI(instance, container) {
                 imported.setAttribute('viewBox', `0 0 ${imgW} ${imgH}`);
             }
 
+            if (!restoring) {
             // Remove all clip-path attributes from SVG elements so content is not clipped
             // (svglite / ggplot2 add clipPath defs that restrict content to the plot area)
             imported.querySelectorAll('[clip-path]').forEach(el => el.removeAttribute('clip-path'));
@@ -17519,18 +17113,25 @@ function renderRPanelUI(instance, container) {
                 }
             });
 
+            }
+            imported.querySelectorAll('[data-ve-selected]').forEach(el => el.removeAttribute('data-ve-selected'));
+            textHitIndex?.dispose();
             liveSvg = imported;
+            textHitIndex = new SvgTextIndex(liveSvg, getElBoundsInSvg);
             canvasW = imgW; canvasH = imgH;
             if (canvasWInput) { canvasWInput.value = Math.round(imgW); canvasHInput.value = Math.round(imgH); }
 
             viewport.innerHTML = '';
             // Insert white background rect as first child of liveSvg
+            bgRect = liveSvg.querySelector('rect[data-role="background"]');
+            if (!bgRect) {
             bgRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
             bgRect.setAttribute('x', '0'); bgRect.setAttribute('y', '0');
             bgRect.setAttribute('width', canvasW); bgRect.setAttribute('height', canvasH);
             bgRect.setAttribute('fill', '#ffffff');
             bgRect.setAttribute('data-role', 'background');
             liveSvg.insertBefore(bgRect, liveSvg.firstChild);
+            }
             viewport.appendChild(liveSvg);
 
             // Setup draw overlay
@@ -17541,38 +17142,30 @@ function renderRPanelUI(instance, container) {
 
             viewport.style.width = canvasW + 'px';
             viewport.style.height = canvasH + 'px';
-            zoomFit();
+            if (restoring) applyTransform();
+            else zoomFit();
         }
 
-        // ===== UNDO / REDO (stores lightweight text snapshots) =====
+        // ===== UNDO / REDO (one SVG document plus lossless text deltas) =====
         function saveState() {
             if (!liveSvg) return;
-            // Serialize only when explicitly called (after user action completes)
-            const xml = new XMLSerializer().serializeToString(liveSvg);
-            // Also include any new shapes from drawSvg
-            const drawXml = drawSvg.innerHTML.replace(/<rect[^>]*visibility="hidden"[^>]*\/?>/, '');
-            undoStack.push({ svg: xml, draw: drawXml });
-            if (undoStack.length > 30) undoStack.shift();
-            redoStack = [];
+            // drawSvg contains transient selection/hover UI, never document shapes.
+            history.commit(new XMLSerializer().serializeToString(liveSvg));
         }
 
         function undo() {
-            if (undoStack.length <= 1) return;
-            redoStack.push(undoStack.pop());
-            const state = undoStack[undoStack.length - 1];
-            restoreState(state);
+            const state = history.undo();
+            if (state !== null) restoreState(state);
         }
 
         function redo() {
-            if (redoStack.length === 0) return;
-            const state = redoStack.pop();
-            undoStack.push(state);
-            restoreState(state);
+            const state = history.redo();
+            if (state !== null) restoreState(state);
         }
 
         function restoreState(state) {
             deselectAll();
-            renderSvgFromText(state.svg);
+            renderSvgFromText(state, true);
         }
 
         // ===== SELECTION =====
@@ -17988,7 +17581,8 @@ function renderRPanelUI(instance, container) {
             // Some SVG renderers lose the text node as event.target after a large
             // CSS zoom. Fall back to the text's transformed local bbox, using a
             // constant screen-pixel tolerance so accuracy is independent of scale.
-            const texts = Array.from(liveSvg.querySelectorAll('text')).reverse();
+            const texts = textHitIndex ? textHitIndex.query(clientX, clientY, screenTolerance)
+                : Array.from(liveSvg.querySelectorAll('text')).reverse();
             for (const textNode of texts) {
                 if (textNode.closest('defs,clipPath,mask')) continue;
                 const cs = getComputedStyle(textNode);
@@ -19127,7 +18721,7 @@ function renderRPanelUI(instance, container) {
                             preview.style.background = gradType==='linear' ? `linear-gradient(${gradAngle}deg,${css2})` : `radial-gradient(circle,${css2})`;
                         };
                         const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); renderStops(); renderPreview(); };
-                        window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp);
+                        listen(window, 'mousemove', onMove); listen(window, 'mouseup', onUp);
                     });
                     mk.addEventListener('click', (ce) => ce.stopPropagation());
                     mk.addEventListener('dblclick', (dev) => {
@@ -20378,6 +19972,7 @@ function renderRPanelUI(instance, container) {
 
         canvasWrap.addEventListener('mousedown', (e) => {
             if (e.button !== 0) return; // only left button
+            pointerFrame.flush();
 
             // Close any open inline text editor when clicking outside it
             const openEditor = overlay.querySelector('.r-ve-inline-editor');
@@ -20560,7 +20155,6 @@ function renderRPanelUI(instance, container) {
                 e.stopPropagation(); // prevent click from bubbling to overlay (would close editor)
                 return;
             } else if (currentTool === 'pen') {
-                freehandPoints = [pt];
                 tempEl = document.createElementNS(ns, 'polyline');
                 tempEl.setAttribute('fill', 'none'); tempEl.setAttribute('stroke', curStroke);
                 tempEl.setAttribute('stroke-width', strokeWidthInput.value); tempEl.setAttribute('opacity', curOpacity);
@@ -20572,7 +20166,14 @@ function renderRPanelUI(instance, container) {
             e.preventDefault();
         });
 
-        canvasWrap.addEventListener('mousemove', (e) => {
+        const pointerFrame = latestFrame(e => handleCanvasMove(e));
+        canvasWrap.addEventListener('mousemove', e => {
+            // Freehand input retains every sample. Other tools need the latest
+            // position once per frame, including a final flush before mouseup.
+            if (currentTool === 'pen' && isDrawing) handleCanvasMove(e);
+            else pointerFrame.schedule(e);
+        });
+        function handleCanvasMove(e) {
             if (!isPanning && !isResizing && !isRotating && !isDragging && !isDrawing && !isMarquee && currentTool === 'select') {
                 // Inside a selected text's actual body the pointer means select/move.
                 // Resize/rotate cursors remain available immediately outside it.
@@ -20828,14 +20429,16 @@ function renderRPanelUI(instance, container) {
             } else if (currentTool === 'line') {
                 tempEl.setAttribute('x2', axisPoint.x); tempEl.setAttribute('y2', axisPoint.y);
             } else if (currentTool === 'pen') {
-                freehandPoints.push(axisPoint);
-                tempEl.setAttribute('points', freehandPoints.map(p => `${p.x},${p.y}`).join(' '));
+                const point = liveSvg.createSVGPoint();
+                point.x = axisPoint.x; point.y = axisPoint.y;
+                tempEl.points.appendItem(point);
             }
-        });
+        }
 
-        canvasWrap.addEventListener('mouseleave', () => setHoveredElement(null));
+        canvasWrap.addEventListener('mouseleave', () => { pointerFrame.flush(); setHoveredElement(null); });
 
         canvasWrap.addEventListener('mouseup', () => {
+            pointerFrame.flush();
             if (isPanning) {
                 isPanning = false;
                 setCanvasInteractionCursor(null);
@@ -20938,7 +20541,6 @@ function renderRPanelUI(instance, container) {
             if (isDrawing) {
                 isDrawing = false;
                 tempEl = null;
-                freehandPoints = [];
                 saveState();
             }
         });
@@ -21039,8 +20641,8 @@ function renderRPanelUI(instance, container) {
                 }
             }
         };
-        document.addEventListener('keydown', keyHandler);
-        document.addEventListener('keyup', keyUpHandler);
+        listen(document, 'keydown', keyHandler);
+        listen(document, 'keyup', keyUpHandler);
 
         // ===== EXPORT =====
         overlay.querySelector('.r-ve-export-unified-btn').onclick = () => showUnifiedExportDialog();
@@ -21497,9 +21099,17 @@ function renderRPanelUI(instance, container) {
 
         // Close
         function closeEditor() {
+            if (editorEvents.signal.aborted) return;
+            overlay.querySelector('.r-ve-text-panel')?._flushLiveChanges?.();
+            pointerFrame.cancel();
+            editorEvents.abort();
+            textHitIndex?.dispose();
+            textHitIndex = null;
+            history.reset();
             document.removeEventListener('keydown', keyHandler);
             if (sessionKey) instance._liveEditorSessions.delete(sessionKey);
             overlay.remove();
+            options.onClose?.();
             // If in standalone native window, close the window
             if (window.__editorStandalone) {
                 window.close();
@@ -21521,7 +21131,8 @@ function renderRPanelUI(instance, container) {
                 updateFn: (newSvgText) => {
                     svgSourceText = newSvgText;
                     deselectAll();
-                    undoStack = []; redoStack = [];
+                    pointerFrame.cancel();
+                    history.reset();
                     renderSvgFromText(newSvgText);
                     saveState();
                     rlog(currentLang==='zh' ? '🔄 图形已实时更新' : '🔄 Figure updated (live)');
@@ -21544,12 +21155,12 @@ function renderRPanelUI(instance, container) {
                 winDragY = e.clientY - veWindow.offsetTop;
                 e.preventDefault();
             });
-            document.addEventListener('mousemove', (e) => {
+            listen(document, 'mousemove', (e) => {
                 if (!isDraggingWin) return;
                 veWindow.style.left = (e.clientX - winDragX) + 'px';
                 veWindow.style.top = (e.clientY - winDragY) + 'px';
             });
-            document.addEventListener('mouseup', () => { isDraggingWin = false; });
+            listen(document, 'mouseup', () => { isDraggingWin = false; });
             // Click to bring to front
             veWindow.addEventListener('mousedown', () => {
                 overlay.style.zIndex = 60000 + (Date.now() % 10000);
@@ -21861,6 +21472,7 @@ function refreshDynamicUI(container, parameters, state) {
 // ==========================================
 
 function renderPluginUI(instance, container) {
+    viewStatus.dispose(container);
     const p = instance.config;
     // ensure parameters array exists to avoid crash when plugin omits it
     if (!Array.isArray(p.parameters)) p.parameters = [];
@@ -22025,9 +21637,9 @@ function renderPluginUI(instance, container) {
 
             const jobId = startRes.job_id;
             clearInstallPoll();
-            installPollTimer = setInterval(async () => {
+            installPollTimer = setNonOverlappingInterval(async () => {
                 try {
-                    const resp = await fetch(`${API_BASE}/setup-plugin-binary-status?job_id=${encodeURIComponent(jobId)}`);
+                    const resp = await fetch(`${API_BASE}/setup-plugin-binary-status?job_id=${encodeURIComponent(jobId)}`, {signal: AbortSignal.timeout(10000)});
                     const stat = await resp.json();
                     if (!stat || stat.status !== 'success' || !stat.job) return;
 
@@ -22041,8 +21653,8 @@ function renderPluginUI(instance, container) {
                         renderInstallProgress(100, currentLang === 'zh' ? '安装完成' : 'Install complete');
                         _showToast(t('install_success_reopen'), 'success', 3000);
                         await init();
-                        const tabId = activeTabId;
-                        if (tabId && tabs[tabId]) {
+                        const tabId = instance.id;
+                        if (container.isConnected && tabId && tabs[tabId] === instance) {
                             const refreshedPlugins = allPlugins || [];
                             const newCfg = refreshedPlugins.find(pp => pp.id === p.id);
                             if (newCfg) {
@@ -22057,7 +21669,7 @@ function renderPluginUI(instance, container) {
                         alert(t('failed_prefix') + (stat.job.error || stat.job.message || 'install failed'));
                     }
                 } catch (err) {}
-            }, 350);
+            }, 350, container);
         };
         return;
     }
@@ -22894,24 +22506,25 @@ function updateChips(inst, p, div) {
                 updateChips(inst, p, div);
             };
         }
+        chip.insertBefore(createFilePreviewEye(item), chip.querySelector('.del-btn'));
         bindChipReorder();
         div.appendChild(chip);
     });
 }
 
 async function post(url, d, timeoutMs) {
+    let timeoutId = null;
     try {
         // timeoutMs === 0 means no timeout (indefinite wait for long-running containers)
         const hasTimeout = typeof timeoutMs === 'number' && timeoutMs > 0;
         const controller = hasTimeout ? new AbortController() : null;
-        const timeoutId = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+        timeoutId = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
         const base = String(url || '').startsWith('/podman') ? AUX_API_BASE : API_BASE;
         const res = await fetch(`${base}${url}`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(d),
             cache: 'no-store',
             signal: controller ? controller.signal : undefined
         });
-        if (timeoutId) clearTimeout(timeoutId);
         if (!res.ok) {
             const txt = await res.text().catch(()=>'<no-body>');
             const msg = `[ERROR] HTTP ${res.status} ${url} -> ${txt}`;
@@ -22930,7 +22543,7 @@ async function post(url, d, timeoutMs) {
         log(msg);
         console.error(msg, e);
         return { status: 'error', message: isTimeout ? (currentLang === 'zh' ? '请求超时，请稍后重试' : 'Request timed out, please retry') : String(e) };
-    }
+    } finally { if (timeoutId) clearTimeout(timeoutId); }
 }
 
 async function initWelcomeGithubStar() {
@@ -23073,19 +22686,19 @@ function _bootstrapStandaloneEditor(filename, svgText, sessionKey) {
 
     // Now call the exposed openVectorEditor to create the editor UI
     const fakeFile = { name: filename, path: '', ext: '.svg' };
+    const update = (newSvgText) => {
+        const session = fakeInstance._liveEditorSessions.get(sessionKey);
+        if (session?.updateFn) session.updateFn(newSvgText);
+    };
     fakeInstance.__openVectorEditor(fakeFile, {
         sessionKey: sessionKey,
         liveMode: true,
-        initialSvgText: svgText
+        initialSvgText: svgText,
+        onClose: () => { if (window.__standaloneEditorUpdate === update) window.__standaloneEditorUpdate = null; }
     });
 
     // Set up the update hook for live re-rendering via IPC
-    window.__standaloneEditorUpdate = (newSvgText) => {
-        const session = fakeInstance._liveEditorSessions.get(sessionKey);
-        if (session && session.updateFn) {
-            session.updateFn(newSvgText);
-        }
-    };
+    window.__standaloneEditorUpdate = update;
 }
 
 // ==========================================
@@ -23456,7 +23069,7 @@ function _bootstrapStandaloneEditor(filename, svgText, sessionKey) {
                     if (menuLinux) menuLinux._isRightClickedOpen = false;
                     if (menuR) menuR._isRightClickedOpen = false;
                 };
-                dlg.addEventListener('cancel', e => { e.preventDefault(); closeDlg(); });
+                dlg.oncancel = e => { e.preventDefault(); closeDlg(); };
                 dlg.showModal();
                 dlg.querySelector('.rename-input-zh').focus();
                 dlg.querySelector('.rename-input-zh').select();
@@ -23729,7 +23342,7 @@ function _bootstrapStandaloneEditor(filename, svgText, sessionKey) {
                     const dlg = document.createElement('div');
                     dlg.style.cssText = 'background:#fff;border-radius:12px;padding:24px;min-width:340px;box-shadow:0 12px 40px rgba(0,0,0,0.25);';
                     dlg.innerHTML = `
-                        <div style="font-size:16px;font-weight:700;margin-bottom:16px;color:#263238;"><i class="fas fa-plus-circle" style="color:#2196F3;margin-right:6px;"></i>${zh?'添加快捷访问':'Add Shortcut'}</div>
+                        <div style="font-size:16px;font-weight:700;margin-bottom:16px;color:#263238;"><i class="fas fa-plus-circle" style="color:#388e3c;margin-right:6px;"></i>${zh?'添加快捷访问':'Add Shortcut'}</div>
                         <div style="margin-bottom:12px;">
                             <label style="font-size:13px;color:#666;display:block;margin-bottom:4px;">${zh?'名称':'Name'}</label>
                             <input type="text" id="bm-dlg-name" style="width:100%;padding:8px 12px;border:2px solid #e0e0e0;border-radius:8px;font-size:14px;outline:none;box-sizing:border-box;" placeholder="${zh?'例如: 我的网站':'e.g. My Site'}" />
@@ -23740,7 +23353,7 @@ function _bootstrapStandaloneEditor(filename, svgText, sessionKey) {
                         </div>
                         <div style="display:flex;justify-content:flex-end;gap:10px;">
                             <button id="bm-dlg-cancel" style="padding:8px 20px;border:1px solid #ddd;border-radius:8px;background:#f5f5f5;cursor:pointer;font-size:13px;">${zh?'取消':'Cancel'}</button>
-                            <button id="bm-dlg-ok" style="padding:8px 20px;border:none;border-radius:8px;background:linear-gradient(135deg,#2196F3,#1976d2);color:#fff;cursor:pointer;font-size:13px;font-weight:600;">${zh?'确定':'OK'}</button>
+                            <button id="bm-dlg-ok" style="padding:8px 20px;border:none;border-radius:8px;background:linear-gradient(135deg,#388e3c,#2e7d32);color:#fff;cursor:pointer;font-size:13px;font-weight:600;">${zh?'确定':'OK'}</button>
                         </div>
                     `;
                     overlay.appendChild(dlg);
@@ -23878,9 +23491,9 @@ function _bootstrapStandaloneEditor(filename, svgText, sessionKey) {
                             <div style="text-align:center;max-width:480px;padding:40px;">
                                 <div style="font-size:56px;margin-bottom:20px;">⚠️</div>
                                 <div style="font-size:20px;font-weight:700;color:#333;margin-bottom:12px;">${cantReach}</div>
-                                <div style="font-size:14px;color:#1976d2;word-break:break-all;margin-bottom:8px;">${escapeHtml(failedUrl)}</div>
+                                <div style="font-size:14px;color:#388e3c;word-break:break-all;margin-bottom:8px;">${escapeHtml(failedUrl)}</div>
                                 <div style="font-size:13px;color:#999;margin-bottom:24px;">${escapeHtml(e.errorDescription || ('ERR_CODE: ' + e.errorCode))}</div>
-                                <button class="browser-error-retry-btn" style="padding:10px 28px;background:linear-gradient(135deg,#1976d2,#1565c0);color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;">${reloadTxt}</button>
+                                <button class="browser-error-retry-btn" style="padding:10px 28px;background:linear-gradient(135deg,#388e3c,#2e7d32);color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;">${reloadTxt}</button>
                             </div>
                         `;
                         errOverlay.querySelector('.browser-error-retry-btn').onclick = () => {

@@ -1,0 +1,13 @@
+FROM registry.fedoraproject.org/fedora@sha256:923dd7d4362a78ef7edc1887cb599720e9f59ff8669a38c81062c6e2aaa83204
+RUN dnf install -y --setopt=install_weak_deps=False \
+    crun-1.28-1.fc44 conmon-2.2.1-2.fc44 netavark-1.17.2-1.fc44 aardvark-dns-1.17.1-1.fc44 \
+    containers-common gpgme libseccomp shadow-utils iptables-nft iproute procps-ng util-linux fuse-overlayfs tar gzip && \
+    dnf clean all
+COPY release/podman-linux /usr/bin/podman
+COPY release/primigenius-engine /usr/libexec/primigenius/engine
+COPY release/primigenius-bridge-linux /usr/libexec/primigenius/bridge
+RUN mkdir -p /etc/containers /usr/lib/containers/storage /var/lib/containers/storage && \
+    printf '[engine]\ncgroup_manager="cgroupfs"\nevents_logger="file"\n[containers]\nlog_driver="k8s-file"\n' > /etc/containers/containers.conf && \
+    printf '[storage]\ndriver="overlay"\nrunroot="/run/containers/storage"\ngraphroot="/var/lib/containers/storage"\n' > /etc/containers/storage.conf && \
+    printf '[boot]\nsystemd=false\n[user]\ndefault=root\n[interop]\nenabled=true\nappendWindowsPath=false\n' > /etc/wsl.conf && \
+    rpm -qa | sort > /usr/libexec/primigenius/packages.txt
