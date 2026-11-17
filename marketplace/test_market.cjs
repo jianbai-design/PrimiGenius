@@ -338,15 +338,21 @@ async function registeredScenario(respond, action, options = {}) {
 
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'market-upload-test-'));
     const source = path.join(directory, 'original.zip'); fs.writeFileSync(source, 'original-plugin');
-    const prepared = [], versions = [];
+    const prepared = [], versions = [], snapshots = [];
+    const { snapshotFixture, gitFixture } = require('../runtime/test_market_source.cjs');
+    const git = gitFixture();
     const server = require('node:http').createServer((req, res) => {
-        assert.equal(req.url, '/prepare-plugin-upload');
         assert.equal(req.headers['x-primigenius-desktop'], 'desktop-test-secret');
         const chunks = [];
         req.on('data', chunk => chunks.push(chunk));
         req.on('end', () => {
             assert.equal(Number(req.headers['content-length']), Buffer.concat(chunks).length, 'The Node loopback transport must retain Content-Length');
-            const data = JSON.parse(Buffer.concat(chunks)); versions.push(data.version);
+            const data = JSON.parse(Buffer.concat(chunks));
+            if (req.url === '/prepare-plugin-source') {
+                const snapshot = snapshotFixture({ 'config.json': '{"id":"demo"}' }); snapshots.push(snapshot);
+                res.end(JSON.stringify(snapshot)); return;
+            }
+            assert.equal(req.url, '/prepare-plugin-upload'); versions.push(data.version);
             const file = path.join(directory, `prepared-${versions.length}.zip`);
             fs.writeFileSync(file, `plugin-version-${data.version}`); prepared.push(file);
             res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ status: 'success', zipPath: file, config: { id: 'demo', version: data.version, name: 'Demo' } }));
@@ -358,6 +364,8 @@ async function registeredScenario(respond, action, options = {}) {
     try {
         await registeredScenario((request, { url, method }) => {
             if (url.endsWith('/user')) reply(request, { id: ADMIN_ID, login: 'jianbai-design' });
+            else if (url.includes('/git/')) reply(request, git.request(new URL(url).pathname + new URL(url).search, method,
+                method === 'GET' ? undefined : JSON.parse(Buffer.concat(request.recordChunks))));
             else if (url.includes('/contents/market-state.json')) reply(request, { content: Buffer.from(JSON.stringify(catalog())).toString('base64') });
             else if (url.includes('/contents/')) {
                 const name = url.split('/contents/')[1];
@@ -389,6 +397,7 @@ async function registeredScenario(respond, action, options = {}) {
             assert(prepared.every(file => !fs.existsSync(file)), 'Superseded and submitted upload copies must be cleaned');
             assert.equal(fs.readFileSync(source, 'utf8'), 'original-plugin');
         }, { port: server.address().port, dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: [source] }) } });
-    } finally { await new Promise(resolve => server.close(resolve)); fs.rmSync(directory, { recursive: true, force: true }); }
+    } finally { await new Promise(resolve => server.close(resolve)); fs.rmSync(directory, { recursive: true, force: true });
+        for (const snapshot of snapshots) fs.rmSync(snapshot.directory, { recursive: true, force: true }); }
     console.log('Upload checks passed: required version, local preparation before GitHub, changed-version retry, original preservation and temporary-copy cleanup.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

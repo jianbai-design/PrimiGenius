@@ -217,7 +217,8 @@ class OfflineR:
                     repository, tag = self.legacy_ref.rsplit(':', 1) if ':' in self.legacy_ref else (self.legacy_ref, 'latest')
                     if not client.api.tag(image.id, repository=repository, tag=tag):
                         raise RuntimeError('Cannot assign the compatible R environment image name')
-                    # Publish only after validation; keep the previous identity for rollback.
+                    # Publish only after validation; the old environment is safe to retire
+                    # only once the new identity has been committed successfully.
                     state = dict(schema=1, validation_schema=1, image_id=image.id, recipe_sha256=self.recipe,
                                  previous_image_id=(retained_id if retained_id != image.id
                                                     else old_state.get('previous_image_id')), validated_at=int(time.time()))
@@ -229,6 +230,11 @@ class OfflineR:
                     os.replace(temp, state_file)
                     self.image_id = image.id
                     self.previous_image_id = state['previous_image_id']
+                    if self.previous_image_id:
+                        try:
+                            self._cleanup_previous(client, state, state_file)
+                        except Exception as exc:
+                            self.log('[R-ENV] Previous environment cleanup deferred: ' + str(exc))
                     self._set('ready', 'ready')
                     if manifest and self.consume_archive:
                         archive = self.bundle / 'stage' / manifest['archive']
@@ -323,22 +329,45 @@ class OfflineR:
         with self._lock, preparation_lock(self.state_dir / 'prepare.lock'):
             state_file = self.state_dir / 'active.json'
             state = json.loads(state_file.read_text(encoding='utf-8'))
-            previous = state.get('previous_image_id')
-            if not self.image_id or state.get('image_id') != self.image_id or not previous or previous == self.image_id:
-                raise RuntimeError('No unused previous R environment is available')
             client = self.client_factory()
             try:
-                image = client.images.get(previous)
-                labels = (image.attrs.get('Config') or {}).get('Labels') or {}
-                if not labels.get('org.primigenius.r-version'):
-                    raise RuntimeError('Previous image is not an application R environment')
-                if client.containers.list(all=True, filters={'ancestor': previous}):
-                    raise RuntimeError('Previous environment is still referenced by a container')
-                client.images.remove(previous, force=False, noprune=True)
-                state['previous_image_id'] = None
-                temp = state_file.with_suffix('.tmp')
-                temp.write_text(json.dumps(state, indent=2), encoding='utf-8')
-                os.replace(temp, state_file)
-                self.previous_image_id = None
+                self._cleanup_previous(client, state, state_file)
             finally:
                 client.close()
+
+    def _cleanup_previous(self, client, state, state_file):
+        previous = state.get('previous_image_id')
+        if not self.image_id or state.get('image_id') != self.image_id or not previous or previous == self.image_id:
+            raise RuntimeError('No unused previous R environment is available')
+        active = client.images.get(self.image_id)
+        if not self.matches(active):
+            raise RuntimeError('The active R environment must be verified before cleanup')
+        import docker
+        try:
+            image = client.images.get(previous)
+        except docker.errors.ImageNotFound:
+            pass  # A previous cleanup may have finished before its state was saved.
+        else:
+            if image.id == active.id:
+                raise RuntimeError('The active R environment cannot be removed as a previous image')
+            labels = (image.attrs.get('Config') or {}).get('Labels') or {}
+            if not labels.get('org.primigenius.r-version'):
+                raise RuntimeError('Previous image is not an application R environment')
+            tags = image.tags or image.attrs.get('Names') or []
+            if any(tag.split('@', 1)[0].rsplit('/', 1)[-1].split(':', 1)[0] != 'primigenius-r-base'
+                   for tag in tags):
+                raise RuntimeError('Previous environment has a user-managed image name')
+            if client.containers.list(all=True, filters={'ancestor': previous}):
+                raise RuntimeError('Previous environment is still referenced by a container')
+            # Reclaim dangling build parents too; never force-remove containers
+            # or layers still shared by the active environment or other images.
+            client.images.remove(previous, force=False, noprune=False)
+        state['previous_image_id'] = None
+        temp = state_file.with_suffix('.tmp')
+        with temp.open('w', encoding='utf-8') as output:
+            json.dump(state, output, indent=2)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp, state_file)
+        self.previous_image_id = None
+        self.log('[R-ENV] Previous environment retired: ' + previous)

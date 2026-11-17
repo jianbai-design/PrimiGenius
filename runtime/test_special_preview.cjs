@@ -41,7 +41,7 @@ app.whenReady().then(async()=>{let win,service;try{
  async function inspect(expression){const {frameTree}=await send('Page.getFrameTree'),child=frameTree.childFrames.find(item=>item.frame.url==='about:srcdoc');assert(child);const {executionContextId}=await send('Page.createIsolatedWorld',{frameId:child.frame.id,worldName:'preview-audit'});const {result,exceptionDetails}=await send('Runtime.evaluate',{contextId:executionContextId,expression,returnByValue:true});if(exceptionDetails)throw Error(JSON.stringify(exceptionDetails));return result.value;}
  const reports=[];
  for(const [kind,file,expectedPixel] of [['tiff',tiff,[200,70,30,255]],['tiff',gray,[127,127,127,255]],['tiff',alpha,[200,70,30,128]],['structure',pdb],['genome',bed]]){
-  errors.length=0;const started=Date.now();await run('globalThis.stopPreview=mount(host,'+JSON.stringify(file)+',{lang:"zh",showExternalOpen:false});true');
+  errors.length=0;const started=Date.now();await run('globalThis.stopPreview='+(kind==='genome'?'require('+JSON.stringify(path.join(uiRoot,'src/special-preview'))+').mountSpecialPreview':'mount')+'(host,'+JSON.stringify(file)+',{lang:"zh",showExternalOpen:false});true');
   await wait('!!host.querySelector("iframe[data-rendered=true]")');
   assert.equal(await run('host.querySelector("iframe").getAttribute("sandbox")'),'allow-scripts');
   assert.equal(await inspect('typeof require'),'undefined');

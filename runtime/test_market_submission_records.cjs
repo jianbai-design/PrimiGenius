@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), http = require('node:http');
 const { Writable, EventEmitter } = require('node:stream');
 const { register, REPOSITORY, ADMIN_ID, submissionReadme } = require('../src/github-market-main');
+const { snapshotFixture, gitFixture } = require('./test_market_source.cjs');
 
 async function run() {
     const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'market-records-'));
@@ -9,11 +10,15 @@ async function run() {
     fs.writeFileSync(path.join(temporary, 'github-market-session.bin'), 'test token');
     const config = { id: 'demo', name: { zh: '测试插件', en: 'Demo plugin' }, description: 'Full description', type: 'CLI',
         version: '1.0.0', command_template: 'echo test', parameters: [{ name: 'input', type: 'file', help: 'Help' }] };
-    const prepared = [];
+    const prepared = [], snapshots = [], git = gitFixture();
     const server = http.createServer((req, res) => {
         let body = ''; req.on('data', chunk => body += chunk); req.on('end', () => {
-            assert.equal(req.url, '/prepare-plugin-upload');
             assert.equal(req.headers['x-primigenius-desktop'], 'desktop');
+            if (req.url === '/prepare-plugin-source') {
+                const snapshot = snapshotFixture({ 'config.json': JSON.stringify(config), 'scripts/run.sh': 'echo demo\n' }); snapshots.push(snapshot);
+                res.end(JSON.stringify(snapshot)); return;
+            }
+            assert.equal(req.url, '/prepare-plugin-upload');
             const { version } = JSON.parse(body), zipPath = path.join(temporary, 'copy-' + prepared.length + '.zip');
             fs.writeFileSync(zipPath, 'prepared ' + version); prepared.push(zipPath);
             res.end(JSON.stringify({ status: 'success', zipPath, config: { ...config, version } }));
@@ -35,6 +40,7 @@ async function run() {
                 const data = method === 'POST' || method === 'PUT' || method === 'PATCH' ?
                     (url.hostname === 'uploads.github.com' ? null : JSON.parse(Buffer.concat(chunks).toString())) : null;
                 if (route === '/user') value = { id: 10, login: 'author' };
+                else if (route.includes('/git/')) value = git.request(route + url.search, method, data);
                 else if (route.includes('/contents/market-state.json')) value = { content: Buffer.from(JSON.stringify(state)).toString('base64') };
                 else if (route === '/repos/' + repository) value = { owner: { id: 10 }, private: false };
                 else if (route.includes('/contents/')) {
@@ -81,8 +87,11 @@ async function run() {
         assert.deepEqual(record.metadata, config); assert.equal(record.owner.login, 'author');
         assert.equal(record.plugin_id, 'community_10_demo'); assert.equal(record.changelog, args.changelog);
         assert.match(record.sha256, /^[a-f0-9]{64}$/); assert(record.size > 0);
+        assert.match(record.source.commit, /^[a-f0-9]{40}$/); assert.match(record.source.index_sha, /^[a-f0-9]{40}$/);
+        assert(git.files(record.source.commit).some(file => file.path === 'plugins/community_10_demo/scripts/run.sh'));
         const readme = Buffer.from(files.get('README.md').content, 'base64').toString();
         assert(readme.includes('测试插件 / Demo plugin')); assert(readme.includes(`submissions/${tag}.json`));
+        assert(readme.includes(`/tree/${record.source.commit}/plugins/community_10_demo`));
         assert(releaseData.get(1).body.includes(record.review.url)); assert.equal(releaseData.get(1).name, '测试插件 / Demo plugin 1.0.0');
         files.set('README.md', { sha: 'custom', content: Buffer.from('Custom author README').toString('base64') });
         const second = await invoke('market-select-source', {});
@@ -95,6 +104,7 @@ async function run() {
         assert(!escaped.includes('<img')); assert(!escaped.includes('[evil]('));
         assert(prepared.every(file => !fs.existsSync(file))); assert.equal(fs.readFileSync(source, 'utf8'), 'source fixture');
         console.log('PASS: full config records, readable releases/README, preserved index/history/custom README, conflict retry, no duplicate issues on metadata retry, safe Markdown and cleanup');
-    } finally { await new Promise(resolve => server.close(resolve)); fs.rmSync(temporary, { recursive: true, force: true }); }
+    } finally { await new Promise(resolve => server.close(resolve)); fs.rmSync(temporary, { recursive: true, force: true });
+        for (const snapshot of snapshots) fs.rmSync(snapshot.directory, { recursive: true, force: true }); }
 }
 run().catch(error => { console.error(error); process.exitCode = 1; });

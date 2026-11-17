@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const { publicGithubCandidates, raceGithubReads } = require('./src/github-public');
 const desktopApiToken = crypto.randomBytes(32).toString('hex');
 const graphicsPolicy = require('./src/gpu-policy').configureGraphics(app);
+require('./src/vector-export-main').register({app,ipcMain,BrowserWindow,dialog});
 const { register: registerMarket, REPOSITORY: MARKET_REPOSITORY } = require('./src/github-market-main');
 registerMarket({ app, ipcMain, dialog, shell,
     net: require('electron').net,
@@ -2233,12 +2234,12 @@ ipcMain.on('force-webcontents-focus', () => {
 });
 
 // ---- IPC: Create editor sub-window ----
-ipcMain.handle('create-editor-window', (event, { sessionKey, filename, svgText, lang, posIndex, totalCount }) => {
+ipcMain.handle('create-editor-window', (event, { sessionKey, filename, sourcePath, svgText, lang, posIndex, totalCount }) => {
     // If window already exists for this session, just update and focus
     if (editorWindows.has(sessionKey)) {
         const existing = editorWindows.get(sessionKey);
         if (!existing.isDestroyed()) {
-            existing.webContents.send('update-svg', svgText);
+            existing.webContents.send('update-svg', svgText, sourcePath);
             existing.focus();
             return { status: 'updated' };
         }
@@ -2273,11 +2274,17 @@ ipcMain.handle('create-editor-window', (event, { sessionKey, filename, svgText, 
 
     editorWin.loadFile(path.join(__dirname, 'src/editor.html'));
     editorWin.setMenuBarVisibility(false);
+    editorWin.on('close', event => {
+        if (editorWin.__vectorCloseApproved || editorWin.webContents.isDestroyed() || editorWin.webContents.isCrashed() || editorWin.webContents.isLoadingMainFrame()) return;
+        event.preventDefault();
+        editorWin.webContents.send('editor-request-close');
+    });
 
     editorWin.webContents.once('did-finish-load', () => {
         editorWin.webContents.send('init-editor', {
             sessionKey,
             filename,
+            sourcePath,
             svgText,
             lang
         });
@@ -2296,11 +2303,11 @@ ipcMain.handle('create-editor-window', (event, { sessionKey, filename, svgText, 
 });
 
 // ---- IPC: Update SVG in existing editor window ----
-ipcMain.handle('update-editor-svg', (event, { sessionKey, svgText }) => {
+ipcMain.handle('update-editor-svg', (event, { sessionKey, svgText, sourcePath }) => {
     if (editorWindows.has(sessionKey)) {
         const win = editorWindows.get(sessionKey);
         if (!win.isDestroyed()) {
-            win.webContents.send('update-svg', svgText);
+            win.webContents.send('update-svg', svgText, sourcePath);
             win.focus();
             return { status: 'updated' };
         }
@@ -3402,7 +3409,7 @@ ipcMain.handle('plugin-update-download', async (event, updateInfo) => {
                     'Content-Type': 'application/json',
                     'Content-Length': Buffer.byteLength(postData)
                 },
-                timeout: 30000
+                timeout: 60 * 60 * 1000
             }, (res) => {
                 let data = '';
                 res.on('data', chunk => data += chunk);

@@ -13,6 +13,7 @@ app.setPath('userData',path.join(output,'profile'));
 const graphics = require('../src/gpu-policy').configureGraphics(app,{PRIMIGENIUS_GPU_MODE:process.argv.includes('--software')?'software':'auto'});
 ipcMain.on('get-backend-port-sync',event=>{event.returnValue=65534;});
 ipcMain.handle('rendering-diagnostics',()=>graphics.snapshot());
+require('../src/vector-export-main').register({app,ipcMain,BrowserWindow,dialog:{showSaveDialog:async()=>({canceled:false,filePath:path.join(output,'qa-export.svg')})}});
 let window;
 const report = {mode:process.argv.includes('--software')?'software':'auto',packaged:!!asarArgument,errors:[]};
 const startedAt = performance.now();
@@ -131,6 +132,9 @@ app.whenReady().then(async()=>{
             button('redo').click();assert(svg().querySelector('#editable').textContent==='更新后的中文 🧬','Text redo failed');
             result.textEditing=true;
             let exported;
+            const exportFs=require('fs'),exportPath=${JSON.stringify(path.join(output,'qa-export.svg'))};
+            const exportedText=async()=>{for(let i=0;i<200;i++){if(exported)return exported.text();if(exportFs.existsSync(exportPath)&&!document.querySelector('.r-ve-export-confirm'))return exportFs.readFileSync(exportPath,'utf8');await new Promise(r=>setTimeout(r,20));}throw Error('SVG export did not finish');};
+            exportFs.rmSync(exportPath,{force:true});
             const create=URL.createObjectURL.bind(URL);
             const anchorClick=HTMLAnchorElement.prototype.click;
             URL.createObjectURL=blob=>{if(blob.type.startsWith('image/svg+xml'))exported=blob;return create(blob);};
@@ -138,18 +142,58 @@ app.whenReady().then(async()=>{
             overlay.querySelector('.r-ve-export-unified-btn').click();
             const format=overlay.querySelector('.r-ve-export-fmt');format.value='svg';format.dispatchEvent(new Event('change'));
             overlay.querySelector('.r-ve-export-confirm').click();
-            assert(exported,'Vector export did not produce an SVG');
-            const xml=await exported.text();
+            const xml=await exportedText();
             assert(xml.includes('更新后的中文')&&xml.includes('<text')&&!xml.includes('data:image/png'),'Vector export rasterized or lost text');
             URL.createObjectURL=create;
             HTMLAnchorElement.prototype.click=anchorClick;
             result.vectorExport=true;
             window.__editorStandalone=false;
             overlay.querySelector('.r-ve-close-btn').click();
+            overlay.querySelector('.ve-confirm [data-choice="1"]')?.click();
+            await new Promise(resolve=>setTimeout(resolve,30));
             assert(activeListeners===0,'Editor retained global event handlers');
+            // Cairo writes letters as paths referenced by <use>, not <text>.
+            const purifier=require(${JSON.stringify(path.join(uiRoot,'src/preview-sanitize'))}).default;
+            const glyphs=Array.from({length:762},(_,i)=>'<use xlink:href="#glyph-qa" x="'+(10+i%38*12)+'" y="'+(12+Math.floor(i/38)*12)+'"/>').join('');
+            const cairo='<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="500" height="300"><defs><symbol id="glyph-qa" overflow="visible"><path d="M0 0L4 0L2 -6Z"/></symbol></defs><g fill="black">'+glyphs+'</g></svg>';
+            const parse=value=>new DOMParser().parseFromString(value,'image/svg+xml');
+            const safe=purifier.sanitizeSvg(cairo);
+            assert(parse(safe).querySelectorAll('use').length===762,'Cairo glyph references were removed');
+            assert(!purifier.sanitize(cairo,{USE_PROFILES:{svg:true,svgFilters:true}}).includes('<use'),'Generic sanitizer was weakened');
+            for(const href of ['https://example.invalid/a.svg#x','file:///tmp/a.svg#x','javascript:alert(1)','data:image/svg+xml,test','#missing']){
+                assert(!parse(purifier.sanitizeSvg('<svg xmlns="http://www.w3.org/2000/svg"><use href="'+href+'"/></svg>')).querySelector('use'),'Unsafe or unresolved use survived: '+href);
+            }
+            const cycles='<svg xmlns="http://www.w3.org/2000/svg"><defs><g id="cycle-a"><use href="#cycle-b"/></g><g id="cycle-b"><use href="#cycle-a"/></g></defs><use href="#cycle-a"/></svg>';
+            assert(!parse(purifier.sanitizeSvg(cycles)).querySelector('use'),'Cyclic references survived');
+            const mixed='<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xml:base="https://example.invalid/" onload="bad()"><defs><path id="safe-qa" d="M0 0L4 4"/></defs><script>bad()</script><use href="#safe-qa" xlink:href="https://example.invalid/evil.svg#x" onclick="bad()"/></svg>';
+            const scoped=parse(purifier.sanitizeSvg(mixed));
+            assert(scoped.querySelector('use')?.getAttribute('href')==='#safe-qa','Valid primary local reference lost');
+            assert(!scoped.querySelector('script')&&!scoped.documentElement.hasAttribute('xml:base')&&!scoped.documentElement.hasAttribute('onload'),'Active SVG content survived');
+            assert(!scoped.querySelector('use').hasAttribute('onclick')&&!scoped.querySelector('use').hasAttribute('xlink:href'),'Unsafe alternate reference survived');
+            _bootstrapStandaloneEditor('cairo.svg',cairo,'qa-cairo');
+            const cairoOverlay=document.querySelector('.r-vector-editor-overlay');
+            const cairoSvg=()=>cairoOverlay.querySelector('.r-ve-viewport>svg:not(.r-ve-draw-layer)');
+            assert(cairoSvg().querySelectorAll('use').length===762,'Editor lost glyph references');
+            assert(cairoSvg().querySelector('use').getBBox().width>0,'Cairo glyph has no visible geometry');
+            exported=null;
+            exportFs.rmSync(exportPath,{force:true});
+            URL.createObjectURL=blob=>{if(blob.type.startsWith('image/svg+xml'))exported=blob;return create(blob);};
+            HTMLAnchorElement.prototype.click=function(){};
+            cairoOverlay.querySelector('.r-ve-export-unified-btn').click();
+            const cairoFormat=cairoOverlay.querySelector('.r-ve-export-fmt');cairoFormat.value='svg';cairoFormat.dispatchEvent(new Event('change'));
+            cairoOverlay.querySelector('.r-ve-export-confirm').click();
+            const cairoExport=await exportedText();
+            assert(parse(purifier.sanitizeSvg(cairoExport)).querySelectorAll('use').length===762,'Export/reimport lost glyphs');
+            URL.createObjectURL=create;HTMLAnchorElement.prototype.click=anchorClick;
+            window.__editorStandalone=false;cairoOverlay.querySelector('.r-ve-close-btn').click();
+            cairoOverlay.querySelector('.ve-confirm [data-choice="1"]')?.click();
+            await new Promise(resolve=>setTimeout(resolve,30));
+            assert(activeListeners===0,'Cairo editor retained global handlers');
+            result.cairoGlyphs={imported:762,exported:762,reimported:762,unsafeReferencesBlocked:true};
             for(let i=0;i<10;i++){
                 _bootstrapStandaloneEditor('repeat.svg','<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><text x="10" y="30">x</text></svg>','repeat-'+i);
                 document.querySelector('.r-ve-close-btn').click();
+                await new Promise(resolve=>setTimeout(resolve,0));
             }
             assert(activeListeners===0&&!document.querySelector('.r-vector-editor-overlay'),'Repeated close retained editor handlers or DOM');
             const opens=[];

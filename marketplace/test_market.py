@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sys
 import os
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -14,7 +15,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'backend'))
 sys.path.insert(0, str(ROOT / 'marketplace/github'))
-from plugin_archive import extract_plugin, inspect_archive, replace_plugin, package_upload, pack_source
+from plugin_archive import extract_plugin, inspect_archive, inspect_install_archive, replace_plugin, package_upload, pack_source
 import market_runner as market
 
 
@@ -163,10 +164,134 @@ class Archives(unittest.TestCase):
         return target
 
     def test_reject_unsafe_and_conflicting_paths(self):
-        for name in ('../escape', '/absolute', 'a\\escape', 'C:/escape', 'CON.txt', 'a./file', 'config.JSON'):
+        for name in ('../escape', '/absolute', 'a\\..\\escape', 'a/..\\escape', 'C:/escape',
+                     'C:\\escape', '\\\\server\\share', 'CON.txt', 'a./file', 'config.JSON',
+                     'a\\CON.txt', 'a\\file:stream', 'a\\file.', 'a\x00hidden',
+                     './a/../escape', './C:\\escape', './\\escape', './a/./file'):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 with zipfile.ZipFile(self.archive(extras={name: 'bad'})) as archive: inspect_archive(archive)
         self.assertFalse((self.root.parent / 'escape').exists())
+
+    def test_windows_zip_paths_install_and_upload_portably(self):
+        for prefix in ('', 'plugin\\'):
+            source = self.root / 'windows.zip'
+            with zipfile.ZipFile(source, 'w') as archive:
+                for name, raw in ((prefix + 'config.json', b'{"id":"demo","version":"1.0.0"}'),
+                                  (prefix + 'bin\\', b''), (prefix + 'bin\\run.sh', b'#!/bin/sh\necho test\n'),
+                                  (prefix + 'data/mixed\\file.txt', b'payload')):
+                    info = zipfile.ZipInfo(name)
+                    info.filename = name
+                    archive.writestr(info, raw)
+            with zipfile.ZipFile(source) as archive:
+                # Also simulate POSIX readers, which retain backslashes in filename.
+                for info in archive.infolist():
+                    info.filename = info.orig_filename
+                cfg, root, entries = inspect_archive(archive)
+                self.assertEqual(cfg['id'], 'demo')
+                self.assertEqual(root, 'plugin/' if prefix else '')
+                self.assertTrue(all('\\' not in info.filename for info in entries))
+                self.assertEqual(archive.read(entries[-1]), b'payload')
+                self.assertIn('\\', archive.infolist()[-1].filename)
+            installed = self.root / ('wrapped' if prefix else 'unwrapped')
+            replace_plugin(source, installed)
+            self.assertEqual((installed / 'data/mixed/file.txt').read_bytes(), b'payload')
+            uploaded = self.root / 'upload.zip'
+            package_upload(source, uploaded, '1.0.1')
+            with zipfile.ZipFile(uploaded) as archive:
+                self.assertTrue(all('\\' not in info.orig_filename for info in archive.infolist()))
+                self.assertEqual(inspect_archive(archive)[0]['version'], '1.0.1')
+
+    def test_reject_conflicts_after_separator_normalization(self):
+        for name in ('bin/run.sh', 'BIN/RUN.SH'):
+            source = self.archive(extras={'bin\\run.sh': 'first', name: 'second'})
+            with zipfile.ZipFile(source) as archive, self.assertRaisesRegex(ValueError, '冲突'):
+                inspect_archive(archive)
+
+    def test_current_directory_prefix_installs_and_uploads_without_rewriting_source(self):
+        for separator in ('/', '\\'):
+            source = self.root / 'dot-prefix.zip'
+            with zipfile.ZipFile(source, 'w') as archive:
+                for name, raw in ((f'.{separator}', b''),
+                                  (f'.{separator}config.json', b'{"id":"demo"}'),
+                                  (f'.{separator}.{separator}bin{separator}run.sh', b'echo test')):
+                    info = zipfile.ZipInfo(name)
+                    info.filename = name
+                    archive.writestr(info, raw)
+            before = source.read_bytes()
+            with zipfile.ZipFile(source) as archive:
+                for info in archive.infolist():
+                    info.filename = info.orig_filename  # POSIX reader behavior.
+                _, prefix, entries = inspect_archive(archive)
+                self.assertEqual(prefix, '')
+                self.assertEqual([i.filename for i in entries], ['config.json', 'bin/run.sh'])
+                self.assertEqual(archive.read(entries[-1]), b'echo test')
+            replace_plugin(source, self.root / 'installed')
+            self.assertEqual((self.root / 'installed/bin/run.sh').read_bytes(), b'echo test')
+            uploaded = self.root / 'upload.zip'
+            package_upload(source, uploaded, '1.0.0')
+            self.assertEqual(source.read_bytes(), before)
+            with zipfile.ZipFile(uploaded) as archive:
+                self.assertEqual(archive.namelist(), ['config.json', 'bin/run.sh'])
+        source = self.archive(extras={'./config.json': '{"id":"demo"}'})
+        with zipfile.ZipFile(source) as archive, self.assertRaisesRegex(ValueError, '冲突'):
+            inspect_install_archive(archive)
+
+    def test_large_install_policy_retains_upload_and_install_bounds(self):
+        source = self.archive(extras={'data/database': 'tiny fixture'})
+        with zipfile.ZipFile(source) as archive:
+            archive.getinfo('data/database').file_size = 51 * 1024 ** 3
+            with self.assertRaisesRegex(ValueError, '大小'):
+                inspect_archive(archive)
+            self.assertEqual(inspect_install_archive(archive)[0]['id'], 'demo')
+            archive.getinfo('data/database').file_size = 129 * 1024 ** 3
+            with self.assertRaisesRegex(ValueError, '大小'):
+                inspect_install_archive(archive)
+        with zipfile.ZipFile(source) as archive:
+            entries = [archive.getinfo('config.json')] + [zipfile.ZipInfo(f'data/{i}') for i in range(10000)]
+            with patch.object(archive, 'infolist', return_value=entries):
+                with self.assertRaisesRegex(ValueError, '数量'):
+                    inspect_archive(archive)
+                self.assertEqual(len(inspect_install_archive(archive)[2]), 10001)
+            with patch.object(archive, 'infolist', return_value=entries * 10):
+                with self.assertRaisesRegex(ValueError, '数量'):
+                    inspect_install_archive(archive)
+
+    def test_insufficient_space_fails_before_extraction_and_preserves_install(self):
+        source = self.archive()
+        destination = self.root / 'installed'
+        replace_plugin(source, destination)
+        before = (destination / 'config.json').read_bytes()
+        disk = shutil.disk_usage(self.root)._replace(free=0)
+        with patch('plugin_archive.shutil.disk_usage', return_value=disk), \
+                patch('plugin_archive.shutil.copyfileobj', side_effect=AssertionError('must not extract')), \
+                self.assertRaisesRegex(ValueError, '磁盘空间不足'):
+            replace_plugin(source, destination)
+        self.assertEqual((destination / 'config.json').read_bytes(), before)
+        self.assertFalse(list(self.root.glob('.plugin-install-*')))
+
+    def test_install_http_route_uses_large_package_policy(self):
+        import ast
+        from contextlib import nullcontext
+        from flask import Flask, jsonify, request
+        tree = ast.parse((ROOT / 'backend/app.py').read_text(encoding='utf-8-sig'))
+        handler = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'install_plugin_panel')
+        app = Flask('large-install-route')
+        source = self.archive(extras={'data/database': b'small payload for resource-policy test'})
+        real_zip = zipfile.ZipFile
+        def open_declared_large_package(*args, **kwargs):
+            archive = real_zip(*args, **kwargs)
+            archive.getinfo('data/database').file_size = 2 * 1024 ** 3
+            return archive
+        namespace = dict(app=app, request=request, jsonify=jsonify, zipfile=zipfile, os=os,
+                         inspect_install_archive=inspect_install_archive, replace_plugin=replace_plugin,
+                         find_config_by_id=lambda _: None, PLUGINS_DIR=str(self.root / 'store'),
+                         path_lock=lambda _: nullcontext(), invalidate_plugin_cache=lambda: None)
+        exec(compile(ast.Module(body=[handler], type_ignores=[]), '<real install route>', 'exec'), namespace)
+        with patch('plugin_archive.zipfile.ZipFile', side_effect=open_declared_large_package):
+            response = app.test_client().post('/install-plugin-panel', json={'zipPath': str(source)})
+        self.assertEqual(response.json['status'], 'success', response.json)
+        self.assertEqual((self.root / 'store/linux/demo/data/database').read_bytes(),
+                         b'small payload for resource-policy test')
 
     def test_upload_version_fills_missing_and_overrides_existing_without_changing_source(self):
         for old in (None, '0.1.0', 'invalid'):
@@ -315,6 +440,54 @@ class Archives(unittest.TestCase):
         output = self.root / 'output'; output.mkdir()
         with patch.object(market, 'download_source', copy_source), self.assertRaisesRegex(ValueError, '名称和描述'):
             market.prepare_release(FakeAPI(), market.initial_state(), e, output)
+
+
+class OnlineSource(unittest.TestCase):
+    def test_snapshot_is_verified_against_zip_and_fixed_commit(self):
+        import base64
+        from plugin_source import source_index, blob_sha, text_chunks
+        with tempfile.TemporaryDirectory(prefix='market-source-review-') as temporary:
+            root = Path(temporary)
+            config = {'id': 'demo', 'version': '1.0.0', 'command_template': 'echo test'}
+            (root / 'config.json').write_text(json.dumps(config), encoding='utf-8')
+            text = ('中文😀\r\n' + 'A' * 270000 + '\n') * 4 + 'final'
+            (root / 'large.py').write_bytes(text.encode())
+            (root / 'empty.txt').write_bytes(b'')
+            (root / 'binary.gz').write_bytes(b'\x1f\x8b\0')
+            index = source_index(root)
+            self.assertEqual(b''.join(text_chunks(root / 'large.py')).decode(), text)
+            self.assertGreater(index['files']['large.py']['size'], 512 * 1024)
+            self.assertEqual(index['omitted']['binary.gz'], 'binary')
+            self.assertEqual(index['files']['empty.txt']['chunks'], [])
+            raw = json.dumps(index).encode()
+            source = {'repository': 'user10/PrimiGenius-market-uploads', 'commit': 'a' * 40,
+                      'index_sha': blob_sha(raw), 'path': 'plugins/community_10_demo',
+                      'preview_path': '.primigenius-preview/community_10_demo'}
+            entries = [{'path': source['preview_path'] + '/index.json', 'sha': source['index_sha'], 'type': 'blob', 'mode': '100644'}]
+            for name, file in index['files'].items():
+                entries.append({'path': source['path'] + '/' + name, 'sha': file['sha'], 'type': 'blob', 'mode': file['mode']})
+                for n, chunk in enumerate(file['chunks']):
+                    entries.append({'path': source['preview_path'] + '/' + file['sha256'] + '/' + str(n),
+                                    'sha': chunk['sha'], 'type': 'blob', 'mode': '100644'})
+            calls = []
+            class FakeAPI:
+                repo = 'jianbai-design/PrimiGenius-community-plugins'
+                def request(self, route):
+                    calls.append(route)
+                    if '/git/trees/' in route:
+                        return {'tree': entries, 'truncated': False}
+                    return {'encoding': 'base64', 'content': base64.b64encode(raw).decode()}
+            api = FakeAPI()
+            self.assertTrue(market.verify_source_snapshot(api, source, root, 'community_10_demo'))
+            self.assertTrue(any('/git/trees/' + 'a' * 40 in route for route in calls))
+            entries[-1]['sha'] = 'b' * 40
+            with self.assertRaisesRegex(ValueError, '不一致'):
+                market.verify_source_snapshot(api, source, root, 'community_10_demo')
+            entries[-1]['sha'] = index['files']['large.py']['chunks'][-1]['sha']
+            (root / 'large.py').write_text('changed', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, '不一致'):
+                market.verify_source_snapshot(api, source, root, 'community_10_demo')
+            self.assertFalse(market.verify_source_snapshot(api, {}, root, 'community_10_demo'))
 
 
 if __name__ == '__main__':

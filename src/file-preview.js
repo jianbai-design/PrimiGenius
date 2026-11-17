@@ -1,13 +1,10 @@
 'use strict';
 const {EventEmitter} = require('events');
 const {ipcRenderer} = require('electron');
-const countClients=new Map();
-ipcRenderer.on('file-preview-count',(_event,id,result)=>countClients.get(id)?.emit('line-count',result));
 class PreviewClient extends EventEmitter {
     constructor(filePath,kind,request=page=>page) {
         super();this.closed=false;this.request=request;
         this.session=ipcRenderer.invoke('file-preview-open',filePath,kind);
-        this.session.then(id=>{if(!this.closed)countClients.set(id,this);}).catch(()=>{});
         this.session.catch(error=>{if(!this.closed)this.emit('error',error);});
     }
     postMessage({id,page}) {
@@ -20,7 +17,7 @@ class PreviewClient extends EventEmitter {
     }
     terminate() {
         if(this.closed)return;this.closed=true;
-        this.session.then(session=>{countClients.delete(session);return ipcRenderer.invoke('file-preview-close',session);}).catch(()=>{});
+        this.session.then(session=>ipcRenderer.invoke('file-preview-close',session)).catch(()=>{});
     }
 }
 
@@ -28,19 +25,23 @@ function mountFilePreview(container, filePath, {kind='table', lang='zh', onDimen
     if (/\.docx$/i.test(filePath)) {
         return require('./docx-preview').mountDocxPreview(container,filePath,{lang,onDimensions,showExternalOpen});
     }
-    if (/\.(tiff?|pdb|cif|mmcif|sdf|mol2|xyz|bam|cram|bcf|bw|bigwig|bb|bigbed)$|\.(vcf|bed|gff3?|gtf)(\.gz)?$/i.test(filePath)) return require('./special-preview').mountSpecialPreview(container,filePath,{lang});
+    if (/\.(tiff?|pdb|cif|mmcif|sdf|mol2|xyz|bam|cram|bcf|bw|bigwig|bb|bigbed)$/i.test(filePath)) return require('./special-preview').mountSpecialPreview(container,filePath,{lang});
     if (/\.(zip|tar|tgz|gz)$/i.test(filePath)) return require('./archive-preview').mountArchivePreview(container,filePath,{lang});
+    if (/\.(vcf|bed|gff3?|gtf)$/i.test(filePath)) kind='text';
     return mountScrollingPreview(container,filePath,{kind,lang,showExternalOpen,onDimensions});
 }
 
-function mountScrollingPreview(container,filePath,{kind,lang,showExternalOpen,onDimensions=()=>{},client:providedClient,countRows=true}) {
+function mountScrollingPreview(container,filePath,{kind,lang,showExternalOpen,onDimensions=()=>{},client:providedClient}) {
     const zh=lang==='zh',doc=container.ownerDocument;
     container.replaceChildren();
     container.style.cssText+=';display:flex;flex-direction:column;min-height:0;overflow:hidden;flex:1;';
-    const toolbar=doc.createElement('div'),status=doc.createElement('span'),viewport=doc.createElement('div'),tail=doc.createElement('div');
+    const toolbar=doc.createElement('div'),status=doc.createElement('span'),wrapNotice=doc.createElement('span'),viewport=doc.createElement('div'),tail=doc.createElement('div');
     toolbar.className='r-viewer-footer';
     toolbar.style.cssText='color:#555;display:flex;align-items:center;flex-shrink:0;';
-    toolbar.append(status);
+    wrapNotice.className='file-preview-wrap-notice';wrapNotice.hidden=true;
+    wrapNotice.setAttribute('role','note');wrapNotice.style.cssText='color:#777;font-size:12px;line-height:1.4;';
+    wrapNotice.textContent=zh?'长行已自动折行显示，原文件未增加换行。':'Long lines are visually wrapped; no line breaks were added to the original file.';
+    toolbar.append(status,wrapNotice);
     status.style.display='none';
     if(!showExternalOpen)toolbar.style.display='none';
     if(showExternalOpen){const open=doc.createElement('button');open.type='button';open.className='r-viewer-action-btn';open.textContent=zh?'系统应用打开完整文件':'Open full file';open.onclick=()=>require('electron').shell.openPath(filePath);toolbar.append(open);}
@@ -70,38 +71,42 @@ function mountScrollingPreview(container,filePath,{kind,lang,showExternalOpen,on
         freezeInput.onchange=()=>{tableHeaderDispose?.setFrozen(freezeInput.checked);for(const block of blocks)block._dispose?.setFrozen?.(freezeInput.checked);};
     }
     const client=providedClient||new PreviewClient(filePath,kind),blocks=[],visible=new Set(),wanted=new Set();
-    function lineCountLabel(text,title=''){
-        const label=container.closest('.wf-preview-window,.r-viewer-window')?.querySelector('.file-preview-lines');
-        if(label){label.textContent=text;label.title=title;}
-    }
-    if(countRows)queueMicrotask(()=>lineCountLabel(zh?'｜ 行数统计中…':'｜ Counting rows…'));
-    client.on('line-count',result=>{
-        if(result.error){lineCountLabel(zh?'｜ 行数暂不可用':'｜ Row count unavailable');return;}
-        const unit=result.label==='dataRows'?(zh?'数据行':'data rows'):(zh?'行':'rows');
-        const note=result.label==='sheetRows'?(zh?'当前工作表范围，含表头及范围内空行':'Current worksheet range, including headers and blank rows'):result.label==='dataRows'?(zh?'不含表头；引号内换行不另计一行':'Excludes the header; quoted newlines stay in one record'):'';
-        lineCountLabel(`｜ ${result.rows.toLocaleString()} ${unit}`,note);
-    });
-    let busy=false,done=false,disposed=false,serial=0,timeout,scheduled;
-    const dispose=()=>{if(disposed)return;disposed=true;clearTimeout(timeout);clearTimeout(scheduled);viewport.removeEventListener('scroll',onScroll);intersection.disconnect();mutation.disconnect();client.terminate();for(const block of blocks)block._dispose?.();tableHeaderDispose?.();freezeControl?.remove();};
+    let busy=false,done=false,disposed=false,serial=0,timeout,scheduled,pendingTrim=false;
+    const dispose=()=>{if(disposed)return;disposed=true;clearTimeout(timeout);clearTimeout(scheduled);viewport.removeEventListener('scroll',onScroll);intersection.disconnect();resize.disconnect();mutation.disconnect();client.terminate();for(const block of blocks)block._dispose?.();tableHeaderDispose?.();freezeControl?.remove();};
     const mutation=new MutationObserver(()=>{if(!container.isConnected)dispose();});
     mutation.observe(doc.body,{childList:true,subtree:true});
-    function fail(message){toolbar.style.display='flex';status.style.display='';status.textContent=message;tail.textContent=message;dispose();}
+    function fail(message){client.onFailure?.(message);toolbar.style.display='flex';status.style.display='';status.textContent=message;tail.textContent=message;dispose();}
+    function armTimeout(){
+        clearTimeout(timeout);
+        timeout=setTimeout(()=>fail(client.timeoutMessage || (zh?'读取超时，请重新打开或使用系统应用。':'Read timed out; reopen or use the system application.')),client.timeoutMs || 30000);
+    }
+    client.on('progress',update=>{
+        if(disposed || !busy)return;
+        armTimeout();if(update.text)tail.textContent=update.text;
+    });
     function request(){
         if(disposed || busy)return;
-        for(const index of [...wanted])if(index<blocks.length && !visible.has(index))wanted.delete(index);
+        for(const index of [...wanted])if(index<blocks.length && (!visible.has(index) || blocks[index].dataset.loaded==='true'))wanted.delete(index);
         const index=wanted.values().next().value;
         if(index===undefined)return;
         wanted.delete(index);busy=index+1;
         tail.textContent=zh?'正在读取…':'Loading…';
-        timeout=setTimeout(()=>fail(zh?'读取超时，请重新打开或使用系统应用。':'Read timed out; reopen or use the system application.'),30000);
+        armTimeout();
         client.postMessage({id:++serial,page:index});
     }
     function trim(){
         // Keep only nearby content. Measured placeholders preserve scroll positions.
+        // Intersection callbacks can lag behind rapid scrolling and editor layout changes.
+        const bounds=!isTable && viewport.getBoundingClientRect();
+        const measured=!isTable && blocks.map(block=>block.getBoundingClientRect());
+        if(measured)visible.clear();
         for(let index=0;index<blocks.length;index++){
-            const block=blocks[index];
+            const block=blocks[index],rect=measured && measured[index];
+            if(rect && rect.bottom>=bounds.top-800 && rect.top<=bounds.bottom+800){
+                visible.add(index);if(block.dataset.loaded!=='true')wanted.add(index);
+            }
             if(block.dataset.loaded==='true' && !visible.has(index)){
-                const height=block.offsetHeight;
+                const height=rect?rect.height:block.offsetHeight;
                 block._dispose?.();block._dispose=null;
                 block.style.height=height+'px';block.replaceChildren();
                 block.dataset.loaded='false';
@@ -115,12 +120,24 @@ function mountScrollingPreview(container,filePath,{kind,lang,showExternalOpen,on
             if(entry.isIntersecting){visible.add(index);if(entry.target.dataset.loaded!=='true')wanted.add(index);}
             else visible.delete(index);
         }
-        clearTimeout(scheduled);scheduled=setTimeout(()=>{trim();request();},16);
+        schedule(true);
     },{root:viewport,rootMargin:'800px 0px'});
     function onScroll(){
+        if(!isTable)schedule(true);
         // A fast scroll may keep the sentinel intersecting across two loads.
-        if(!done && viewport.scrollTop+viewport.clientHeight>=viewport.scrollHeight-800){wanted.add(blocks.length);request();}
+        if(!done && viewport.clientHeight>0 && viewport.scrollTop+viewport.clientHeight>=viewport.scrollHeight-800){wanted.add(blocks.length);request();}
     }
+    function schedule(prune=false){
+        if(disposed)return;
+        pendingTrim ||= prune;
+        clearTimeout(scheduled);scheduled=setTimeout(()=>{
+            if(pendingTrim){pendingTrim=false;trim();}
+            if(!done && viewport.clientHeight>0 && viewport.scrollHeight<=viewport.clientHeight+1)wanted.add(blocks.length);
+            request();
+        },16);
+    }
+    const resize=new doc.defaultView.ResizeObserver(()=>schedule());
+    resize.observe(viewport);
     viewport.addEventListener('scroll',onScroll,{passive:true});
     intersection.observe(tail);
     client.on('message',result=>{
@@ -131,7 +148,8 @@ function mountScrollingPreview(container,filePath,{kind,lang,showExternalOpen,on
         let block=blocks[index];
         if(!block){
             block=doc.createElement('div');block.className='file-preview-segment';block.dataset.segment=String(index);
-            blocks.push(block);if(isTable)table.append(block);else viewport.insertBefore(block,tail);intersection.observe(block);
+            // Keep new content until its first visibility observation arrives.
+            blocks.push(block);visible.add(index);if(isTable)table.append(block);else viewport.insertBefore(block,tail);intersection.observe(block);
             done=!result.hasNext;
         }
         const oldHeight=block.offsetHeight;
@@ -145,12 +163,14 @@ function mountScrollingPreview(container,filePath,{kind,lang,showExternalOpen,on
             });
         }
         block._dispose=isTable?require('./preview-components').table(block,result,{frozen:freezeInput.checked,viewport,showHeader:false,columnWidths}):require('./preview-components').text(block,result,filePath);
+        if(!isTable && block._dispose?.wrapped){wrapNotice.hidden=false;toolbar.style.display='flex';}
         if(result.sheetName)onDimensions(result.sheetName);
         if(result.note){toolbar.style.display='flex';status.style.display='';status.textContent=result.note;}
         block.dataset.loaded='true';
         if(above)viewport.scrollTop+=block.offsetHeight-oldHeight;
         tail.textContent=done?(isTable && result.note?(zh?'已到快速预览末尾':'End of quick preview'):(zh?'已到文件末尾':'End of file')):(zh?'继续向下滚动以读取后续内容':'Scroll down for more content');
-        request();
+        // Recheck after layout even when the short first page leaves the sentinel visible.
+        schedule(!isTable);
     });
     client.on('error',error=>fail(error.message));
     wanted.add(0);request();
@@ -160,11 +180,10 @@ function decoratePreviewHeader(header,filePath,lang='zh') {
     const doc=header.ownerDocument,title=header.querySelector(':scope > span');
     if(!title)return;
     const icon=title.querySelector('i'),dims=title.querySelector('.wf-table-dims,.r-table-dims,.r-text-dims');
-    const name=doc.createElement('span'),meta=doc.createElement('span'),lines=doc.createElement('span');
+    const name=doc.createElement('span'),meta=doc.createElement('span');
     name.className='file-preview-name';name.textContent=require('path').basename(filePath);name.title=filePath;
     meta.className='file-preview-meta';title.classList.add('file-preview-title');
-    lines.className='file-preview-meta file-preview-lines';
-    title.replaceChildren(...[icon,name,meta,dims,lines].filter(Boolean));
+    title.replaceChildren(...[icon,name,meta,dims].filter(Boolean));
     if(dims)dims.style.color='#666';
     if(!header.querySelector('.fa-external-link-alt')) {
         const prior=header.closest('.r-viewer-window')?.querySelector('[data-action="openext"]');

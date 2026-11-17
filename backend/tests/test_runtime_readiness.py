@@ -24,12 +24,14 @@ class RuntimeReadinessTests(unittest.TestCase):
     def setUp(self):
         self.delay = 0.7
         self.engine = 'primigenius-libpod'
+        self.version = '5.8.5'
         test = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 time.sleep(test.delay)
-                body = json.dumps({'engine': test.engine, 'version': 'test'}).encode()
+                body = json.dumps({'engine': test.engine, 'version': test.version,
+                                   'commit': test.runtime.manifest()['podman_commit']}).encode()
                 try:
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
@@ -67,6 +69,12 @@ class RuntimeReadinessTests(unittest.TestCase):
         self.assertIn('timed out', self.runtime.last_error)
         self.assertTrue(self.runtime.ping(), self.runtime.last_error)
         self.assertEqual(self.runtime.last_error, '')
+
+    def test_a_different_patch_engine_is_not_reported_as_the_fixed_runtime(self):
+        self.delay = 0
+        self.version = '5.8.8'
+        self.assertFalse(self.runtime.ping())
+        self.assertIn('fixed runtime', self.runtime.last_error)
 
     def test_manager_does_not_mark_a_slow_healthy_engine_degraded(self):
         manager = object.__new__(PodmanManager)
@@ -107,10 +115,12 @@ class RuntimeReadinessTests(unittest.TestCase):
             process.poll.return_value = None
             with patch.object(self.runtime, 'ping', side_effect=readiness), \
                     patch.object(self.runtime, 'validate', return_value={'podman_version': 'test'}), \
-                    patch('embedded_runtime.subprocess.Popen', return_value=process):
+                    patch('embedded_runtime.subprocess.Popen', return_value=process) as spawn:
                 begin = time.monotonic()
                 self.assertTrue(self.runtime.start(timeout=1.5), self.runtime.last_error)
                 self.assertLess(time.monotonic() - begin, 2)
+                self.assertEqual('C.UTF-8', spawn.call_args.kwargs['env']['LC_ALL'])
+                self.assertIn('LANG', spawn.call_args.kwargs['env']['WSLENV'].split(':'))
             process.terminate.assert_not_called()
 
     def test_wrong_engine_is_still_rejected(self):

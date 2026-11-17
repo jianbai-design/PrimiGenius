@@ -1,6 +1,6 @@
 {
   "name": "primigenius",
-  "version": "1.2.0",
+  "version": "1.2.4",
   "main": "main.js",
   "description": "Bioinformatics Analysis Tool with Built-in Container Runtime",
   "author": "生信美学",

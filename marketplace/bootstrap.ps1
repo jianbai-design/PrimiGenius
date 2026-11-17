@@ -70,6 +70,7 @@ try {
     $files = @{
         'market_runner.py' = Join-Path $PSScriptRoot 'github/market_runner.py'
         'plugin_archive.py' = Join-Path $projectRoot 'backend/plugin_archive.py'
+        'plugin_source.py' = Join-Path $projectRoot 'backend/plugin_source.py'
         'sign.js' = Join-Path $PSScriptRoot 'github/sign.js'
         '.github/workflows/market.yml' = Join-Path $PSScriptRoot 'github/workflow.yml'
     }

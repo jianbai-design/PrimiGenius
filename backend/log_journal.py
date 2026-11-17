@@ -66,8 +66,10 @@ class LogJournal:
             sql = 'SELECT * FROM events WHERE seq>?'
             args = [max(0, int(after))]
             if run_id != '*':
-                sql += ' AND runId=?'
-                args.append(run_id)
+                # Slash-delimited child runs share an archive without copying
+                # events; the range is literal and uses the runId index.
+                sql += ' AND (runId=? OR (runId>=? AND runId<?))'
+                args.extend((run_id, run_id + '/', run_id + '0'))
             if until is not None:
                 sql += ' AND seq<=?'
                 args.append(int(until))
@@ -87,7 +89,9 @@ class LogJournal:
             db = self._connect()
             if run_id == '*':
                 return db.execute('SELECT COALESCE(MAX(seq),0) FROM events').fetchone()[0]
-            return db.execute('SELECT COALESCE(MAX(seq),0) FROM events WHERE runId=?', (run_id,)).fetchone()[0]
+            return db.execute('SELECT COALESCE(MAX(seq),0) FROM events '
+                              'WHERE runId=? OR (runId>=? AND runId<?)',
+                              (run_id, run_id + '/', run_id + '0')).fetchone()[0]
 
     def flush(self):
         with self.lock:

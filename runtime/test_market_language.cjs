@@ -62,6 +62,91 @@ async function checkPage() {
     assert.match(banner(), /rate limit exceeded/);
     switchLanguage('zh'); assert.match(banner(), /请求次数已达上限/);
     assert.equal(errorMessage(new Error('Unknown server detail'), 'zh'), 'Unknown server detail');
+    // Installation state survives success, failed retries, rerenders and language changes.
+    const installIPC=new (require('events').EventEmitter)(),installTabs={},installHost=document.createElement('main');document.body.append(installHost);
+    const repository='jianbai-design/PrimiGenius-community-plugins',origin={source:'github:'+repository,owner_github_id:10};
+    const versions={fresh:null,update:'1.0.0',same:'2.0.0',newer:'3.0.0',conflict:'2.0.0',unknown:'invalid',race:null};
+    const plugins={},installed={};let installCalls=0,pluginRefreshes=0,failInstall=false,failInstalled=false;
+    for(const [name,version]of Object.entries(versions)){
+        const id='community_10_'+name;plugins[id]={id,listed:true,owner:{id:10,login:'author'},collaborators:[],metadata:{name,type:'cli'},published:{version:'2.0.0'}};
+        if(version)installed[id]={id,version,marketplace:{...origin}};
+    }
+    installed.community_10_conflict.marketplace.source='github:other/store';
+    installIPC.invoke=async(channel,args)=>{
+        if(channel==='market-list')return {user:null,repository,state:{plugins,requests:{},blocked:[],reviewers:[],audit:[]}};
+        if(channel==='market-download-counts')return {ok:true,counts:{}};
+        if(channel==='market-installed'){if(failInstalled)throw Error('local read failed');return {ok:true,plugins:structuredClone(installed)};}
+        if(channel==='market-install'){
+            installCalls++;if(failInstall)throw Error('install failed');
+            installed[args.pluginId]={id:args.pluginId,version:'2.0.0',marketplace:{...origin}};
+            return {ok:true,id:args.pluginId,version:'2.0.0',skipped:args.pluginId.endsWith('_race')};
+        }
+        throw Error('Unexpected install IPC: '+channel);
+    };
+    const settleInstall=async()=>{for(let i=0;i<6;i++)await settle();};
+    const installButton=name=>installHost.querySelector('[data-market-install="community_10_'+name+'"]');
+    lang='zh';open({ipc:installIPC,tabs:installTabs,language:()=>lang,switchTab(){},createTabFrame(_id,_caption,mount){mount(installHost);},refreshPlugins:async()=>{pluginRefreshes++;}});await settleInstall();
+    for(const [name,caption]of Object.entries({fresh:'安装',update:'更新',same:'已安装',newer:'本地版本较新',conflict:'来源冲突',unknown:'本地版本未知'}))assert.equal(installButton(name).textContent,caption);
+    for(const name of ['same','newer','conflict','unknown']){assert.equal(installButton(name).disabled,true);installButton(name).click();}
+    assert.equal(installCalls,0);installButton('fresh').click();await settleInstall();
+    assert.equal(installCalls,1);assert.equal(pluginRefreshes,1);assert.equal(installButton('fresh').textContent,'已安装');assert.equal(installButton('fresh').disabled,true,'Action wrapper re-enabled an installed plugin');
+    installButton('fresh').click();await settleInstall();assert.equal(installCalls,1);
+    failInstall=true;installButton('update').click();await settleInstall();assert.equal(installButton('update').textContent,'更新');assert.equal(installButton('update').disabled,false);
+    assert.equal(installIPC.listenerCount('market-install-progress'),0);
+    failInstall=false;installButton('update').click();await settleInstall();assert.equal(installButton('update').disabled,true);assert.equal(installButton('update').textContent,'已安装');
+    installButton('race').click();await settleInstall();assert.equal(installButton('race').disabled,true);assert.match(installHost.querySelector('.market-notice').textContent,/跳过重复安装/);
+    lang='en';installTabs['sys-marketplace'].renderMarket();assert.equal(installButton('fresh').textContent,'Installed');assert.equal(installButton('newer').textContent,'Newer version installed');
+    assert.equal(installButton('same').disabled,true);lang='zh';installTabs['sys-marketplace'].renderMarket();assert.equal(installButton('same').textContent,'已安装');
+    failInstalled=true;installHost.querySelector('.plugin-store-refresh').click();await settleInstall();assert.equal(installButton('same').disabled,true);assert.match(installButton('same').textContent,/检查失败/);
+    failInstalled=false;installHost.querySelector('.plugin-store-refresh').click();await settleInstall();assert.equal(installButton('same').textContent,'已安装');
+    console.log('PASS: marketplace install/update/installed/newer/source/unknown labels, duplicate-click prevention, post-install disabled state, retry, stale-state no-op, EN/ZH rerenders and local-read recovery');
+    // Use the actual upload dialog and every progress stage emitted by the main process.
+    const uploadIPC = new (require('events').EventEmitter)(), uploadTabs = {}, uploadHost = document.createElement('main'); document.body.append(uploadHost);
+    let listReads = 0, submits = 0, rejectUpload;
+    uploadIPC.invoke = async channel => {
+        if (channel === 'market-download-counts') return { ok: true, counts: {} };
+        if (channel === 'market-list') { listReads++; return { user: { id: 134767426, login: 'admin', role: 'admin' },
+            state: { plugins: {}, blocked: [], requests: {}, reviewers: [], audit: [] } }; }
+        if (channel === 'market-select-source') return { id: 'fixture', name: 'plugin.zip', size: 1024, sha256: 'a'.repeat(64) };
+        if (channel === 'market-submit') { submits++; return new Promise((_resolve, reject) => rejectUpload = reject); }
+        if (channel === 'market-discard-source') return { ok: true };
+        throw new Error('Unexpected upload IPC: ' + channel);
+    };
+    lang = 'en';
+    open({ ipc: uploadIPC, tabs: uploadTabs, language: () => lang, switchTab() {}, createTabFrame(_id, _caption, mount) { mount(uploadHost); } });
+    await settle();
+    [...uploadHost.querySelectorAll('button')].find(button => button.textContent === 'Upload plugin').click();
+    const dialog = document.querySelector('.market-upload-dialog'); assert(dialog);
+    [...dialog.querySelectorAll('button')].find(button => button.textContent === 'Choose ZIP').click(); await settle();
+    dialog.querySelector('.market-version-row input').value = '2.0.1';
+    dialog.querySelector('textarea').value = '优化界面参数排版';
+    [...dialog.querySelectorAll('button')].find(button => button.textContent === 'Upload and submit').click(); await settle();
+    assert(rejectUpload);
+    const source = require('fs').readFileSync(path.join(root, 'src/github-market-main.js'), 'utf8');
+    const stages = [...new Set([...source.matchAll(/progress\('([^']+)'\)/g)].map(match => match[1]))];
+    assert.equal(stages.length, 10);
+    const beforeLanguageSwitch = listReads;
+    for (const stage of stages) {
+        uploadIPC.emit('market-progress', {}, { selection: 'fixture', text: stage + '…' });
+        const english = dialog.querySelector('.market-dialog-status').textContent;
+        assert(!/[\u3400-\u9fff]/.test(english), 'Untranslated upload stage: ' + english);
+        assert(english.endsWith('…'));
+        lang = 'zh'; uploadTabs['sys-marketplace'].renderMarket();
+        assert.equal(dialog.querySelector('.market-dialog-status').textContent, stage + '…');
+        lang = 'en'; uploadTabs['sys-marketplace'].renderMarket();
+        assert.equal(dialog.querySelector('.market-dialog-status').textContent, english, 'Current upload stage changes language without waiting for another event');
+    }
+    assert.equal(listReads, beforeLanguageSwitch, 'Stage localization must not retry network operations'); assert.equal(submits, 1);
+    assert.equal(dialog.querySelector('textarea').value, '优化界面参数排版', 'User change notes are not translated');
+    const latest = dialog.querySelector('.market-dialog-status').textContent;
+    uploadIPC.emit('market-progress', {}, { selection: 'another-upload', text: '本地准备安装包…' });
+    assert.equal(dialog.querySelector('.market-dialog-status').textContent, latest);
+    rejectUpload(new Error("Error invoking remote method 'market-submit': Error: 同步可浏览的源码与滚动预览索引失败：retry test")); await settle();
+    assert.match(dialog.querySelector('.market-dialog-status').textContent, /^Syncing browsable source and scrolling preview index failed: retry test$/);
+    dialog.querySelector('.market-close').click(); await settle();
+    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+    assert.equal(uploadIPC.listenerCount('market-progress'), 0);
+    console.log('PASS: all 10 upload stages in EN/ZH, immediate language switching, localized failure context, preserved user notes, isolated upload events and listener cleanup');
     console.log('PASS: immediate EN/ZH marketplace error switching, rate limits, network errors, stale-data suffix, account warning, action errors, retained filters and zero language-switch requests');
 }
 

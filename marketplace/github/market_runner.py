@@ -18,9 +18,11 @@ import zipfile
 
 try:
     from plugin_archive import extract_plugin, valid_plugin_id
+    from plugin_source import source_index, blob_sha
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'backend'))
     from plugin_archive import extract_plugin, valid_plugin_id
+    from plugin_source import source_index, blob_sha
 
 ADMIN_ID = 134767426
 MAX_SIZE = 256 * 1024 * 1024
@@ -162,6 +164,51 @@ def download_source(api, source, actor, destination):
         raise ValueError('提交文件摘要不匹配，不能继续审核')
 
 
+def verify_source_snapshot(api, source, extracted, plugin_id):
+    """Bind browsable files and every preview fragment to the submitted ZIP."""
+    if not source.get('commit'):
+        # Existing clients/requests predate online source snapshots.
+        return False
+    if (not re.fullmatch('[a-f0-9]{40}', str(source.get('commit', ''))) or
+            not re.fullmatch('[a-f0-9]{40}', str(source.get('index_sha', ''))) or
+            source.get('path') != 'plugins/' + plugin_id or
+            source.get('preview_path') != '.primigenius-preview/' + plugin_id):
+        raise ValueError('在线源码快照地址不合法')
+    route = '/repos/' + source['repository']
+    tree = api.request(route + '/git/trees/' + source['commit'] + '?recursive=1')
+    if tree.get('truncated'):
+        raise ValueError('在线源码文件树不完整')
+    entries = {item['path']: item for item in tree['tree'] if item['type'] == 'blob'}
+    index_path = source['preview_path'] + '/index.json'
+    if entries.get(index_path, {}).get('sha') != source['index_sha']:
+        raise ValueError('在线源码索引不属于审核提交')
+    index_blob = api.request(route + '/git/blobs/' + source['index_sha'])
+    if index_blob.get('encoding') != 'base64':
+        raise ValueError('在线源码索引编码不合法')
+    raw = base64.b64decode(index_blob['content'])
+    if blob_sha(raw) != source['index_sha']:
+        raise ValueError('在线源码索引摘要不匹配')
+    expected = source_index(extracted)
+    if json.loads(raw) != expected:
+        raise ValueError('仓库源码索引与安装包不一致')
+    wanted = {index_path: source['index_sha']}
+    for name, file in expected['files'].items():
+        target = source['path'] + '/' + name
+        wanted[target] = file['sha']
+        if entries.get(target, {}).get('mode') != file['mode']:
+            raise ValueError('仓库源码权限与安装包不一致: ' + name)
+        for n, chunk in enumerate(file['chunks']):
+            wanted[source['preview_path'] + '/' + file['sha256'] + '/' + str(n)] = chunk['sha']
+    actual = {name: item['sha'] for name, item in entries.items()
+              if name.startswith(source['path'] + '/') or name.startswith(source['preview_path'] + '/')}
+    if actual != wanted:
+        raise ValueError('仓库源码或预览分块与安装包不一致')
+    if any(item['type'] not in ('tree', 'blob') for item in tree['tree']
+           if item['path'].startswith(source['path'] + '/') or item['path'].startswith(source['preview_path'] + '/')):
+        raise ValueError('源码快照不允许子模块或特殊对象')
+    return True
+
+
 def prepare_release(api, state, event, output, existing=None):
     data = issue_data(event) if existing is None else existing
     author = actor_from(event) if existing is None else existing['author']
@@ -200,6 +247,7 @@ def prepare_release(api, state, event, output, existing=None):
             owner = p['owner']
         if not valid_plugin_id(plugin_id):
             raise ValueError('市场插件 ID 不合法')
+        source_verified = verify_source_snapshot(api, source, extracted, plugin_id)
         if existing is not None:
             # Frozen author identity is part of the approved package, including username spelling.
             owner = existing['owner']
@@ -233,7 +281,7 @@ def prepare_release(api, state, event, output, existing=None):
                    for name in sorted(set(files) | set(old_files)) if files.get(name) != old_files.get(name)]
         record = {'kind': 'release', 'issue': event['issue']['number'], 'author': author, 'owner': owner,
                   'plugin_id': plugin_id, 'original_id': data.get('original_id', original), 'version': cfg['version'],
-                  'source': source, 'metadata': cfg, 'sha256': digest, 'size': size, 'files': files, 'changes': changes,
+                  'source': source, 'source_verified': source_verified, 'metadata': cfg, 'sha256': digest, 'size': size, 'files': files, 'changes': changes,
                   'changelog': str(data.get('changelog', ''))[:8000],
                   'status': 'pending_review' if author['id'] == owner['id'] else 'awaiting_author'}
         if existing is not None and digest != existing['sha256']:

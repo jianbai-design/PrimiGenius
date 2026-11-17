@@ -48,17 +48,22 @@ function table(element,result,{frozen=true,viewport=element.closest('.file-previ
 function text(element,result,filePath){
     const cm=require('./preview-codemirror');
     const ext=path.extname(filePath).toLowerCase();
+    // Soft-wrap pathological lines without changing source text or copying the whole file.
+    const longLine=result.continuedLine || /[^\r\n]{4097}/.test(result.text);
+    const wrap=result.wrapLines ?? longLine;
     const language=ext==='.json'?cm.json():['.xml','.svg'].includes(ext)?cm.xml():ext==='.py'?cm.python():ext==='.r'?cm.StreamLanguage.define(cm.r):[];
     const view=new cm.EditorView({parent:element,state:cm.EditorState.create({doc:result.text,extensions:[
         cm.EditorState.readOnly.of(true),cm.EditorView.editable.of(false),cm.lineNumbers({formatNumber:number=>String((result.startLine||1)+number-1)}),cm.highlightSpecialChars(),cm.drawSelection(),
         cm.keymap.of([...cm.searchKeymap,...cm.defaultKeymap]),cm.highlightSelectionMatches(),language,
-        cm.syntaxHighlighting(cm.defaultHighlightStyle),cm.EditorView.theme({'&':{fontSize:'13px',color:'#333',backgroundColor:'#fff'},'.cm-content':{paddingTop:'0'},'.cm-scroller':{fontFamily:'Consolas,monospace',overflow:'visible',width:'max-content',minWidth:'100%'}})
+        cm.syntaxHighlighting(cm.defaultHighlightStyle),wrap?cm.EditorView.lineWrapping:[],cm.EditorView.theme({'&':{fontSize:'13px',color:'#333',backgroundColor:'#fff'},'.cm-content':{paddingTop:'0'},'.cm-scroller':{fontFamily:'Consolas,monospace',overflow:'visible',width:wrap?'100%':'max-content',minWidth:'100%'}})
     ]})});
+    if(wrap)return Object.assign(()=>view.destroy(),{wrapped:longLine});
     // Preserve the widest measured text even when virtualization removes its line or segment.
     let minimumWidth=0;
     function rememberWidth(){
         const width=view.scrollDOM.scrollWidth;
-        if(width>minimumWidth){minimumWidth=width;element.style.minWidth=width+'px';}
+        const viewport=element.closest('.file-preview-scroll');
+        if(width>minimumWidth && width>(viewport?.clientWidth||0)+1){minimumWidth=width;element.style.minWidth=width+'px';}
     }
     rememberWidth();
     const observer=new element.ownerDocument.defaultView.ResizeObserver(rememberWidth);

@@ -1349,6 +1349,9 @@ class PodmanManager:
                 getattr(self, '_wsl_storage_missing', False)):
             self._set_connection_state('attention')
             return False
+        if getattr(self.runtime, 'migration_blocked', False) is True:
+            self._set_connection_state('attention')
+            return False
         if getattr(self, '_runtime_provisioning_pending', False):
             self._set_connection_state('starting')
             return False  # auto_setup owns the import before IPC may start.
@@ -1720,6 +1723,9 @@ class PodmanManager:
                 self._setup_running = False
 
     def _auto_setup_impl(self):
+        # Explicit setup retries migration after the reported conflict is fixed;
+        # the monitor never repeats a destructive/unsupported migration attempt.
+        self.runtime.migration_blocked = False
         if not self.is_podman_available():
             self._set_connection_state('attention')
             return False, self.runtime.last_error

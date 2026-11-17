@@ -5,7 +5,7 @@ const images={'.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.gif'
 function mountArchivePreview(container,filePath,{lang='zh'}={}){
     const zh=lang==='zh',doc=container.ownerDocument,win=doc.defaultView;
     const gzip=/\.gz$/i.test(filePath)&&!/\.tar\.gz$/i.test(filePath);
-    if(gzip)return mountScrollingPreview(container,filePath.replace(/\.gz$/i,''),{kind:'text',lang,showExternalOpen:false,countRows:false,
+    if(gzip)return mountScrollingPreview(container,filePath.replace(/\.gz$/i,''),{kind:'text',lang,showExternalOpen:false,
         client:new PreviewClient(filePath,'archive',page=>({action:'text',entry:0,page}))});
     container.replaceChildren();container.classList.add('archive-preview');
     container.style.cssText+=';display:flex;flex-direction:row;flex:1;min-height:0;padding:0;overflow:hidden;background:#fff;color:#333;';
@@ -103,7 +103,7 @@ function mountArchivePreview(container,filePath,{lang='zh'}={}){
         if(/\.(zip|gz|tar|tgz|7z|rar|xlsx?|docx?|pptx?|pdf|bam|bai|cram|bcf|exe|dll|so|tiff?|ico)$/i.test(entry.name)){
             body.textContent=zh?'此类型暂不支持包内预览，请使用压缩软件查看。':'This member type is not available for in-archive preview; use your archive application.';return;
         }
-        stopMember=mountScrollingPreview(body,entry.name,{kind:'text',lang,showExternalOpen:false,countRows:false,
+        stopMember=mountScrollingPreview(body,entry.name,{kind:'text',lang,showExternalOpen:false,
             client:new PreviewClient(filePath,'archive',page=>({action:'text',entry:entry.id,page}))});
     }
     load();return dispose;

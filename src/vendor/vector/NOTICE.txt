@@ -1,0 +1,6 @@
+Paper.js 0.12.18, geometry core (MIT)
+Source: https://registry.npmjs.org/paper/-/paper-0.12.18.tgz
+Upstream: https://github.com/paperjs/paper.js
+Unmodified dist/paper-core.min.js; loaded only by vector-geometry-worker.js.
+SHA-256: 3a8c73ecdf3929a7fe05f96b82e8146193ea449c5c3e889c5f4fe0184a30ed96
+Copyright and permission notice: paper-LICENSE.txt.

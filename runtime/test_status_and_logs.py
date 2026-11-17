@@ -31,6 +31,55 @@ def functions(*names):
 
 
 class StatusAndLogTests(unittest.TestCase):
+    def test_workflow_archive_includes_all_steps_and_client_messages_in_order(self):
+        import re
+        import threading
+        with tempfile.TemporaryDirectory(dir=ROOT / 'build', prefix='workflow-log-') as folder:
+            path = str(pathlib.Path(folder) / 'events.sqlite3')
+            journal = LogJournal(path)
+            scope = functions('append_client_logs', '_publish_run_log_event', 'log_history', 'download_run_logs')
+            scope.update(re=re, _LOG_JOURNAL=journal, _LOG_EVENT_COND=threading.Condition())
+            app = Flask(__name__)
+            with app.test_request_context('/logs/events', method='POST', json={
+                    'runId': 'wf-one', 'channel': 'Workflow', 'message': '开始\n调度'}):
+                self.assertEqual(scope['append_client_logs']().get_json()['status'], 'success')
+            for index in range(601):
+                journal.append('wf-one/run-a', 'Linux', ['重复 🧬'])
+                journal.append('wf-one/run-b', 'R', [f'parallel {index}'])
+                journal.append('wf-other/run-c', 'Linux', ['unrelated'])
+                journal.append('wf-one-more/run-d', 'R', ['similar prefix'])
+            journal.append('wf-one', 'Workflow', ['finished'])
+            expected = []
+            after = 0
+            while page := journal.read('*', after, 1000):
+                expected.extend(e for e in page if e['runId'] == 'wf-one' or e['runId'].startswith('wf-one/'))
+                after = page[-1]['seq']
+            found, after = [], 0
+            while True:
+                with app.test_request_context(f'/logs/history?runId=wf-one&afterSeq={after}&limit=71'):
+                    page = scope['log_history']().get_json()
+                found.extend(page['events'])
+                after = page['nextSeq']
+                if not page['has_more']:
+                    break
+            self.assertEqual(found, expected)
+            self.assertEqual(len(found), 1205)
+            with app.test_request_context('/logs/download?runId=wf-one'):
+                exported = scope['download_run_logs']().get_data(as_text=True)
+            self.assertEqual(exported.count('[Linux] 重复 🧬'), 601)
+            self.assertIn('[RUN:wf-one/run-b] [R] parallel 600', exported)
+            self.assertIn('[Workflow] 开始\n[Workflow] 调度', exported)
+            self.assertNotIn('unrelated', exported)
+            self.assertNotIn('similar prefix', exported)
+            self.assertEqual(len(journal.read('wf-one/run-a', limit=1000)), 601)
+            journal.close()
+            self.assertEqual(journal.latest('wf-one'), expected[-1]['seq'])
+            journal.close()
+            for body in ({'runId': '*', 'channel': 'Workflow', 'message': 'bad'},
+                         {'runId': 'wf-one', 'channel': 'Workflow', 'message': 'x' * (256 * 1024 + 1)}):
+                with app.test_request_context('/logs/events', method='POST', json=body):
+                    self.assertEqual(scope['append_client_logs']()[1], 400)
+
     def test_recovered_manager_bypasses_an_older_sdk_retry_delay(self):
         import threading
         scope = functions('get_docker_client')

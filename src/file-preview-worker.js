@@ -9,49 +9,7 @@ const offsets = [];
 const lineOffsets = [1];
 const rowOffsets = [1], PAGE_CHARS=2*1024*1024;
 let bytesRead = 0;
-let counting = false;
 let streamedBook;
-function startLineCount() {
-    if(counting)return;counting=true;
-    const emit=(rows,label)=>parentPort.postMessage({event:'line-count',rows,label,size:initial.size,mtimeMs:initial.mtimeMs,kind:workerData.kind});
-    const cached=workerData.cachedCount;
-    if(cached && cached.size===initial.size && cached.mtimeMs===initial.mtimeMs && cached.kind===workerData.kind){emit(cached.rows,cached.label);return;}
-    if(excel){emit(excel.totalRows,'sheetRows');return;}
-    const logical=workerData.kind==='table',buffer=Buffer.alloc(1024*1024);
-    let position=bom,rows=0,quoted=false,nonblank=false,previousCR=false,lastNewline=false;
-    function scan() {
-        try {
-            const count=fs.readSync(fd,buffer,0,buffer.length,position);position+=count;
-            if(!logical && count){
-                if(width===2 && count%2)throw Error('Incomplete UTF-16 character');
-                const text=width===1?buffer.toString('latin1',0,count):iconv.decode(buffer.subarray(0,count),encoding);
-                rows+=(text.match(/\r\n|\r|\n/g)||[]).length;
-                if(previousCR && text[0]==='\n')rows--;
-                previousCR=text.endsWith('\r');lastNewline=/[\r\n]$/.test(text);
-            }
-            for(let i=0;logical && i<count;i+=width){
-                const code=width===1?buffer[i]:encoding==='utf16le'?buffer.readUInt16LE(i):buffer.readUInt16BE(i);
-                if(logical && code===34)quoted=!quoted;
-                const newline=(code===10 || code===13) && (!logical || !quoted);
-                if(newline){
-                    if(!(code===10 && previousCR)){if(!logical || nonblank)rows++;nonblank=false;}
-                    previousCR=code===13;lastNewline=true;
-                }else{
-                    previousCR=false;lastNewline=false;
-                    if(code!==32 && code!==9)nonblank=true;
-                }
-            }
-            if(count && position<initial.size){setTimeout(scan,2);return;}
-            const current=fs.statSync(workerData.path);
-            if(current.size!==initial.size || current.mtimeMs!==initial.mtimeMs)throw Error('File changed');
-            if(logical && quoted)throw Error('Unclosed quoted field');
-            if(logical){if(nonblank)rows++;rows=Math.max(0,rows-1);}
-            else if(initial.size>bom && !lastNewline)rows++;
-            emit(rows,logical?'dataRows':'lines');
-        }catch(error){parentPort.postMessage({event:'line-count',error:error.message});}
-    }
-    setTimeout(scan,2);
-}
 function read(buffer, position) {
     const count = fs.readSync(fd, buffer, 0, buffer.length, position);
     bytesRead += count;
@@ -174,7 +132,7 @@ function text(page) {
         } else if (encoding === 'utf8') { while (end > 0 && (buffer[end] & 0xc0) === 0x80) end--; }
         else { let i=0; while(i<end) { const next=i+(buffer[i]>=0x81?2:1); if(next>end){end=i;break;} i=next; } }
     }
-    // Prefer a complete line without scanning beyond this bounded byte window.
+    // Prefer complete lines without discarding most of a window for a short header.
     let continuedLine = false;
     if (start + end < initial.size) {
         let lineEnd = -1;
@@ -187,9 +145,11 @@ function text(page) {
             const newline=buffer.lastIndexOf(10,end-1);
             if(newline>=0)lineEnd=newline+1;
         }
-        if(lineEnd>0)end=lineEnd;
+        if(lineEnd>=end/2 && lineEnd>0)end=lineEnd;
         else continuedLine=true;
     }
+    // Do not split a CRLF pair between pages, including when a long line fills the window.
+    if(start+end<initial.size && end>=width && iconv.decode(buffer.subarray(end-width,end+width),encoding)==='\r\n')end-=width;
     offsets[page+1] = start+end;
     const value=iconv.decode(buffer.subarray(0,end),encoding);
     lineOffsets[page+1]=lineOffsets[page]+(value.match(/\r\n|\r|\n/g)||[]).length;
@@ -207,11 +167,9 @@ parentPort.on('message', async ({page=0,id}) => {
         if(workerData.kind !== 'text' && /\.xlsx$/i.test(workerData.path)) {
             if(!streamedBook) {
                 streamedBook=new (require('./xlsx-preview').WorkbookPreview)(workerData.path,workerData.cacheDir);
-                streamedBook.ready.then(()=>{if(!streamedBook.error)parentPort.postMessage({event:'line-count',rows:streamedBook.rows,label:'dataRows',size:initial.size,mtimeMs:initial.mtimeMs,kind:workerData.kind});});
             }
             result=await streamedBook.page(page);
         } else result=workerData.kind==='text'?text(page):/\.xls$/i.test(workerData.path)?spreadsheet(page):table(page);
         parentPort.postMessage({id,...result,bytesRead});
-        if(!streamedBook)startLineCount();
     } catch (error) { parentPort.postMessage({id,error:error.message}); }
 });

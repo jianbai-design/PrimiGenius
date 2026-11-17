@@ -14,7 +14,7 @@ import unittest
 from unittest.mock import Mock
 import uuid
 
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -23,6 +23,7 @@ class RunFailureCompatibilityTests(unittest.TestCase):
     def test_success_failures_and_existing_native_outputs(self):
         tree = ast.parse((ROOT / 'backend/app.py').read_text(encoding='utf-8-sig'))
         route = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'run_plugin')
+        prepare_output = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_prepare_analysis_output')
         route.decorator_list = []
         app = Flask(__name__)
         for stage in ('success', 'create', 'start', 'wait', 'logs', 'nonzero'):
@@ -52,7 +53,7 @@ class RunFailureCompatibilityTests(unittest.TestCase):
                                     return_value={'StatusCode': 1 if stage == 'nonzero' else 0})
                         final_logs = Mock(side_effect=RuntimeError('logs failed') if stage == 'logs' else None)
                         scope = dict(os=os, json=json, re=re, uuid=uuid, time=time, datetime=datetime,
-                                     traceback=traceback, request=request, jsonify=jsonify,
+                                     traceback=traceback, request=request, jsonify=jsonify, g=g,
                                      threading=SimpleNamespace(local=threading.local, Event=threading.Event,
                                                                Thread=lambda **kw: Mock()),
                                      _LOG_CONTEXT=threading.local(), R_DOCKER_IMAGE='other-r-image',
@@ -64,7 +65,7 @@ class RunFailureCompatibilityTests(unittest.TestCase):
                                      _create_container_with_image_repair=create, _robust_container_wait=wait,
                                      _push_docker_event=lambda event: None, RUNNING_CONTAINERS={},
                                      _collect_final_logs=final_logs, _schedule_container_cleanup=Mock())
-                        exec(compile(ast.Module(body=[route], type_ignores=[]), 'backend/app.py', 'exec'), scope)
+                        exec(compile(ast.Module(body=[prepare_output, route], type_ignores=[]), 'backend/app.py', 'exec'), scope)
                         data = dict(pluginId='fixture', outDir=folder, params={}, threads=2, clientRunId='legacy-run')
                         with app.test_request_context('/run-plugin', method='POST', json=data):
                             result = scope['run_plugin']().get_json()

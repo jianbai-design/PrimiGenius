@@ -1,5 +1,79 @@
 'use strict';
 const { createAccountMenu } = require('./github-account');
+const { installState } = require('./market-install-state');
+let reviewWatch = null;
+
+const uploadStages = new Map([
+    ['本地准备安装包', 'Preparing upload package locally'],
+    ['验证 GitHub 账号', 'Verifying GitHub account'],
+    ['读取市场审核与权限信息', 'Loading marketplace review and permissions'],
+    ['检查个人上传仓库', 'Checking personal upload repository'],
+    ['同步可浏览的源码与滚动预览索引', 'Syncing browsable source and scrolling preview index'],
+    ['准备 GitHub Release', 'Preparing GitHub Release'],
+    ['检查已上传附件', 'Checking uploaded attachments'],
+    ['上传 GitHub 插件附件', 'Uploading plugin attachment to GitHub'],
+    ['提交市场审核申请', 'Submitting marketplace review request'],
+    ['记录作者仓库中的插件信息（审核申请已提交，失败可重试补全）', 'Saving plugin details to the author repository (review submitted; retry if saving fails)']
+]);
+function uploadProgressText(text, lang) {
+    const message = String(text || '');
+    if (lang === 'zh') return message;
+    const stage = message.replace(/(?:…|\.{3})$/, '');
+    const translated = uploadStages.get(stage);
+    return translated ? translated + message.slice(stage.length) : message;
+}
+
+function canReview(account, request, plugin) {
+    return !!account && (account.role === 'admin' || account.role === 'reviewer' && request.author?.id !== account.id &&
+        plugin?.owner?.id !== account.id && !(plugin?.collaborators || []).some(person => person.id === account.id));
+}
+function pendingReviewCount(data) {
+    return Object.values(data?.state?.requests || {}).filter(request => request.kind === 'release' && request.status === 'pending_review' &&
+        canReview(data.user, request, data.state.plugins?.[request.plugin_id])).length;
+}
+function watchReviews({ ipc, button, language, openReviews, prepareSession }) {
+    reviewWatch?.dispose();
+    const badge = button.ownerDocument.createElement('button'); badge.type = 'button'; badge.className = 'market-review-badge'; badge.hidden = true;
+    button.append(badge);
+    let last = null, timer, busy = false, again = false, disposed = false, version = 0;
+    function paint() {
+        const count = pendingReviewCount(last), zh = language() === 'zh';
+        badge.textContent = count > 99 ? '99+' : String(count); badge.hidden = !count;
+        badge.title = zh ? `${count} 个插件待你审核，点击查看` : `${count} plugin${count === 1 ? '' : 's'} awaiting your review; click to view`;
+        badge.setAttribute('aria-label', badge.title);
+        button.title = count ? badge.title : zh ? '自由市场' : 'Community Market';
+    }
+    function update(data) { version++; last = data; paint(); }
+    async function refresh() {
+        if (disposed) return;
+        clearTimeout(timer);
+        if (busy) { again = true; return; }
+        busy = true; const current = version;
+        try {
+            await prepareSession?.();
+            const session = await ipc.invoke('market-session');
+            if (disposed || current !== version) return;
+            if (!session?.token) { update(null); return; }
+            const data = await ipc.invoke('market-list', { force: false });
+            if (!disposed && current === version && !data.accountUnavailable) update(data);
+        } catch (_) { /* Keep the last verified count through a temporary network failure. */ }
+        finally {
+            busy = false;
+            if (!disposed) {
+                if (again) { again = false; queueMicrotask(refresh); }
+                else timer = setTimeout(refresh, 60000);
+            }
+        }
+    }
+    const click = event => { event.stopPropagation(); openReviews(); };
+    const keydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); openReviews(); } };
+    badge.addEventListener('click', click);
+    badge.addEventListener('keydown', keydown);
+    reviewWatch = { update, refresh, localize: paint, clear: () => update(null),
+        dispose() { disposed = true; clearTimeout(timer); badge.removeEventListener('click', click); badge.removeEventListener('keydown', keydown); badge.remove(); } };
+    refresh();
+    return reviewWatch;
+}
 
 function errorMessage(error, lang = 'zh') {
     const message = String(error && error.message || error || '')
@@ -14,6 +88,10 @@ function errorMessage(error, lang = 'zh') {
     if (message === '插件列表已加载，但暂时无法验证 GitHub 登录状态，请稍后刷新') {
         return lang === 'zh' ? message : 'The plugin list is loaded, but GitHub sign-in could not be verified. Refresh later.';
     }
+    if (lang !== 'zh') for (const [stage, translated] of uploadStages) {
+        const prefix = stage + '失败：';
+        if (message.startsWith(prefix)) return translated + ' failed: ' + message.slice(prefix.length);
+    }
     return message;
 }
 
@@ -22,11 +100,15 @@ function open({ ipc, tabs, createTabFrame, switchTab, language, refreshPlugins, 
     if (tabs[id]) { switchTab(id); return; }
     const t = (zh, en) => language() === 'zh' ? zh : en;
     createTabFrame(id, t('自由市场', 'Community Market'), root => {
-        const model = { view: 'browse', query: '', kind: 'all', data: null, counts: {}, loading: false, loadError: '' };
+        const model = { view: 'browse', query: '', kind: 'all', data: null, counts: {}, installed: null, installedError: '', loading: false, loadError: '' };
         let installId = '', installPanel = null, installBox = null, installCaption = '';
         const installLines = [];
         const permissionProfiles = new Map();
-        tabs[id] = { id, type: 'marketplace', renderMarket: () => render() };
+        const uploadStatusPainters = new Set();
+        tabs[id] = { id, type: 'marketplace', renderMarket: () => { render(); for (const paint of uploadStatusPainters) paint(); }, showReviews: () => {
+            if (model.data && !['admin', 'reviewer'].includes(model.data.user?.role)) return;
+            model.view = 'reviews'; render();
+        } };
         tabs[id].onGithubAuthChanged = () => load(true, false);
         root.classList.add('market-page');
         const el = (tag, text, className) => {
@@ -50,7 +132,7 @@ function open({ ipc, tabs, createTabFrame, switchTab, language, refreshPlugins, 
             node.type = 'button';
             node.onclick = () => run(async () => {
                 node.disabled = true;
-                try { await action(); } finally { node.disabled = false; }
+                try { await action(); } finally { node.disabled = false; if(node.dataset.marketInstall)updateInstallButtons(); }
             });
             return node;
         };
@@ -99,7 +181,7 @@ function open({ ipc, tabs, createTabFrame, switchTab, language, refreshPlugins, 
         }
         function pluginOwner(p) {
             const account = model.data.user;
-            return !!account && (account.role === 'admin' || account.id === p.owner.id);
+            return !!account && (account.role === 'admin' || account.id === p?.owner?.id);
         }
         function member(p, uid) {
             return p.owner.id === uid || p.collaborators.some(person => person.id === uid);
@@ -124,7 +206,11 @@ function open({ ipc, tabs, createTabFrame, switchTab, language, refreshPlugins, 
             needUser();
             const box = dialogBox(plugin ? t('提交插件更新', 'Submit plugin update') : t('上传新插件', 'Submit new plugin'));
             box.dialog.classList.add('market-upload-dialog');
-            let selected = null, uploading = false;
+            let selected = null, uploading = false, latestProgress = null;
+            const paintProgress = () => {
+                if (latestProgress !== null && box.dialog.open) box.status.textContent = uploadProgressText(latestProgress, language());
+            };
+            uploadStatusPainters.add(paintProgress);
             box.body.append(el('p', t('可选择插件 ZIP，或包含 config.json、脚本与附带程序的源码目录。文件将公开上传到你自己的 GitHub 仓库。',
                 'Select a plugin ZIP or a source folder containing config.json, scripts and bundled programs. Files will be uploaded publicly to your GitHub repository.')));
             const picker = el('div', undefined, 'market-actions');
@@ -171,35 +257,154 @@ function open({ ipc, tabs, createTabFrame, switchTab, language, refreshPlugins, 
                     notify(() => t(`已提交 #${result.issue}，等待 GitHub Actions 检查。`, `Submitted #${result.issue}; awaiting GitHub Actions checks.`));
                     box.dialog.close();
                     model.view = 'inbox'; await load(true);
-                } catch (error) { box.status.textContent = errorMessage(error, language()); }
+                } catch (error) { latestProgress = null; box.status.textContent = errorMessage(error, language()); }
                 finally { uploading = false; box.dialog.querySelectorAll('button, input, textarea').forEach(b => { b.disabled = false; }); }
             }, 'primary');
             box.body.append(box.status, submit);
             box.dialog.addEventListener('cancel', event => { if (uploading) event.preventDefault(); });
-            const progress = (_, update) => { if (selected && update.selection === selected.id) box.status.textContent = update.text; };
+            const progress = (_, update) => { if (selected && update.selection === selected.id) { latestProgress = update.text; paintProgress(); } };
             ipc.on('market-progress', progress);
             box.dialog.addEventListener('close', () => {
                 ipc.removeListener('market-progress', progress);
+                uploadStatusPainters.delete(paintProgress);
                 if (selected && !uploading) ipc.invoke('market-discard-source', { id: selected.id }).catch(() => {});
             }, { once: true });
         }
         async function inspect(r) {
             const box = dialogBox(t('检查提交文件', 'Inspect submission'));
-            const summary = el('pre', JSON.stringify({ plugin: r.plugin_id, version: r.version, author: r.author,
-                sha256: r.sha256, changes: r.changes, metadata: r.metadata }, null, 2), 'market-code');
-            box.body.append(summary);
-            if (r.files) {
-                const select = el('select');
-                select.append(el('option', t('选择文件预览（不执行）', 'Preview a file without execution')));
-                for (const file of Object.keys(r.files)) { const option = el('option', file); option.value = file; select.append(option); }
-                const preview = el('pre', '', 'market-code');
-                select.onchange = () => run(async () => {
-                    box.status.textContent = t('正在下载并验证原始附件…', 'Downloading and verifying source attachment…');
-                    try { const result = await ipc.invoke('market-preview', { number: r.issue, file: select.value }); preview.textContent = result.text; box.status.textContent = ''; }
-                    catch (error) { box.status.textContent = errorMessage(error, language()); }
-                });
-                box.body.append(select, preview);
+            box.dialog.classList.add('market-inspect-dialog');
+            box.dialog.setAttribute('aria-label', t('检查提交文件', 'Inspect submission'));
+            box.dialog.querySelector('.market-close').setAttribute('aria-label', t('关闭', 'Close'));
+            const files = Object.keys(r.files || {}).sort((a, b) => a.localeCompare(b));
+            const changes = Array.isArray(r.changes) ? r.changes : [];
+            const changeLabel = value => ({ added: t('新增', 'Added'), changed: t('修改', 'Changed'), removed: t('删除', 'Removed') }[value] || value);
+            const changeMap = new Map(changes.map(change => [change.path, change.change]));
+            const identity = el('div', undefined, 'market-inspect-identity');
+            identity.append(el('strong', title(r.metadata?.name) || r.plugin_id),
+                el('span', [r.version && 'v' + r.version, r.author?.login && '@' + r.author.login].filter(Boolean).join(' · '), 'market-muted'));
+            const workspace = el('div', undefined, 'market-inspect-workspace');
+            const sidebar = el('nav', undefined, 'market-inspect-sidebar');
+            sidebar.setAttribute('aria-label', t('提交文件', 'Submission files'));
+            const sidebarTitle = el('div', undefined, 'market-inspect-sidebar-title');
+            sidebarTitle.append(el('strong', t('提交内容', 'Contents')), el('span', String(files.length), 'market-inspect-count'));
+            const overviewButton = el('button', t('提交概览', 'Submission overview'), 'market-inspect-file');
+            overviewButton.type = 'button';
+            const search = el('input', undefined, 'market-inspect-search');
+            search.type = 'search'; search.placeholder = t('搜索文件…', 'Search files…'); search.setAttribute('aria-label', search.placeholder);
+            const list = el('div', undefined, 'market-inspect-file-list');
+            const empty = el('p', files.length ? t('没有匹配的文件', 'No matching files') : t('没有可预览的文件', 'No files to preview'), 'market-inspect-empty');
+            empty.hidden = files.length > 0; search.disabled = !files.length;
+            sidebar.append(sidebarTitle, overviewButton, search, list);
+            const viewer = el('section', undefined, 'market-inspect-viewer');
+            const viewerHeader = el('div', undefined, 'market-inspect-viewer-header');
+            const filename = el('strong', '', 'market-inspect-filename');
+            const wrapLabel = el('label', undefined, 'market-inspect-wrap');
+            const wrap = el('input'); wrap.type = 'checkbox'; wrap.checked = true;
+            wrapLabel.append(wrap, document.createTextNode(t('自动换行', 'Wrap lines'))); wrapLabel.hidden = true;
+            wrap.onchange = () => { if (selectedFile) showFile(selectedFile.file, selectedFile.entry); };
+            const preview = el('div', undefined, 'market-inspect-preview'); preview.tabIndex = 0;
+            preview.setAttribute('role', 'region');
+            viewerHeader.append(filename, wrapLabel); viewer.append(viewerHeader, preview);
+            workspace.append(sidebar, viewer); box.body.append(identity, workspace);
+            const entries = [];
+            const previewSession = require('crypto').randomBytes(16).toString('hex');
+            let disposePreview, selectedFile, serial = 0;
+            function stopPreview() { serial++; disposePreview?.(); disposePreview = null; }
+            box.dialog.addEventListener('close', () => {
+                stopPreview(); ipc.invoke('market-preview-close', { session: previewSession }).catch(() => {});
+            }, { once: true });
+            function selectEntry(selected) {
+                for (const entry of [overviewButton, ...entries]) {
+                    const active = entry === selected;
+                    entry.classList.toggle('selected', active);
+                    if (active) entry.setAttribute('aria-current', 'true'); else entry.removeAttribute('aria-current');
+                }
             }
+            function showOverview() {
+                stopPreview(); selectedFile = null; selectEntry(overviewButton); box.status.textContent = ''; preview.removeAttribute('aria-busy');
+                filename.textContent = t('提交概览', 'Submission overview'); filename.title = filename.textContent; wrapLabel.hidden = true;
+                preview.setAttribute('aria-label', filename.textContent); preview.replaceChildren(); preview.scrollTop = preview.scrollLeft = 0;
+                const overview = el('div', undefined, 'market-inspect-overview');
+                const details = el('dl', undefined, 'market-inspect-facts');
+                for (const [caption, value] of [[t('插件 ID', 'Plugin ID'), r.plugin_id], [t('版本', 'Version'), r.version],
+                    [t('提交作者', 'Submitted by'), r.author?.login], ['SHA-256', r.sha256],
+                    ...(r.source?.commit ? [[t('源码提交', 'Source commit'), r.source.commit]] : [])]) {
+                    details.append(el('dt', caption), el('dd', value || '—'));
+                }
+                overview.append(details);
+                if (r.changelog) overview.append(el('h4', t('更新说明', 'Release notes')), el('p', r.changelog, 'market-inspect-changelog'));
+                overview.append(el('h4', t('文件变更', 'File changes')));
+                if (!changes.length) overview.append(el('p', t('没有文件变更记录', 'No file-change records'), 'market-muted'));
+                for (const change of changes) {
+                    const row = el('div', undefined, 'market-inspect-change');
+                    row.append(el('span', changeLabel(change.change), 'market-inspect-badge'), el('code', change.path)); overview.append(row);
+                }
+                const raw = el('details', undefined, 'market-inspect-raw');
+                raw.append(el('summary', t('原始提交信息', 'Original submission details')), el('pre', JSON.stringify({ plugin: r.plugin_id,
+                    version: r.version, author: r.author, sha256: r.sha256, changes: r.changes, metadata: r.metadata }, null, 2), 'market-inspect-code'));
+                overview.append(raw); preview.append(overview);
+            }
+            function showFile(file, entry) {
+                stopPreview(); const request = serial; selectedFile = { file, entry };
+                selectEntry(entry); filename.textContent = file; filename.title = file; wrapLabel.hidden = false;
+                preview.setAttribute('aria-label', file); preview.replaceChildren(); preview.scrollTop = preview.scrollLeft = 0;
+                const host = el('div', undefined, 'market-inspect-text'); preview.append(host);
+                box.status.textContent = r.source_verified ? t('正在在线读取已固定版本的源码…', 'Reading pinned source online…') :
+                    t('历史提交未保存在线源码，正在读取原始附件…', 'Legacy submission: reading original attachment…');
+                disposePreview = require('./market-source-preview').mountSourcePreview(host, {
+                    ipc, number: r.issue, file, lang: language(), wrapLines: wrap.checked,
+                    session: previewSession, legacy: !r.source_verified,
+                    onStatus(message) { if (request === serial && box.dialog.open) box.status.textContent = message ? errorMessage(new Error(message), language()) : ''; }
+                });
+            }
+            const fileTree = { path: '', directories: new Map(), entries: [] }, folders = [];
+            for (const file of files) {
+                const parts = file.split('/'); let branch = fileTree;
+                for (const name of parts.slice(0, -1)) {
+                    if (!branch.directories.has(name)) branch.directories.set(name, {
+                        path: branch.path ? branch.path + '/' + name : name, directories: new Map(), entries: []
+                    });
+                    branch = branch.directories.get(name);
+                }
+                const entry = el('button', undefined, 'market-inspect-file'); entry.type = 'button'; entry.title = file; entry.dataset.file = file;
+                entry.append(el('span', parts[parts.length - 1], 'market-inspect-file-path'));
+                if (changeMap.has(file)) entry.append(el('span', changeLabel(changeMap.get(file)), 'market-inspect-badge'));
+                entry.onclick = () => showFile(file, entry); entries.push(entry); branch.entries.push(entry);
+            }
+            function appendBranch(branch, container) {
+                for (const [name, folder] of [...branch.directories].sort(([a], [b]) => a.localeCompare(b))) {
+                    const details = el('details', undefined, 'market-inspect-folder'); details.open = true; details.dataset.directory = folder.path;
+                    const summary = el('summary', name, 'market-inspect-folder-heading'); summary.title = folder.path;
+                    const children = el('div', undefined, 'market-inspect-folder-children'); details.append(summary, children); container.append(details);
+                    folder.element = details; folders.push(folder); appendBranch(folder, children);
+                }
+                container.append(...branch.entries);
+            }
+            appendBranch(fileTree, list);
+            list.append(empty);
+            let searchExpansion;
+            function filterBranch(branch, query) {
+                let matches = 0;
+                for (const entry of branch.entries) {
+                    entry.hidden = !entry.dataset.file.toLowerCase().includes(query); if (!entry.hidden) matches++;
+                }
+                for (const folder of branch.directories.values()) {
+                    const count = filterBranch(folder, query); folder.element.hidden = count === 0;
+                    if (query && count) folder.element.open = true;
+                    matches += count;
+                }
+                return matches;
+            }
+            search.oninput = () => {
+                const query = search.value.trim().toLowerCase();
+                if (query && !searchExpansion) searchExpansion = new Map(folders.map(folder => [folder.element, folder.element.open]));
+                empty.hidden = filterBranch(fileTree, query) > 0;
+                if (!query && searchExpansion) {
+                    for (const [folder, open] of searchExpansion) folder.open = open;
+                    searchExpansion = null;
+                }
+            };
+            overviewButton.onclick = showOverview; showOverview();
         }
         function requestCard(r, key) {
             const card = el('article', undefined, 'market-card');
@@ -221,8 +426,7 @@ function open({ ipc, tabs, createTabFrame, switchTab, language, refreshPlugins, 
                     button(t('退回', 'Reject'), () => reasonAction(t('退回申请', 'Reject request'), reason => command(number, prefix + 'reject' + hash + ' ' + reason))));
             }
             if (r.status === 'pending_review' && me && ['admin', 'reviewer'].includes(me.role)) {
-                const canReview = me.role === 'admin' || !member(p, me.id) && me.id !== r.author.id;
-                if (canReview) actions.append(button(t('审核通过并发布', 'Approve and publish'), () => command(number, 'approve ' + r.sha256), 'primary'),
+                if (canReview(me, r, p)) actions.append(button(t('审核通过并发布', 'Approve and publish'), () => command(number, 'approve ' + r.sha256), 'primary'),
                     button(t('退回', 'Reject'), () => reasonAction(t('填写退回原因', 'Reason for rejection'), reason => command(number, 'reject ' + r.sha256 + ' ' + reason))));
                 else card.append(el('p', t('需由其他审核员审核此插件', 'Another reviewer must review this plugin'), 'market-muted'));
             }
@@ -230,14 +434,33 @@ function open({ ipc, tabs, createTabFrame, switchTab, language, refreshPlugins, 
                 me && (r.author.id === me.id || pluginOwner(p))) actions.append(button(t('撤回', 'Withdraw'), () => command(number, 'withdraw ' + r.sha256)));
             card.append(actions); return card;
         }
+        function pluginInstallState(plugin){
+            if(!model.installed)return 'checking';
+            return installState(model.installed[plugin.id],{version:plugin.published.version,source:'github:'+model.data.repository,owner_github_id:plugin.owner.id});
+        }
+        async function loadInstalled(){
+            try{
+                const result=await ipc.invoke('market-installed');
+                if(!result?.ok||!result.plugins)throw new Error(t('无法读取本地安装状态，请刷新后重试','Cannot read installed plugins; refresh to retry'));
+                model.installed=result.plugins;model.installedError='';
+            }catch(error){model.installed=null;model.installedError=errorMessage(error,language());}
+            updateInstallButtons();
+        }
+        function paintInstallButton(node,plugin){
+                const state=pluginInstallState(plugin);
+                node.disabled=!!installId||!['install','update'].includes(state);
+                node.textContent=node.dataset.marketInstall===installId?installCaption:({install:t('安装','Install'),update:t('更新','Update'),installed:t('已安装','Installed'),newer:t('本地版本较新','Newer version installed'),conflict:t('来源冲突','Source conflict'),unknown:t('本地版本未知','Unknown installed version'),checking:model.installedError?t('检查失败，请刷新','Check failed; refresh'):t('正在检查…','Checking…')})[state];
+                const local=model.installed?.[plugin.id];
+                node.title=model.installedError||(local?t('本地版本：','Installed version: ')+String(local.version||'—'):'');
+        }
         function updateInstallButtons() {
             root.querySelectorAll('[data-market-install]').forEach(node => {
-                node.disabled = !!installId;
-                if (node.dataset.marketInstall === installId) node.textContent = installCaption;
+                const plugin=model.data?.state.plugins[node.dataset.marketInstall];if(plugin)paintInstallButton(node,plugin);
             });
         }
         async function installPlugin(plugin) {
             if (installId) return;
+            if(!['install','update'].includes(pluginInstallState(plugin)))return;
             installId = plugin.id;
             installCaption = t('正在验证…', 'Verifying…');
             installLines.length = 0;
@@ -276,7 +499,8 @@ function open({ ipc, tabs, createTabFrame, switchTab, language, refreshPlugins, 
                 const result = await ipc.invoke('market-install', { pluginId: plugin.id });
                 if (!result || !result.ok) throw new Error(result?.reason || t('安装失败','Installation failed'));
                 await refreshPlugins();
-                notify(() => t('安装成功', 'Installed successfully'));
+                await loadInstalled();
+                notify(() => result.skipped?t('已安装相同或更新版本，已跳过重复安装','Same or newer version already installed; skipped'):t('安装成功', 'Installed successfully'));
                 installPanel.remove(); installPanel = null;
             } catch (error) {
                 const message = errorMessage(error, language()); append(message);
@@ -284,9 +508,7 @@ function open({ ipc, tabs, createTabFrame, switchTab, language, refreshPlugins, 
                 throw error;
             } finally {
                 ipc.removeListener('market-install-progress', progress);
-                installId = ''; root.querySelectorAll('[data-market-install]').forEach(node => {
-                    node.disabled = false; node.textContent = t('安装 / 更新','Install / update');
-                });
+                installId = ''; updateInstallButtons();
             }
         }
         function updateDownloadCounts(nodes = root.querySelectorAll('.market-download-count')) {
@@ -322,8 +544,8 @@ function open({ ipc, tabs, createTabFrame, switchTab, language, refreshPlugins, 
             card.append(top, el('div', title(metadata.description), 'plugin-store-card-desc'), author);
             const actions = el('div', undefined, 'market-actions');
             if (p.published && p.listed) {
-                const install = button(installId === p.id ? installCaption : t('安装 / 更新', 'Install / update'), () => installPlugin(p), 'primary');
-                install.dataset.marketInstall = p.id; install.disabled = !!installId;
+                const install = button('', () => installPlugin(p), 'primary');
+                install.dataset.marketInstall = p.id; paintInstallButton(install,p);
                 actions.append(install);
             }
             if (model.data.user) {
@@ -424,6 +646,7 @@ function open({ ipc, tabs, createTabFrame, switchTab, language, refreshPlugins, 
             count.title = t('市场当前公开上架的插件数量', 'Plugins currently published in the market');
             heading.append(caption, count); header.append(heading);
             const account = model.data && model.data.user;
+            const pending = pendingReviewCount(model.data);
             const toolbar = el('div', undefined, 'plugin-store-toolbar market-toolbar');
             const browsing = ['browse', 'mine'].includes(model.view);
             let fill = () => {};
@@ -467,7 +690,7 @@ function open({ ipc, tabs, createTabFrame, switchTab, language, refreshPlugins, 
             const nav = el('select', undefined, 'market-view-select');
             nav.setAttribute('aria-label', t('市场管理', 'Market navigation'));
             const views = [['browse', t('浏览插件', 'Browse')], ['mine', t('我的插件', 'My plugins')], ['inbox', t('合作与更新', 'Contributions')]];
-            if (account && ['reviewer', 'admin'].includes(account.role)) views.push(['reviews', t('审核管理', 'Review queue')]);
+            if (account && ['reviewer', 'admin'].includes(account.role)) views.push(['reviews', t('审核管理', 'Review queue') + (pending ? ` (${pending})` : '')]);
             if (account && account.role === 'admin') views.push(['admin', t('权限管理', 'Permissions')], ['audit', t('操作记录', 'Audit trail')]);
             for (const [view, caption] of views) {
                 const option = el('option', caption); option.value = view; nav.append(option);
@@ -486,6 +709,12 @@ function open({ ipc, tabs, createTabFrame, switchTab, language, refreshPlugins, 
                 content.append(emptyState(model.loadError ? t('插件列表加载失败，请稍后点击刷新重试。', 'The plugin list could not be loaded. Refresh to retry.') :
                     t('正在从 GitHub 读取插件列表…', 'Loading the plugin list from GitHub…')));
                 return;
+            }
+            if (pending) {
+                const caption = t(`${pending} 个插件待你审核`, `${pending} plugin${pending === 1 ? '' : 's'} awaiting your review`);
+                const prompt = button(caption + (model.view === 'reviews' ? '' : t(' · 前往审核 →', ' · Review now →')),
+                    () => tabs[id].showReviews(), 'market-review-prompt');
+                content.append(prompt);
             }
             const state = model.data.state;
             if (model.view === 'admin') {
@@ -535,6 +764,7 @@ function open({ ipc, tabs, createTabFrame, switchTab, language, refreshPlugins, 
         async function load(force = false, refreshCounts = force) {
             if (model.loading) return;
             model.loading = true;
+            loadInstalled();
             if (!model.data) render();
             try {
                 if (prepareSession) await prepareSession();
@@ -542,7 +772,8 @@ function open({ ipc, tabs, createTabFrame, switchTab, language, refreshPlugins, 
                 if (data.accountUnavailable && model.data && model.data.user) data.user = model.data.user;
                 model.data = data;
                 if (data.user && onAccount) onAccount(data.user);
-                if (!data.user) model.view = 'browse';
+                if (!data.user || model.view === 'reviews' && !['admin', 'reviewer'].includes(data.user.role)) model.view = 'browse';
+                reviewWatch?.update(data);
                 model.loadError = '';
                 notice = data.warning || '';
                 ipc.invoke('market-download-counts', { force: refreshCounts }).then(result => {
@@ -555,7 +786,7 @@ function open({ ipc, tabs, createTabFrame, switchTab, language, refreshPlugins, 
                 notice = () => errorMessage(error, language()) +
                     (model.data ? t('；正在显示上次成功读取的数据', '; showing the last successfully loaded data') : '');
             }
-            finally { model.loading = false; render(); updateDownloadCounts(); }
+            finally { model.loading = false; render(); updateDownloadCounts(); updateInstallButtons(); }
         }
         render(); load();
         const poll = async () => {
@@ -568,4 +799,4 @@ function open({ ipc, tabs, createTabFrame, switchTab, language, refreshPlugins, 
     });
 }
 
-module.exports = { open, errorMessage };
+module.exports = { open, errorMessage, watchReviews, pendingReviewCount };

@@ -4,6 +4,7 @@ import shlex
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -11,6 +12,50 @@ import app as runtime
 
 
 class RBuildEnvironmentTests(unittest.TestCase):
+    def test_validated_image_skips_checks_for_all_launch_paths(self):
+        image_id = 'sha256:validated-offline-r'
+        client = mock.Mock()
+        job = {'status': 'pending', 'log': []}
+        with tempfile.TemporaryDirectory() as root, contextlib.ExitStack() as patches:
+            patches.enter_context(mock.patch.object(runtime, '_OFFLINE_R_ENV', SimpleNamespace(image_id=None)))
+            self.assertFalse(runtime._r_image_has_system_deps(image_id))
+            runtime._OFFLINE_R_ENV.image_id = image_id
+            self.assertTrue(runtime._r_image_has_system_deps(image_id))
+            self.assertFalse(runtime._r_image_has_system_deps('sha256:another-image'))
+            for name, value in (
+                ('get_docker_client', client), ('_get_r_image', image_id),
+                ('_ensure_pinned_r_base_image', True),
+                ('_resolve_r_repo_bundle', ('https://example.test/CRAN', 'https://example.test/bioc')),
+                ('_robust_container_wait', {'StatusCode': 0}),
+                ('_host_r_dependency_status', {'ready': False, 'missing': ['demo']}),
+                ('_has_cached_r_preflight', False), ('_mark_cached_r_preflight', None),
+                ('_drop_cached_r_preflight', None), ('_bump_r_libs_revision', None),
+                ('_complete_r_runtime_migration', None),
+                ('_stream_container_logs_realtime', None), ('_enqueue_job_log', None),
+            ):
+                patches.enter_context(mock.patch.object(runtime, name, return_value=value))
+            ensure = patches.enter_context(mock.patch.object(runtime, '_ensure_custom_r_image'))
+            guard = patches.enter_context(mock.patch.object(runtime, '_r_system_deps_prefix'))
+            patches.enter_context(mock.patch.object(runtime, 'INSTALL_JOBS', {'test': job}))
+            patches.enter_context(mock.patch.object(runtime.tempfile, 'gettempdir', return_value=root))
+            patches.enter_context(mock.patch.object(runtime, 'R_PACKAGE_LOCK_FILE', os.path.join(root, 'package.lock')))
+            code, _ = runtime._run_r_container_with_realtime_logs(
+                client, ['Rscript', '-e', 'cat("ok")'], [], {}, install_system_deps=True)
+            self.assertEqual(0, code)
+            runtime._run_r_install_job_locked('test', ['demo'], skip_repair=True)
+            self.assertEqual('done', job['status'])
+            script = os.path.join(root, 'analysis.R')
+            with open(script, 'w', encoding='utf-8') as handle:
+                handle.write('cat("ok")')
+            result = runtime._run_rscript_docker(script, {}, root, root, required_packages=['demo'])
+            self.assertEqual('success', result['status'])
+            self.assertEqual(4, client.containers.run.call_count)  # helper, install, repair, analysis
+            command = client.containers.run.call_args.kwargs['command'][2]
+            self.assertIn('R started; loading graphics support and plugin packages', command)
+            ensure.assert_not_called()
+            guard.assert_not_called()
+            self.assertEqual([], os.listdir(os.path.join(root, 'primigenius_rscripts')))
+
     def test_upgrade_rejects_old_image_without_changing_library(self):
         labels = {
             'org.primigenius.r-version': runtime.R_VERSION,
@@ -50,6 +95,7 @@ class RBuildEnvironmentTests(unittest.TestCase):
                 ('_robust_container_wait', {'StatusCode': 1}),
                 ('_host_r_dependency_status', {'ready': False, 'missing': ['demo']}),
                 ('_has_cached_r_preflight', False), ('_complete_r_runtime_migration', None),
+                ('_drop_cached_r_preflight', None), ('_bump_r_libs_revision', None),
                 ('_stream_container_logs_realtime', None), ('_enqueue_job_log', None),
             ):
                 patches.enter_context(mock.patch.object(runtime, name, return_value=value))

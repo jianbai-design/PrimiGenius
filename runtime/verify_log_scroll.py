@@ -12,6 +12,8 @@ def main():
     source = (ROOT / 'src/renderer.js').read_text(encoding='utf-8')
     viewer = source[source.index('function showLogHistory('):
                     source.index('\nfunction appendArchivedInstallEvent(')]
+    controls = source[source.index('function attachLogArchiveLink('):
+                      source.index('\nfunction finishAutoCloseInstallLog(')]
     css = (ROOT / 'src/styles.css').read_text(encoding='utf-8')
     test = r'''
         const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -67,12 +69,49 @@ def main():
         if (!dialog.querySelector('a').href.includes('/logs/download?runId=qa')) throw new Error('Export missing');
         dialog.close();
         await until(() => !document.querySelector('.log-history-dialog'));
-        return {records: 7201, forwardBackward: true, boundedChunks: 3, retryPreservesLogs: true};
+        const holder = document.createElement('div'), box = document.createElement('div');
+        holder.innerHTML = '<div class="local-log-header">Workflow</div>';
+        holder.append(box); document.body.append(holder);
+        box.dataset.workflowRunId = 'wf-first'; tabs.workflow = {logUI: box};
+        const events = [
+            {seq: 1, runId: 'wf-first/run-a', line: '[Linux] first program'},
+            {seq: 2, runId: 'wf-second/run-c', line: '[R] unrelated workflow'},
+            {seq: 3, runId: 'wf-first/run-b', line: '[R] second program failed'}
+        ];
+        const requested = [];
+        window.fetch = async (url, options) => {
+            await wait(15);
+            if (options?.method === 'POST') {
+                const item = JSON.parse(options.body);
+                events.push({seq: events.length + 1, runId: item.runId, line: '[Workflow] ' + item.message});
+                return {ok: true};
+            }
+            const query = new URL(url, 'http://localhost').searchParams, runId = query.get('runId');
+            requested.push(runId);
+            const selected = events.filter(event => event.runId === runId || event.runId.startsWith(runId + '/'));
+            return {ok: true, json: async () => ({events: selected, nextSeq: events.at(-1).seq, has_more: false})};
+        };
+        attachLogArchiveLink(box, 'wf-first/run-a');
+        appendWorkflowLog('workflow', 'wf-first', 'node start');
+        attachLogArchiveLink(box, 'wf-first/run-b');
+        appendWorkflowLog('workflow', 'wf-first', 'workflow finished');
+        if (box.dataset.logRunId !== 'wf-first') throw new Error('Last node replaced workflow scope');
+        await box._archiveControls.querySelector('button').onclick();
+        await until(() => document.querySelector('.log-history-content')?.textContent.includes('workflow finished'));
+        const full = document.querySelector('.log-history-content').textContent;
+        if (!full.includes('first program') || !full.includes('second program failed') || !full.includes('node start')) throw new Error('Missing workflow steps or scheduling logs');
+        if (full.includes('unrelated workflow') || requested.some(id => id !== 'wf-first')) throw new Error('Wrong log scope');
+        if (!document.querySelector('.log-history-export').href.includes('runId=wf-first')) throw new Error('Export does not cover the workflow');
+        document.querySelector('.log-history-dialog').close();
+        await until(() => !document.querySelector('.log-history-dialog'));
+        return {records: 7201, forwardBackward: true, boundedChunks: 3, retryPreservesLogs: true, workflowScope: true, allStepsAndScheduling: true};
     '''
     with tempfile.TemporaryDirectory(dir=ROOT / 'build', prefix='log-scroll-qa-') as directory:
         work = Path(directory)
         script = work / 'main.cjs'
-        injected = "let currentLang='zh'; const auxApiUrl=p=>'http://localhost'+p;\n" + viewer
+        injected = ("let currentLang='zh'; const tabs={}; const auxApiUrl=p=>'http://localhost'+p;\n"
+                    "function log(message) {}\nfunction _showInlineAlert(message) { throw new Error(message); }\n"
+                    + controls + viewer)
         script.write_text(f'''
 const {{app, BrowserWindow}} = require('electron');
 app.setPath('userData', {json.dumps(str(work/'profile'))});

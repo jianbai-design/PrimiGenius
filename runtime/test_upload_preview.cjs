@@ -46,7 +46,7 @@ app.whenReady().then(async()=>{let win,service;try{
    checkTextSurface(document.querySelector('.wf-preview-body .cm-editor'));
    const header=document.querySelector('.wf-preview-header');
    await wait(()=>header.querySelector('.file-preview-meta')?.textContent.includes('｜'));
-   await wait(()=>header.querySelector('.file-preview-lines')?.textContent.includes('1,000'));
+   assert.equal(header.querySelector('.file-preview-lines'),null,'No row-count scan or status');
    assert.equal(getComputedStyle(header).backgroundColor,'rgb(245, 245, 245)');assert(header.offsetHeight<=36,'Compact preview header');
    assert(header.querySelector('.file-preview-meta').textContent.endsWith('TXT'));
    header.querySelector('button:last-child').click();await wait(async()=>await ipcRenderer.invoke('audit-preview-count')===0);
@@ -153,11 +153,11 @@ app.whenReady().then(async()=>{let win,service;try{
     const cells=row.querySelectorAll('.tabulator-cell');if(cells.length>1){const id=Number(cells[1].textContent);assert.equal(cells[2].textContent,'item'+id);collected.add(id);}
    }};
    await wait(()=>view.querySelector('.file-preview-segment[data-loaded="true"] .tabulator-row'));const firstPaint=performance.now()-started;
-   await wait(()=>header.querySelector('.file-preview-lines').textContent.includes(file===csv?'3,000':file===xlsx?'2,300':'2,301'));
+   assert.equal(header.querySelector('.file-preview-lines'),null,'No row-count scan or status');
    if(file===csv){
     title.style.cssText+='position:fixed;top:20px;left:20px;width:720px;z-index:100000;';
     await new Promise(resolve=>setTimeout(resolve,80));
-    const block=view.querySelector('.file-preview-segment'),heading=block.querySelector('.tabulator-header');
+    const block=view.querySelector('.file-preview-segment'),heading=view.querySelector('.file-preview-table-header .tabulator-header');
     for(const label of heading.querySelectorAll('.tabulator-col-title'))assert(label.getBoundingClientRect().bottom<=heading.getBoundingClientRect().bottom+1,'Chinese table headings remain fully visible');
     view.scrollTop=350;view.dispatchEvent(new Event('scroll'));await new Promise(resolve=>setTimeout(resolve,50));
     assert(Math.abs(heading.getBoundingClientRect().top-view.getBoundingClientRect().top)<=2,'Header remains pinned while scrolling down');
@@ -185,7 +185,7 @@ app.whenReady().then(async()=>{let win,service;try{
      const top=view.getBoundingClientRect().top;
      const active=[...view.querySelectorAll('.file-preview-segment[data-loaded="true"]')].find(block=>block.getBoundingClientRect().top<=top+1&&block.getBoundingClientRect().bottom>top+40);
      assert(active&&Number(active.dataset.segment)>0,'Check freezing after crossing multiple data segments');
-     const heading=active.querySelector('.tabulator-header');assert(Math.abs(heading.getBoundingClientRect().top-top)<=2,'Later segments keep their heading pinned');
+     const heading=view.querySelector('.file-preview-table-header .tabulator-header');assert(Math.abs(heading.getBoundingClientRect().top-top)<=2,'Later segments keep their heading pinned');
      const label=heading.querySelector('.tabulator-col-title').getBoundingClientRect();assert(document.elementFromPoint(label.left+5,label.top+label.height/2)?.closest('.tabulator-header'),'Frozen corner stays above body cells in later segments');
     }
    }

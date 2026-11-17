@@ -12,6 +12,7 @@ import threading
 import time
 
 import docker
+from runtime_migration import MigrationError, PENDING, VERSION_COMMAND, migrate_existing, recover_pending
 
 RUNTIME_PROBE_TIMEOUT = 3.0
 
@@ -88,6 +89,7 @@ class EmbeddedRuntime:
         self.engine_info = {}
         self._validated = None
         self._lock = threading.RLock()
+        self.migration_blocked = False
 
     def manifest(self):
         with open(os.path.join(self.bundle, 'manifest.json'), encoding='utf-8') as f:
@@ -153,6 +155,9 @@ class EmbeddedRuntime:
                 data = response.json()
                 if data.get('engine') != 'primigenius-libpod':
                     raise RuntimeError('The connected process is not the embedded engine')
+                expected = self.manifest()
+                if data.get('version') != expected['podman_version'] or data.get('commit') != expected['podman_commit']:
+                    raise RuntimeError('The connected engine does not match this build\'s fixed runtime; stop the previous application before retrying')
                 self.engine_info = data
                 self.last_error = ''
                 return True
@@ -177,7 +182,7 @@ class EmbeddedRuntime:
             self.stop_bridge()
             manifest = self.validate()
             # Do not open an older/newer user's database with an unvalidated ABI.
-            check = self.manager._run_wsl('podman --version', timeout=min(6, max(0.1, deadline-time.monotonic())))
+            check = self.manager._run_wsl(VERSION_COMMAND, timeout=min(6, max(0.1, deadline-time.monotonic())))
             if check is None or check.returncode != 0:
                 detail = ((check.stderr or check.stdout) if check is not None else 'WSL command timed out')
                 self.last_error = 'Linux environment is unavailable: ' + str(detail).strip()
@@ -186,17 +191,32 @@ class EmbeddedRuntime:
                 return False
             if check is not None and check.returncode == 0:
                 installed = check.stdout.strip().split()[-1]
-                if installed != manifest['podman_version']:
-                    raise RuntimeError('Existing Linux engine version %s requires a matching embedded build; bundled version is %s. Existing data was preserved.' % (installed, manifest['podman_version']))
+                try:
+                    if installed == PENDING:
+                        installed = recover_pending(self)
+                    if installed != manifest['podman_version']:
+                        migrate_existing(self, installed, manifest)
+                except MigrationError:
+                    self.migration_blocked = True
+                    raise
+                if installed != manifest['podman_version'] or check.stdout.strip() == PENDING:
+                    # Archive verification/streaming does not consume the IPC budget.
+                    deadline = time.monotonic() + timeout
             cmd = [os.path.join(self.bundle, 'primigenius-bridge.exe'),
                    '--pipe', self.pipe, '--distro', self.manager.wsl_distro_name,
                    '--helper', self.manager.host_path_to_wsl(os.path.join(self.bundle, 'primigenius-bridge-linux')),
                    '--engine', self.manager.host_path_to_wsl(os.path.join(self.bundle, 'primigenius-engine')),
                    '--socket', self.socket]
             os.makedirs(self.manager.podman_data_dir, exist_ok=True)
+            # conmon interprets filesystem arguments using the host locale. WSL
+            # must receive UTF-8 even when Windows has no matching Linux locale.
+            environment = dict(os.environ, LANG='C.UTF-8', LC_ALL='C.UTF-8')
+            forwarded = [value for value in environment.get('WSLENV', '').split(':')
+                         if value and value.split('/')[0] not in ('LANG', 'LC_ALL')]
+            environment['WSLENV'] = ':'.join(forwarded + ['LANG', 'LC_ALL'])
             with open(os.path.join(self.manager.podman_data_dir, 'runtime-bridge.log'), 'wb') as log:
                 self.process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                                stderr=log, creationflags=subprocess.CREATE_NO_WINDOW)
+                                                stderr=log, env=environment, creationflags=subprocess.CREATE_NO_WINDOW)
             while time.monotonic() < deadline:
                 if self.ping(timeout=min(RUNTIME_PROBE_TIMEOUT, max(0.05, deadline-time.monotonic()))):
                     return True

@@ -15,6 +15,23 @@ function isSystemLogFile(filename) {
     return name.endsWith('.primigenius.log') || /^primigenius\.\d{4}-\d{2}-\d{2}(?:_\d{2}-\d{2}-\d{2})?\.log$/.test(name);
 }
 
+async function openRunOutputDirectory(targetDir) {
+    if (!targetDir) {
+        _showToast(currentLang === 'zh' ? '暂无可打开的运行输出目录，请先运行一次分析' : 'No last-run output directory yet, run analysis first', 'warning');
+        return;
+    }
+    try {
+        if (!require('fs').existsSync(targetDir)) {
+            _showToast((currentLang === 'zh' ? '目录不存在: ' : 'Directory not found: ') + targetDir, 'warning');
+            return;
+        }
+        const error = await require('electron').shell.openPath(targetDir);
+        if (error) _showToast((currentLang === 'zh' ? '打开失败: ' : 'Open failed: ') + error, 'error');
+    } catch (error) {
+        _showToast((currentLang === 'zh' ? '打开失败: ' : 'Open failed: ') + error.message, 'error');
+    }
+}
+
 // ==========================================
 // 1. 状态与 i18n 配置
 // ==========================================
@@ -118,6 +135,7 @@ window.addEventListener('beforeunload', () => { clearInterval(viewStatusTimer); 
 
 function attachLogArchiveLink(box, runId) {
     if (!box || !runId || !box.parentElement) return;
+    runId = box.dataset.workflowRunId || runId;
     box.dataset.logRunId = runId;
     if (box.closest('[data-auto-close-log]')) {
         box._archiveControls?.remove();
@@ -129,7 +147,14 @@ function attachLogArchiveLink(box, runId) {
         const history = document.createElement('button');
         history.type = 'button';
         history.className = 'log-archive-button';
-        history.onclick = () => showLogHistory(box.dataset.logRunId);
+        history.onclick = async () => {
+            try {
+                await box._archivePending;
+                showLogHistory(box.dataset.logRunId);
+            } catch (error) {
+                await _showInlineAlert((currentLang === 'zh' ? '日志归档失败：' : 'Log archive failed: ') + error.message);
+            }
+        };
         controls.appendChild(history);
         box._archiveControls = controls;
     }
@@ -148,6 +173,22 @@ function attachLogArchiveLink(box, runId) {
     } else if (controls.parentElement !== box.parentElement) {
         box.parentElement.insertBefore(controls, box);
     }
+}
+
+function appendWorkflowLog(tabId, runId, message) {
+    for (const line of String(message).split(/\r\n|\r|\n/)) log(`[RUN:${runId}] [Workflow] ${line}`);
+    const box = tabs[tabId]?.logUI;
+    if (!box) return;
+    box._archivePending = (box._archivePending || Promise.resolve()).then(async () => {
+        const response = await fetch(auxApiUrl('/logs/events'), {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({runId, channel: 'Workflow', message: String(message)}),
+            signal: AbortSignal.timeout(10000)
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    });
+    // Keep the rejected promise for the history button and execution barrier.
+    box._archivePending.catch(error => console.error('Workflow log archive failed', error));
 }
 
 function finishAutoCloseInstallLog(panel, result, box = panel) {
@@ -451,6 +492,7 @@ const i18nData = {
         'wf-bg-set': '背景已设置',
         'start_analysis': '开始分析',
         'output_dir_label': '输出目录',
+        'auto_output_dir_hint': '留空自动创建，或拖入文件夹/输入路径...',
         'drag_file_hint': '拖入文件或点击选择',
         'drag_folder_hint': '拖拽文件夹到这里或手动输入路径...',
 
@@ -591,6 +633,7 @@ const i18nData = {
         'wf-bg-set': 'Background set',
         'start_analysis': 'START ANALYSIS',
         'output_dir_label': 'Output Directory',
+        'auto_output_dir_hint': 'Leave blank to create automatically, or drop a folder / type a path...',
         'drag_file_hint': 'Drop file or click to choose',
         'drag_folder_hint': 'Drag folder here or type path...',
 
@@ -889,6 +932,7 @@ function updateLanguage(lang) {
     if(navStore) navStore.innerHTML = `<i class="fas fa-store"></i> ${t('nav-plugin-store')}`;
     const navMarket = document.getElementById('nav-marketplace-label');
     if (navMarket) navMarket.innerHTML = `<i class="fas fa-box-open"></i> ${currentLang === 'zh' ? '自由市场' : 'Free Market'}`;
+    marketplaceReviewNotice?.localize();
     const navLang = document.getElementById('nav-lang-label');
     if(navLang) navLang.innerHTML = `<i class="fas fa-globe"></i> ${t('nav-lang')}`;
     const navComm = document.getElementById('nav-community-label');
@@ -1304,6 +1348,11 @@ function updateLanguage(lang) {
         // 工作流面板：更新工具箱标题并刷新左侧工具箱（分类 & 工具名）
         if (tabObj && tabObj.type === 'workflow') {
             const zh = currentLang === 'zh';
+            view.querySelectorAll('.wf-svg-layer > path > title').forEach(hint => {
+                hint.textContent = zh ? '右键可删除连线' : 'Right-click to delete connection';
+            });
+            const connectionDelete = view.querySelector('.wf-connection-delete');
+            if (connectionDelete) connectionDelete.title = zh ? '删除连线' : 'Delete connection';
             // Update change background button
             const changeBgBtn = view.querySelector('.wf-change-bg-btn');
             if (changeBgBtn) {
@@ -1333,7 +1382,7 @@ function updateLanguage(lang) {
                         wdLabel.title = currentLang==='zh' ? '点击打开上次运行输出目录' : 'Click to open last run output directory';
                     }
                 const wdInput = wdBox.querySelector('.wf-workdir-input');
-                if (wdInput) wdInput.placeholder = currentLang==='zh'?'拖入文件夹或输入路径...':'Drop folder or type path...';
+                if (wdInput) wdInput.placeholder = t('auto_output_dir_hint');
             }
 
             // 更新左侧分类与工具名称
@@ -1588,10 +1637,6 @@ function updateLanguage(lang) {
                 node.querySelectorAll('.wf-output-placeholder').forEach(ph => {
                     ph.textContent = currentLang==='zh'?'运行后显示文件':'Files appear after run';
                 });
-                // 更新输出复选框提示
-                node.querySelectorAll('.wf-output-chk').forEach(chk => {
-                    chk.title = currentLang==='zh'?'启用此输出':'Enable this output';
-                });
                 // 更新删除按钮提示
                 const nodeDel = node.querySelector('.node-delete');
                 if (nodeDel) nodeDel.title = currentLang==='zh'?'删除':'Delete';
@@ -1623,6 +1668,10 @@ function updateLanguage(lang) {
                 const importBtn = toolbar.querySelector('.wf-import-wf');
                 if (importBtn) { importBtn.innerHTML = `<i class="fas fa-file-import"></i> ${zh ? '导入' : 'Import'}`; importBtn.title = zh ? '导入工作流' : 'Import Workflow'; }
             }
+            // Measure ports after translated text has finished changing the layout.
+            requestAnimationFrame(() => {
+                if (view.isConnected && view.getClientRects().length) view._wfRefreshConnections?.();
+            });
             return;
         }
 
@@ -1680,7 +1729,7 @@ function updateLanguage(lang) {
             const outDirOpenLbl = view.querySelector('.r-outdir-open-label');
             if (outDirOpenLbl) outDirOpenLbl.title = currentLang === 'zh' ? '点击打开上次运行输出目录' : 'Click to open last run output directory';
             const outDirInput = view.querySelector('.r-outdir-input');
-            if (outDirInput) outDirInput.placeholder = currentLang === 'zh' ? '拖入文件夹或输入目录路径...' : 'Drop folder or type path...';
+            if (outDirInput) outDirInput.placeholder = t('auto_output_dir_hint');
 
             // 结果占位文字
             const placeholder = view.querySelector('.r-result-placeholder p');
@@ -1920,10 +1969,15 @@ function updateLanguage(lang) {
             if (descEl) descEl.innerText = getPluginText(cfg.description || '');
 
             // 输出目录 label & placeholder
-            const outLabel = view.querySelector('.params-box b');
+            const outLabel = view.querySelector('.plugin-output-dir-label');
             if (outLabel) outLabel.innerText = t('output_dir_label');
+            const outOpen = view.querySelector('.plugin-output-dir-open');
+            if (outOpen) {
+                outOpen.lang = currentLang;
+                outOpen.title = currentLang === 'zh' ? '点击打开上次运行输出目录' : 'Click to open last run output directory';
+            }
             const outInput = view.querySelector('.plugin-output-dir-input');
-                if (outInput) outInput.placeholder = t('drag_folder_hint');
+                if (outInput) outInput.placeholder = t('auto_output_dir_hint');
 
                 // 若存在本地二进制且尚未安装，更新 kernel-zone 的提示文本
                 const kernelZone = view.querySelector('.kernel-zone');
@@ -2476,6 +2530,7 @@ if (_menuInstall) _menuInstall.onclick = () => openInstallTab();
 const _menuPluginStore = document.getElementById('menu-plugin-store');
 if (_menuPluginStore) _menuPluginStore.onclick = () => openPluginStoreTab();
 const _menuMarketplace = document.getElementById('menu-marketplace');
+let marketplaceReviewNotice = null;
 if (_menuMarketplace) {
     _menuMarketplace.onclick = () => marketplace.open({ ipc: ipcRenderer, tabs, createTabFrame, switchTab,
         language: () => currentLang, refreshPlugins: () => init(),
@@ -2763,7 +2818,7 @@ function showFilePreview(filePath, fileName) {
     const isSpreadsheet = ['xlsx', 'xls'].includes(ext);
     const isTable = ['csv', 'tsv', 'tab'].includes(ext) || isSpreadsheet;
     const isHtml = ['html', 'htm'].includes(ext);
-    const isSpecial = /\.(tiff?|pdb|cif|mmcif|sdf|mol2|xyz|bam|cram|bcf|bw|bigwig|bb|bigbed)$|\.(vcf|bed|gff3?|gtf)(\.gz)?$/i.test(fileName);
+    const isSpecial = /\.(tiff?|pdb|cif|mmcif|sdf|mol2|xyz|bam|cram|bcf|bw|bigwig|bb|bigbed)$/i.test(fileName);
     const isBinary = ['bam', 'bai', 'gz', 'zip', 'tar', 'rar', '7z', 'exe', 'dll', 'so', 'o', 'pyc', 'class', 'ht2'].includes(ext);
 
     // For images — native in-app preview (same as R tool image viewer)
@@ -3779,6 +3834,10 @@ function renderToolSearch(plugins) {
             const name = document.createElement('span');
             name.textContent = getPluginText(plugin.name);
             const isR = String(plugin.type || '').toLowerCase().startsWith('r');
+            const categories = Array.isArray(plugin.category) ? plugin.category : [plugin.category];
+            const paths = [...new Set((categories.length ? categories : [null]).map(getCategoryLabel))];
+            item.title = paths.filter(path => !paths.some(other => other.startsWith(path + ' > ')))
+                .map(path => `${t(isR ? 'nav-r' : 'nav-linux')} > ${path}`).join('\n');
             item.append(createPluginMenuIcon(plugin, isR), document.createTextNode(' '), name);
             item.onclick = () => {
                 createNewTab(plugin);
@@ -4745,6 +4804,8 @@ function openWorkflowTab() {
 }
 
 function renderWorkflowUI(container, tabId) {
+    const workflowLogRunId = 'wf-' + require('crypto').randomUUID();
+    function log(message) { appendWorkflowLog(tabId, workflowLogRunId, message); }
     container.innerHTML = `
         <div class="workflow-container">
             <div class="wf-sidebar" id="wf-tools-${tabId}">
@@ -4757,7 +4818,7 @@ function renderWorkflowUI(container, tabId) {
                     </div>
                     <div class="wf-workdir-box">
                         <label class="wf-workdir-open-label" title="${currentLang==='zh'?'点击打开上次运行输出目录':'Click to open last run output directory'}"><i class="fas fa-folder-open"></i> ${currentLang==='zh'?'工作路径':'Work Dir'} <i class="fas fa-external-link-alt" style="font-size:11px; opacity:.75;"></i></label>
-                        <input type="text" class="wf-workdir-input" placeholder="${currentLang==='zh'?'拖入文件夹或输入路径...':'Drop folder or type path...'}" value="${wfGlobalWorkDir || ''}" />
+                        <input type="text" class="wf-workdir-input" placeholder="${t('auto_output_dir_hint')}" value="${wfGlobalWorkDir || ''}" />
                     </div>
                 </div>
                 <div class="wf-sidebar-scroll">
@@ -4932,23 +4993,7 @@ function renderWorkflowUI(container, tabId) {
 
     if (workDirLabel) {
         workDirLabel.style.cursor = 'pointer';
-        workDirLabel.onclick = async () => {
-            if (!wfLastRunOutputDir) {
-                _showToast(currentLang==='zh' ? '暂无可打开的运行输出目录，请先运行一次工作流' : 'No last-run output directory yet, run workflow first', 'warning');
-                return;
-            }
-            try {
-                const fs = require('fs');
-                if (!fs.existsSync(wfLastRunOutputDir)) {
-                    _showToast((currentLang==='zh' ? '目录不存在: ' : 'Directory not found: ') + wfLastRunOutputDir, 'warning');
-                    return;
-                }
-                const err = await require('electron').shell.openPath(wfLastRunOutputDir);
-                if (err) _showToast((currentLang==='zh' ? '打开失败: ' : 'Open failed: ') + err, 'error');
-            } catch (e) {
-                _showToast((currentLang==='zh' ? '打开失败: ' : 'Open failed: ') + e.message, 'error');
-            }
-        };
+        workDirLabel.onclick = () => openRunOutputDirectory(wfLastRunOutputDir);
     }
 
     // arrow marker for directional links (use tabId-scoped id)
@@ -5112,6 +5157,9 @@ function renderWorkflowUI(container, tabId) {
     try {
         tabs[tabId] = tabs[tabId] || {};
         tabs[tabId].logUI = container.querySelector('.wf-local-log');
+        tabs[tabId].logUI.dataset.workflowRunId = workflowLogRunId;
+        bindRunLogTarget(workflowLogRunId, tabId);
+        attachLogArchiveLink(tabs[tabId].logUI, workflowLogRunId);
     } catch (e) { console.warn('failed to attach wf log UI', e); }
 
     // Log panel: default closed; resize from its top edge when visible.
@@ -5228,37 +5276,66 @@ function renderWorkflowUI(container, tabId) {
 
     canvas.appendChild(minimap);
 
-    function updateMinimap() {
+    let minimapFrame = 0;
+    let minimapNeedsRedraw = false;
+    let minimapBackground = null;
+    function updateMinimap(redraw = true) {
+        minimapNeedsRedraw = minimapNeedsRedraw || redraw;
+        if (minimapFrame) return;
+        minimapFrame = requestAnimationFrame(() => {
+            // A drag frame may be queued after this one. Commit it first so the
+            // overview measures the current position without another layout pass.
+            flushCanvasPan();
+            flushNodeMove();
+            minimapFrame = 0;
+            const fullRedraw = minimapNeedsRedraw;
+            minimapNeedsRedraw = false;
+            if (!canvas.isConnected) return;
+            if (fullRedraw || !minimap._mapScale) drawMinimap();
+            else updateMinimapViewport();
+        });
+    }
+
+    function drawMinimap() {
         const nodes = canvasInner.querySelectorAll('.wf-node');
         const ctx = minimapCanvas.getContext('2d');
         const mmW = minimap.clientWidth || 180;
         const mmH = minimap.clientHeight || 130;
-        minimapCanvas.width = mmW;
-        minimapCanvas.height = mmH;
+        if (minimapCanvas.width !== mmW) minimapCanvas.width = mmW;
+        if (minimapCanvas.height !== mmH) minimapCanvas.height = mmH;
         ctx.clearRect(0, 0, mmW, mmH);
+        ctx.fillStyle = '#f0f2f5';
+        ctx.fillRect(0, 0, mmW, mmH);
 
         // Draw minimap background (same as canvas background)
         const canvasBg = canvas.style.backgroundImage;
         if (canvasBg && canvasBg !== 'none') {
             const bgUrl = canvasBg.slice(5, -2);
-            const bgImg = new Image();
-            bgImg.src = bgUrl;
-            if (bgImg.complete) {
-                ctx.drawImage(bgImg, 0, 0, mmW, mmH);
-            } else {
-                bgImg.onload = () => {
-                    ctx.drawImage(bgImg, 0, 0, mmW, mmH);
-                };
+            if (!minimapBackground || minimapBackground.url !== bgUrl) {
+                const image = new Image();
+                minimapBackground = { url: bgUrl, image };
+                image.onload = () => updateMinimap();
+                image.src = bgUrl;
             }
+            const bgImg = minimapBackground.image;
+            if (bgImg.complete && bgImg.naturalWidth) ctx.drawImage(bgImg, 0, 0, mmW, mmH);
         } else {
-            ctx.fillStyle = '#f0f2f5';
-            ctx.fillRect(0, 0, mmW, mmH);
+            minimapBackground = null;
         }
 
-        if (nodes.length === 0) return;
+        if (nodes.length === 0) {
+            minimap._mapScale = 0;
+            minimapViewport.hidden = true;
+            return;
+        }
+        minimapViewport.hidden = false;
 
-        // compute bounding box of all nodes in canvasInner coordinate space (unscaled)
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        // Include the visible canvas so moving a lone node changes its map position
+        // instead of translating the map's bounds along with the node.
+        const canvasRect = canvas.getBoundingClientRect();
+        let minX = -canvasPanX / canvasScale, minY = -canvasPanY / canvasScale;
+        let maxX = minX + canvasRect.width / canvasScale;
+        let maxY = minY + canvasRect.height / canvasScale;
         const nodeRects = [];
         nodes.forEach(n => {
             const x = parseFloat(n.style.left) || 0;
@@ -5282,12 +5359,18 @@ function renderWorkflowUI(container, tabId) {
         // Draw connections as thin lines
         ctx.strokeStyle = 'rgba(63,81,181,0.5)';
         ctx.lineWidth = 1;
+        const innerRect = canvasInner.getBoundingClientRect();
+        const portCenters = new Map();
+        const centerOf = port => {
+            if (!portCenters.has(port)) portCenters.set(port, getPortCenter(port, innerRect));
+            return portCenters.get(port);
+        };
         connections.forEach(c => {
             const fromPort = findPortElement(c.from.nodeId, c.from.port, c.from.portKey);
             const toPort = findPortElement(c.to.nodeId, c.to.port, c.to.portKey);
             if (!fromPort || !toPort) return;
-            const p1 = getPortCenter(fromPort);
-            const p2 = getPortCenter(toPort);
+            const p1 = centerOf(fromPort);
+            const p2 = centerOf(toPort);
             const sx = (p1.x - minX) * scale;
             const sy = (p1.y - minY) * scale;
             const ex = (p2.x - minX) * scale;
@@ -5311,9 +5394,19 @@ function renderWorkflowUI(container, tabId) {
             ctx.strokeRect(rx, ry, rw, rh);
         });
 
-        // Draw viewport rectangle (what the user sees)
+        // Store mapping for click-to-navigate and viewport-only pan/zoom updates.
+        minimap._mapMinX = minX;
+        minimap._mapMinY = minY;
+        minimap._mapScale = scale;
+        updateMinimapViewport();
+    }
+
+    function updateMinimapViewport() {
+        const scale = minimap._mapScale;
+        if (!scale) return;
+        const minX = minimap._mapMinX, minY = minimap._mapMinY;
+        const mmW = minimapCanvas.width, mmH = minimapCanvas.height;
         const canvasRect = canvas.getBoundingClientRect();
-        const vpLeft = (-canvasPanX / canvasScale - minX + minX) ; // viewport top-left in unscaled coords
         // The canvas viewport in unscaled canvasInner coords:
         const vpX = -canvasPanX / canvasScale;
         const vpY = -canvasPanY / canvasScale;
@@ -5329,11 +5422,6 @@ function renderWorkflowUI(container, tabId) {
         minimapViewport.style.top = Math.max(0, vpRy) + 'px';
         minimapViewport.style.width = Math.min(vpRw, mmW) + 'px';
         minimapViewport.style.height = Math.min(vpRh, mmH) + 'px';
-
-        // Store mapping for click-to-navigate
-        minimap._mapMinX = minX;
-        minimap._mapMinY = minY;
-        minimap._mapScale = scale;
     }
 
     // Click on minimap to navigate
@@ -5353,7 +5441,6 @@ function renderWorkflowUI(container, tabId) {
             canvasPanX = -(targetX * canvasScale - canvasRect.width / 2);
             canvasPanY = -(targetY * canvasScale - canvasRect.height / 2);
             applyCanvasTransform();
-            updateMinimap();
         };
         navigateToMinimapPoint(e);
         const onMove = (ev) => navigateToMinimapPoint(ev);
@@ -5364,11 +5451,12 @@ function renderWorkflowUI(container, tabId) {
 
     // Update minimap on zoom, pan, node drag
     const origApply = applyCanvasTransform;
-    applyCanvasTransform = function() { origApply(); requestAnimationFrame(updateMinimap); };
+    applyCanvasTransform = function() { origApply(); updateMinimap(false); };
 
     // Also hook updateConnections to refresh minimap
     const origUpdateConn = updateConnections;
-    updateConnections = function() { origUpdateConn(); requestAnimationFrame(updateMinimap); };
+    updateConnections = function(nodeId) { origUpdateConn(nodeId); updateMinimap(); };
+    container._wfRefreshConnections = updateConnections;
 
     // Initial minimap draw
     setTimeout(updateMinimap, 200);
@@ -5812,6 +5900,7 @@ function renderWorkflowUI(container, tabId) {
                             try {
                                 pathEl.style.pointerEvents = 'stroke';
                                 pathEl.style.cursor = 'pointer';
+                                pathEl.innerHTML = currentLang === 'zh' ? '<title>右键可删除连线</title>' : '<title>Right-click to delete connection</title>';
                                 pathEl.addEventListener('contextmenu', (e) => {
                                     e.preventDefault(); e.stopPropagation();
                                     const idx = connections.indexOf(conn);
@@ -5823,9 +5912,10 @@ function renderWorkflowUI(container, tabId) {
                                     pathEl.setAttribute('stroke', '#ff5722');
                                     pathEl.setAttribute('stroke-width', '4');
                                     pathEl.setAttribute('marker-end', `url(#${markerId}-hover)`);
+                                    const p1 = getPortCenter(fromPort);
                                     const p2 = getPortCenter(toPort);
-                                    connDel.style.left = (p2.x - 20) + 'px';
-                                    connDel.style.top = (p2.y - 10) + 'px';
+                                    connDel.style.left = ((p1.x + p2.x) / 2) + 'px';
+                                    connDel.style.top = ((p1.y + p2.y) / 2) + 'px';
                                     connDel.style.display = 'flex';
                                     connDelTarget = conn;
                                 };
@@ -5857,8 +5947,7 @@ function renderWorkflowUI(container, tabId) {
         stopWorkflowScheduling = false;
         activeWorkflowRuns += 1;
         try {
-        // Workflow-run id for this Start All invocation
-        const wfRunId = 'wf-' + Date.now() + '-' + Math.floor(Math.random()*10000);
+        log('[SYSTEM] Workflow started');
         const nodes = Array.from(canvasInner.querySelectorAll('.wf-node'));
         const nodeIds = nodes.map(n => n.getAttribute('data-id'));
 
@@ -5873,11 +5962,6 @@ function renderWorkflowUI(container, tabId) {
         } else {
             execGroups = computeTopoGroups();
         }
-
-        // base for output dirs when no global workdir and no per-node dir
-        const wfBaseDir = _appOutputsDir || path.join(os.homedir(), 'Documents', 'BioFramework');
-        const permanentBase = path.join(wfBaseDir, 'workflow_output');
-        wfLastRunOutputDir = wfGlobalWorkDir || permanentBase;
 
         // The configured groups are only a priority. Graph dependencies always
         // take precedence, including when a custom order reverses two nodes.
@@ -5938,15 +6022,6 @@ function renderWorkflowUI(container, tabId) {
                 if (!n) {
                     setExecutionStatus(nodeId, 'failed');
                     return;
-                }
-
-                const userOut = (n._outDir && n._outDir.trim()) ? n._outDir : null;
-                if (!userOut && !wfGlobalWorkDir) {
-                    const fs = require('fs');
-                    const toolName = (n.dataset.pluginId || 'output').replace(/[^a-zA-Z0-9_-]/g, '_');
-                    const permDir = path.join(permanentBase, toolName);
-                    try { fs.mkdirSync(permDir, { recursive: true }); } catch(e) {}
-                    n._outDir = permDir;
                 }
 
                 const plugin = allPlugins.find(p => p.id === n.dataset.pluginId);
@@ -6012,7 +6087,10 @@ function renderWorkflowUI(container, tabId) {
             await new Promise(r => setTimeout(r, 500));
         }
 
-        } finally { activeWorkflowRuns -= 1; }
+        } finally {
+            log(stopWorkflowScheduling ? '[SYSTEM] Workflow stopped' : '[SYSTEM] Workflow finished');
+            activeWorkflowRuns -= 1;
+        }
     };
 
     const applyToAllNodes = (fn) => {
@@ -6029,9 +6107,7 @@ function renderWorkflowUI(container, tabId) {
         // CSS transform:scale() for standardized scaling (replaces non-standard zoom).
         // All children (nodes + SVG) are in the same transform matrix,
         // so connections automatically stay aligned with ports during zoom/pan.
-        canvasInner.style.transform = `scale(${canvasScale})`;
-        canvasInner.style.left = canvasPanX + 'px';
-        canvasInner.style.top = canvasPanY + 'px';
+        canvasInner.style.transform = `translate(${canvasPanX}px, ${canvasPanY}px) scale(${canvasScale})`;
     }
 
     // Scroll wheel zooms canvas
@@ -6075,6 +6151,22 @@ function renderWorkflowUI(container, tabId) {
     // Drag blank canvas area to pan
     let isPanning = false;
     let panStartX = 0, panStartY = 0, panStartPX = 0, panStartPY = 0;
+    let panFrame = 0, panPointer = null;
+    function flushCanvasPan() {
+        if (panFrame) cancelAnimationFrame(panFrame);
+        panFrame = 0;
+        if (!isPanning || !panPointer) return;
+        const { clientX, clientY } = panPointer;
+        panPointer = null;
+        canvasPanX = panStartPX + (clientX - panStartX);
+        canvasPanY = panStartPY + (clientY - panStartY);
+        applyCanvasTransform();
+        if (pending) {
+            pendingPointerClientX = clientX;
+            pendingPointerClientY = clientY;
+            updatePendingPath(clientX, clientY);
+        }
+    }
     canvas.addEventListener('pointerdown', (e) => {
         // While carrying a connection, hold the right mouse button anywhere
         // on the canvas to pan without dropping the pending line.
@@ -6100,18 +6192,16 @@ function renderWorkflowUI(container, tabId) {
     });
     document.addEventListener('pointermove', (e) => {
         if (!isPanning) return;
-        canvasPanX = panStartPX + (e.clientX - panStartX);
-        canvasPanY = panStartPY + (e.clientY - panStartY);
-        applyCanvasTransform();
-        if (pending) {
-            pendingPointerClientX = e.clientX;
-            pendingPointerClientY = e.clientY;
-            updatePendingPath(e.clientX, e.clientY);
-        }
+        panPointer = { clientX: e.clientX, clientY: e.clientY };
+        if (!panFrame) panFrame = requestAnimationFrame(flushCanvasPan);
         // No need to recalculate connections — SVG and nodes pan together inside canvasInner.
     });
     document.addEventListener('pointerup', (e) => {
-        if (isPanning) { isPanning = false; canvas.style.cursor = pending ? 'crosshair' : ''; }
+        if (isPanning) {
+            flushCanvasPan();
+            isPanning = false;
+            canvas.style.cursor = pending ? 'crosshair' : '';
+        }
     });
     canvas.addEventListener('contextmenu', (e) => {
         if (!pending) return;
@@ -6279,6 +6369,7 @@ function renderWorkflowUI(container, tabId) {
     toolbar.querySelector('.wf-exec-order').onclick = () => showExecOrderModal();
 
     let dragNode = null;
+    let nodeMoveFrame = 0, nodePointer = null;
     let startX, startY, initialLeft, initialTop;
     let _nodeZCounter = 10;  // incremental z-index for bringing dragged nodes to front
 
@@ -6381,6 +6472,7 @@ function renderWorkflowUI(container, tabId) {
     const connDel = document.createElement('div');
     connDel.className = 'wf-connection-delete';
     connDel.style.cssText = 'position:absolute; width:22px; height:22px; background:transparent; color:#e53935; display:none; align-items:center; justify-content:center; border-radius:50%; cursor:pointer; z-index:50; font-size:11px; line-height:22px; transition:transform 0.12s; border:2px solid transparent;';
+    connDel.style.transform = 'translate(-50%, -50%)';
     connDel.innerText = '✕';
     connDel.title = currentLang==='zh'?'删除连线':'Delete connection';
     canvasInner.appendChild(connDel);
@@ -6403,9 +6495,8 @@ function renderWorkflowUI(container, tabId) {
     // coordinates — the same coordinate space used by SVG paths and node left/top.
     // Since SVG and nodes share the same transform matrix, the resulting path coordinates
     // are inherently stable across zoom levels (Galaxy unified view transform).
-    function getPortCenter(portEl) {
+    function getPortCenter(portEl, innerRect = canvasInner.getBoundingClientRect()) {
         const portRect = portEl.getBoundingClientRect();
-        const innerRect = canvasInner.getBoundingClientRect();
         const x = (portRect.left + portRect.width/2 - innerRect.left) / canvasScale;
         const y = (portRect.top + portRect.height/2 - innerRect.top) / canvasScale;
         return { x, y };
@@ -6666,15 +6757,30 @@ function renderWorkflowUI(container, tabId) {
         } catch (e) { console.warn('autoSelectForParam error', e); }
     }
 
-    function updateConnections() {
-        connections.forEach(c => {
-            const fromPort = findPortElement(c.from.nodeId, c.from.port, c.from.portKey);
-            const toPort = findPortElement(c.to.nodeId, c.to.port, c.to.portKey);
-            if (!fromPort || !toPort) {
+    function updateConnections(nodeId) {
+        if (connDelTarget && !connections.includes(connDelTarget)) {
+            connDelTarget = null;
+            connDel.style.display = 'none';
+        }
+        const innerRect = canvasInner.getBoundingClientRect();
+        const portCenters = new Map();
+        const centerOf = port => {
+            if (!portCenters.has(port)) portCenters.set(port, getPortCenter(port, innerRect));
+            return portCenters.get(port);
+        };
+        // Measure all affected endpoints before writing SVG paths (one layout pass).
+        const endpoints = connections
+            .filter(c => !nodeId || c.from.nodeId === nodeId || c.to.nodeId === nodeId)
+            .map(c => {
+                const fromPort = findPortElement(c.from.nodeId, c.from.port, c.from.portKey);
+                const toPort = findPortElement(c.to.nodeId, c.to.port, c.to.portKey);
+                return { c, p1: fromPort && centerOf(fromPort), p2: toPort && centerOf(toPort) };
+            });
+        endpoints.forEach(({ c, p1, p2 }) => {
+            if (!p1 || !p2) {
                 try { if (c.path && c.path.parentNode) c.path.parentNode.removeChild(c.path); } catch(e){}
                 return;
             }
-            const p1 = getPortCenter(fromPort); const p2 = getPortCenter(toPort);
             // Galaxy-style smooth cubic bezier: compute control points
             const dx = Math.abs(p2.x - p1.x);
             const dy = Math.abs(p2.y - p1.y);
@@ -6699,8 +6805,8 @@ function renderWorkflowUI(container, tabId) {
 
             if (connDelTarget === c) {
                 const mx = (p1.x + p2.x)/2; const my = (p1.y + p2.y)/2;
-                connDel.style.left = (mx - 10) + 'px';
-                connDel.style.top = (my - 10) + 'px';
+                connDel.style.left = mx + 'px';
+                connDel.style.top = my + 'px';
             }
         });
     }
@@ -7226,18 +7332,11 @@ function renderWorkflowUI(container, tabId) {
                 labelRow.className = 'wf-output-label-row';
                 const outLabel = (out.label ? getPluginText(out.label) : (out.id || 'output'));
 
-                const chk = document.createElement('input');
-                chk.type = 'checkbox';
-                chk.checked = true;
-                chk.className = 'wf-output-chk';
-                chk.title = currentLang==='zh'?'启用此输出':'Enable this output';
-
                 const nameSpan = document.createElement('span');
                 nameSpan.className = 'wf-output-name';
                 nameSpan.innerText = outLabel;
                 nameSpan.title = out.description ? getPluginText(out.description) : outLabel;
 
-                labelRow.appendChild(chk);
                 labelRow.appendChild(nameSpan);
                 outContent.appendChild(labelRow);
 
@@ -7341,8 +7440,8 @@ function renderWorkflowUI(container, tabId) {
             dragNode = nodeEl;
             startX = e.clientX;
             startY = e.clientY;
-            initialLeft = nodeEl.offsetLeft;
-            initialTop = nodeEl.offsetTop;
+            initialLeft = parseFloat(nodeEl.style.left) || nodeEl.offsetLeft;
+            initialTop = parseFloat(nodeEl.style.top) || nodeEl.offsetTop;
             // Bring this node to the top layer to prevent overlap and text selection
             _nodeZCounter++;
             nodeEl.style.zIndex = _nodeZCounter;
@@ -7411,6 +7510,7 @@ function renderWorkflowUI(container, tabId) {
                     try {
                         conn.path.style.pointerEvents = 'stroke';
                         conn.path.style.cursor = 'pointer';
+                        conn.path.innerHTML = currentLang === 'zh' ? '<title>右键可删除连线</title>' : '<title>Right-click to delete connection</title>';
                         conn.path.setAttribute('stroke-width', '2.5');
                         conn.path.setAttribute('stroke-linecap', 'round');
                         // Right-click to delete connection
@@ -7428,10 +7528,11 @@ function renderWorkflowUI(container, tabId) {
                             const fromPort = findPortElement(conn.from.nodeId, conn.from.port, conn.from.portKey);
                             const toPort = findPortElement(conn.to.nodeId, conn.to.port, conn.to.portKey);
                             if (!fromPort || !toPort) return;
-                            // Show delete button near the endpoint (target input port)
+                            // Center the delete button on the symmetric connection curve.
+                            const p1 = getPortCenter(fromPort);
                             const p2 = getPortCenter(toPort);
-                            connDel.style.left = (p2.x - 20) + 'px';
-                            connDel.style.top = (p2.y - 10) + 'px';
+                            connDel.style.left = ((p1.x + p2.x) / 2) + 'px';
+                            connDel.style.top = ((p1.y + p2.y) / 2) + 'px';
                             connDel.style.display = 'flex';
                             connDelTarget = conn;
                         };
@@ -7457,15 +7558,27 @@ function renderWorkflowUI(container, tabId) {
 
     function onNodeMove(e) {
         if (!dragNode) return;
+        nodePointer = { clientX: e.clientX, clientY: e.clientY };
+        if (!nodeMoveFrame) nodeMoveFrame = requestAnimationFrame(flushNodeMove);
+    }
+
+    function flushNodeMove() {
+        if (nodeMoveFrame) cancelAnimationFrame(nodeMoveFrame);
+        nodeMoveFrame = 0;
+        if (!dragNode || !nodePointer) return;
+        const { clientX, clientY } = nodePointer;
+        nodePointer = null;
         // Account for canvas scale when dragging nodes
-        const dx = (e.clientX - startX) / canvasScale;
-        const dy = (e.clientY - startY) / canvasScale;
+        const dx = (clientX - startX) / canvasScale;
+        const dy = (clientY - startY) / canvasScale;
         dragNode.style.left = (initialLeft + dx) + 'px';
         dragNode.style.top = (initialTop + dy) + 'px';
-        updateConnections();
+        updateConnections(dragNode.dataset.id);
     }
 
     function stopNodeMove() {
+        // Commit the last move even when release happens before the next frame.
+        flushNodeMove();
         dragNode = null;
         document.onpointermove = null;
         document.onpointerup = null;
@@ -7602,30 +7715,16 @@ function renderWorkflowUI(container, tabId) {
                 }
             });
 
-            // Determine output directory: use global workdir + tool name subfolder
-            let outDir = nodeEl._outDir || '';
-            if (!outDir && wfGlobalWorkDir) {
-                const fs = require('fs');
-                const toolName = (plugin.id || 'output').replace(/[^a-zA-Z0-9_-]/g, '_');
-                outDir = path.join(wfGlobalWorkDir, toolName);
-                try { fs.mkdirSync(outDir, { recursive: true }); } catch(e) { console.warn('mkdir failed', e); }
-                nodeEl._outDir = outDir;
-            }
-            if (!outDir) {
-                // fallback to temp dir
-                const fs = require('fs');
-                const toolName = (plugin.id || 'output').replace(/[^a-zA-Z0-9_-]/g, '_');
-                const fallbackBase = _appOutputsDir || path.join(os.homedir(), 'Documents', 'BioFramework');
-                outDir = path.join(fallbackBase, 'workflow_output', toolName);
-                try { fs.mkdirSync(outDir, { recursive: true }); } catch(e) {}
-                nodeEl._outDir = outDir;
-            }
+            // The backend creates a fresh run directory under the configured root.
+            // _outDir stores results only, never the root for a subsequent run.
+            let outDir = wfGlobalWorkDir || '';
 
             log(`[USER] Node start: ${plugin.id} threads=${threads} outDir=${outDir}`);
 
-            clientRunId = 'run-' + Date.now() + '-' + Math.floor(Math.random()*100000);
+            clientRunId = workflowLogRunId + '/run-' + require('crypto').randomUUID();
             nodeEl._currentRunId = clientRunId;
             startRunLogStream(clientRunId, tabId);
+            await tabs[tabId].logUI._archivePending;
 
             // Determine if this is an R tool
             const isRTool = plugin.type && String(plugin.type).toLowerCase().startsWith('r');
@@ -7638,6 +7737,7 @@ function renderWorkflowUI(container, tabId) {
                 const script = plugin.script || ('scripts/' + plugin.id.replace(/_panel$/, '') + '.R');
                 form.append('script', script);
                 form.append('outDir', outDir);
+                form.append('outputContext', 'workflow');
                 const rParams = {};
                 (plugin.parameters || []).forEach(p => {
                     const pid = p.id || p.name;
@@ -7662,7 +7762,7 @@ function renderWorkflowUI(container, tabId) {
                     // or the user manually stops it.
                     const r = await fetch(API_BASE + '/r/run-script', { method: 'POST', body: form });
                     const j = await r.json();
-                    // Update outDir to timestamped subfolder from backend
+                    // Keep the actual result path for previews and downstream inputs.
                     if (j.outDir) { outDir = j.outDir; nodeEl._outDir = j.outDir; }
                     if (outDir) wfLastRunOutputDir = outDir;
                     const isOk = (j.status === 'success' || j.exit_code === 0);
@@ -7683,10 +7783,16 @@ function renderWorkflowUI(container, tabId) {
                     pluginId: plugin.id,
                     params,
                     outDir,
+                    outputContext: 'workflow',
                     threads,
                     clientRunId,
                     _visibleFileParams: visibleFileParams
                 }, 0);
+                if (resp && resp.outDir) {
+                    outDir = resp.outDir;
+                    nodeEl._outDir = outDir;
+                    wfLastRunOutputDir = outDir;
+                }
             }
             if (resp && resp.status === 'success') {
                 if (outDir) wfLastRunOutputDir = outDir;
@@ -7709,17 +7815,12 @@ function renderWorkflowUI(container, tabId) {
                     const thisNodeId = nodeEl.getAttribute('data-id');
 
                     if (outputList && resultFiles.length > 0) {
-                        // Collect old port keys and checkbox states from existing output rows before rebuilding
+                        // Keep output port keys stable so existing connections survive rebuilding.
                         const oldPortKeys = [];
-                        const oldCheckStates = {}; // output id/index -> checked boolean
-                        outputList.querySelectorAll('.wf-output-row').forEach((row, rIdx) => {
+                        outputList.querySelectorAll('.wf-output-row').forEach(row => {
                             const port = row.querySelector('.wf-port.out');
                             if (port) {
                                 oldPortKeys.push({ key: port.getAttribute('data-key'), port: port.getAttribute('data-port') });
-                            }
-                            const chk = row.querySelector('.wf-output-chk');
-                            if (chk !== null) {
-                                oldCheckStates[rIdx] = chk.checked;
                             }
                         });
 
@@ -7791,23 +7892,15 @@ function renderWorkflowUI(container, tabId) {
                             const outContent = document.createElement('div');
                             outContent.className = 'wf-output-content';
 
-                            // Label row with checkbox
+                            // Output label and connection port are the only output controls.
                             const labelRow = document.createElement('div');
                             labelRow.className = 'wf-output-label-row';
-
-                            const chk = document.createElement('input');
-                            chk.type = 'checkbox';
-                            chk.className = 'wf-output-chk';
-                            chk.checked = (grp.entryIdx >= 0 && oldCheckStates[grp.entryIdx] !== undefined)
-                                ? oldCheckStates[grp.entryIdx] : true;
-                            chk.title = currentLang==='zh'?'启用此输出':'Enable this output';
 
                             const nameSpan = document.createElement('span');
                             nameSpan.className = 'wf-output-name';
                             nameSpan.innerText = entryLabel || `${ext} (${grp.files.length})`;
                             nameSpan.title = grp.files.map(f => path.basename(f)).join('\n');
 
-                            labelRow.appendChild(chk);
                             labelRow.appendChild(nameSpan);
                             outContent.appendChild(labelRow);
 
@@ -7936,20 +8029,6 @@ function renderWorkflowUI(container, tabId) {
                         // Get files ONLY from the specific output port that is connected
                         const fromPortKey = c.from.portKey || '';
                         let filesToPass = [];
-
-                        // Check if the output port's checkbox is unchecked (user disabled this output)
-                        const fromPortEl_chk = nodeEl.querySelector(`.wf-port.out[data-key="${fromPortKey}"]`);
-                        if (fromPortEl_chk) {
-                            const parentRow = fromPortEl_chk.closest('.wf-output-row');
-                            if (parentRow) {
-                                const outputChk = parentRow.querySelector('.wf-output-chk');
-                                if (outputChk && !outputChk.checked) {
-                                    // User has unchecked this output — skip file passing
-                                    triggered.add(key);
-                                    continue;
-                                }
-                            }
-                        }
 
                         // First: check if the from port has grouped files (consolidated output)
                         const fromPortEl_grp = nodeEl.querySelector(`.wf-port.out[data-key="${fromPortKey}"]`);
@@ -9099,6 +9178,7 @@ function _fetchTextViaHttps(url, timeoutMs = 6500, redirects = 3) {
 // Get stored OAuth token from localStorage, or null
 let _ghRestorePromise = null, _ghSyncPromise = null, _ghSyncToken = '', _ghSyncedToken = '', _ghAuthVersion = 0;
 function _ghNotifyAuth() {
+    marketplaceReviewNotice?.refresh();
     Object.values(tabs).forEach(tab => {
         try { Promise.resolve(tab.onGithubAuthChanged?.()).catch(() => {}); } catch (_) {}
     });
@@ -9150,12 +9230,14 @@ function _ghSetUser(user) {
     _ghNotifyAuth();
 }
 function _ghClearAuth() {
+    marketplaceReviewNotice?.clear();
     _ghAuthVersion++; _ghSyncedToken = '';
     localStorage.removeItem('gh_oauth_token');
     localStorage.removeItem('gh_oauth_user');
     return ipcRenderer.invoke('market-logout').catch(() => {}).finally(_ghNotifyAuth);
 }
 ipcRenderer.on('github-session-cleared', () => {
+    marketplaceReviewNotice?.clear();
     _ghAuthVersion++; _ghSyncedToken = '';
     localStorage.removeItem('gh_oauth_token'); localStorage.removeItem('gh_oauth_user');
     _ghNotifyAuth();
@@ -14359,7 +14441,7 @@ function renderRPanelUI(instance, container) {
                 <span class="r-runtime-status"></span>
                 <div class="r-outdir-box">
                     <label class="r-outdir-open-label" title="${currentLang==='zh'?'点击打开上次运行输出目录':'Click to open last run output directory'}"><i class="fas fa-folder-open"></i> <span class="r-lbl-outdir">${currentLang==='zh'?'结果输出目录':'Output Directory'}</span>: <i class="fas fa-external-link-alt" style="font-size:11px; opacity:.75;"></i></label>
-                    <input type="text" class="r-outdir-input" placeholder="${currentLang==='zh'?'拖入文件夹或输入目录路径...':'Drop folder or type path...'}" />
+                    <input type="text" class="r-outdir-input" placeholder="${t('auto_output_dir_hint')}" />
                 </div>
             </div>
 
@@ -14428,7 +14510,8 @@ function renderRPanelUI(instance, container) {
     const autoOpenSvgToggle = container.querySelector('.r-auto-open-svg-toggle');
     const rLogBox = container.querySelector('.r-local-log');
     instance.logUI = rLogBox;
-    instance.outDir = '';
+    instance.outDir = instance.outDir || '';
+    outDirInput.value = instance.outDir || instance.lastRunOutDir || '';
     if (!instance.lastRunOutDir) instance.lastRunOutDir = '';
 
     const syncPackageDetails = () => {
@@ -14489,24 +14572,7 @@ function renderRPanelUI(instance, container) {
 
     if (outDirLabel) {
         outDirLabel.style.cursor = 'pointer';
-        outDirLabel.onclick = async () => {
-            const targetDir = instance.lastRunOutDir || '';
-            if (!targetDir) {
-                _showToast(currentLang==='zh' ? '暂无可打开的运行输出目录，请先运行一次分析' : 'No last-run output directory yet, run analysis first', 'warning');
-                return;
-            }
-            try {
-                const fs = require('fs');
-                if (!fs.existsSync(targetDir)) {
-                    _showToast((currentLang==='zh' ? '目录不存在: ' : 'Directory not found: ') + targetDir, 'warning');
-                    return;
-                }
-                const err = await require('electron').shell.openPath(targetDir);
-                if (err) _showToast((currentLang==='zh' ? '打开失败: ' : 'Open failed: ') + err, 'error');
-            } catch (e) {
-                _showToast((currentLang==='zh' ? '打开失败: ' : 'Open failed: ') + e.message, 'error');
-            }
-        };
+        outDirLabel.onclick = () => openRunOutputDirectory(instance.lastRunOutDir);
     }
 
     if (autoOpenSvgToggle) {
@@ -15885,9 +15951,12 @@ function renderRPanelUI(instance, container) {
                 rlog('❌ ' + (currentLang==='zh'?'响应解析失败':'Response parse failed'));
                 throw jsonErr;
             }
+            if (j.outDir) {
+                instance.lastRunOutDir = j.outDir;
+                // Display automatic outputs without changing the configured root.
+                if (!instance.outDir) outDirInput.value = j.outDir;
+            }
             if (j.status === 'success' || (j.exit_code === 0)) {
-                if (j.outDir) instance.outDir = j.outDir;
-                instance.lastRunOutDir = j.outDir || instance.outDir || '';
                 rlog('✅ ' + (currentLang==='zh'?'运行成功':'Run completed'));
                 refreshOutputFileList();
                 if (instance.autoOpenSvgEditor) {
@@ -15920,7 +15989,7 @@ function renderRPanelUI(instance, container) {
     let currentNavigationPath = '';
     
     async function refreshOutputFileList(path = null) {
-        const outDir = instance.outDir || '';
+        const outDir = instance.lastRunOutDir || instance.outDir || '';
         try {
             let url = API_BASE + '/r/list-outputs';
             const params = [];
@@ -16271,12 +16340,14 @@ function renderRPanelUI(instance, container) {
     // ====================================================================
     function openVectorEditor(f, options = {}) {
         const { sessionKey, liveMode, initialSvgText, windowPosition } = options;
+        const recoveryIdentity = file => file ? 'file:'+require('path').win32.normalize(file).toLowerCase() : sessionKey||f.name;
+        let editorRecoveryKey = recoveryIdentity(f.path);
 
         // If sessionKey exists and editor is already open, update it in-place
         if (sessionKey && instance._liveEditorSessions.has(sessionKey)) {
             const session = instance._liveEditorSessions.get(sessionKey);
             if (session.updateFn && initialSvgText) {
-                session.updateFn(initialSvgText);
+                session.updateFn(initialSvgText,f.path);
                 // Bring window to front
                 if (session.overlay) session.overlay.style.zIndex = 60000 + Date.now() % 1000;
                 return;
@@ -16284,6 +16355,8 @@ function renderRPanelUI(instance, container) {
         }
 
         const editorEvents = new AbortController();
+        const geometryJobs = require('./vector-jobs').createJobs();
+        let editorTools = null;
         const listen = (target, type, callback, options = {}) => target.addEventListener(type, callback,
             {...(typeof options === 'boolean' ? {capture:options} : options), signal:editorEvents.signal});
         const overlay = document.createElement('div');
@@ -16298,22 +16371,17 @@ function renderRPanelUI(instance, container) {
                         <span class="r-ve-title"><i class="fas fa-key" style="color:#2e7d32;"></i> ${currentLang==='zh'?'矢量编辑器':'Vector Editor'} — ${escapeHtml(f.name)}${liveMode ? ' <span class="r-ve-live-badge">● LIVE</span>' : ''}</span>
                     </div>
                     <div class="r-ve-toolbar-center">
-                        <button class="r-ve-tool active" data-tool="select" title="Select"><i class="fas fa-mouse-pointer"></i></button>
-                        <button class="r-ve-tool" data-tool="move" title="Move canvas"><i class="fas fa-arrows-alt"></i></button>
-                        <button class="r-ve-tool" data-tool="polygon" title="${currentLang==='zh'?'多边形':'Polygon'}"><i class="fas fa-draw-polygon"></i></button>
-                        <button class="r-ve-tool" data-tool="rectangle" title="${currentLang==='zh'?'长方形':'Rectangle'}" aria-label="${currentLang==='zh'?'长方形':'Rectangle'}"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6.5" width="18" height="11" rx="1" /></svg></button>
-                        <button class="r-ve-tool" data-tool="square" title="${currentLang==='zh'?'正方形':'Square'}" aria-label="${currentLang==='zh'?'正方形':'Square'}"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="1" /></svg></button>
-                        <button class="r-ve-tool" data-tool="circle" title="Circle"><i class="fas fa-circle"></i></button>
-                        <button class="r-ve-tool" data-tool="line" title="Line"><i class="fas fa-minus"></i></button>
-                        <button class="r-ve-tool" data-tool="text" title="Text"><span class="r-ve-text-tool-icon" aria-hidden="true">T</span></button>
-                        <button class="r-ve-tool" data-tool="pen" title="Freehand"><i class="fas fa-pen"></i></button>
+                        <button class="r-ve-tool active" data-tool="select" title="${currentLang==='zh'?'选择工具（单按 Ctrl）':'Select (tap Ctrl)'}"><i class="fas fa-mouse-pointer"></i></button>
+                        <button class="r-ve-tool" data-tool="anchor" title="${currentLang==='zh'?'锚点选择工具 (A)':'Anchor selection (A)'}"><svg viewBox="0 0 24 24"><path d="M5 2L5 21L10 16L14 22L18 20L14 14L21 14Z" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></button>
+                        <button class="r-ve-tool" data-tool="move" title="${currentLang==='zh'?'移动画布':'Move canvas'}"><i class="fas fa-arrows-alt"></i></button>
+                        <div class="ve-shape-group"><button class="r-ve-tool ve-shape-tool" data-tool="rectangle" title="${currentLang==='zh'?'矩形；右键展开工具集':'Rectangle; right-click for tools'}" aria-label="${currentLang==='zh'?'矩形工具集':'Shape tools'}" aria-haspopup="menu" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6.5" width="18" height="11" rx="1" /></svg></button><div class="ve-shape-menu" role="menu" hidden></div></div>
+                        <button class="r-ve-tool" data-tool="line" title="${currentLang==='zh'?'直线工具':'Line'}"><i class="fas fa-minus"></i></button>
+                        <button class="r-ve-tool" data-tool="text" title="${currentLang==='zh'?'文本工具':'Text'}"><span class="r-ve-text-tool-icon" aria-hidden="true">T</span></button>
+                        <div class="ve-pen-group"><button class="r-ve-tool ve-pen-tool" data-tool="bezier" title="${currentLang==='zh'?'钢笔工具 (P)；右键展开工具集':'Pen (P); right-click for tools'}" aria-haspopup="menu" aria-expanded="false"><i class="fas fa-pen-nib"></i></button><div class="ve-pen-menu" role="menu" hidden></div></div>
                         <div class="r-ve-separator"></div>
-                        <button class="r-ve-tool" data-tool="zoomin" title="Zoom In"><i class="fas fa-search-plus"></i></button>
-                        <button class="r-ve-tool" data-tool="zoomout" title="Zoom Out"><i class="fas fa-search-minus"></i></button>
-                        <div class="r-ve-separator"></div>
-                        <button class="r-ve-tool" data-tool="undo" title="Undo"><i class="fas fa-undo"></i></button>
-                        <button class="r-ve-tool" data-tool="redo" title="Redo"><i class="fas fa-redo"></i></button>
-                        <button class="r-ve-tool r-ve-delete-btn" data-tool="delete" title="Delete"><i class="fas fa-trash"></i></button>
+                        <button class="r-ve-tool" data-tool="undo" title="${currentLang==='zh'?'撤销 (Ctrl+Z)':'Undo (Ctrl+Z)'}"><i class="fas fa-undo"></i></button>
+                        <button class="r-ve-tool" data-tool="redo" title="${currentLang==='zh'?'重做 (Ctrl+Y / Ctrl+Shift+Z)':'Redo (Ctrl+Y / Ctrl+Shift+Z)'}"><i class="fas fa-redo"></i></button>
+                        <button class="r-ve-tool r-ve-delete-btn" data-tool="delete" title="${currentLang==='zh'?'删除':'Delete'}"><i class="fas fa-trash"></i></button>
                         <div class="r-ve-separator"></div>
                         <button class="r-ve-bool-btn" data-bool="union" title="${currentLang==='zh'?'合并 (Unite)':'Unite'}"><svg viewBox="0 0 20 16" width="18" height="14"><defs><clipPath id="boolU"><rect x="0" y="0" width="20" height="16"/></clipPath></defs><g clip-path="url(#boolU)"><circle cx="7" cy="8" r="6" fill="currentColor" opacity="0.65" stroke="currentColor" stroke-width="0.8"/><circle cx="13" cy="8" r="6" fill="currentColor" opacity="0.65" stroke="currentColor" stroke-width="0.8"/></g></svg></button>
                         <button class="r-ve-bool-btn" data-bool="subtract" title="${currentLang==='zh'?'减去前方 (Minus Front)':'Minus Front'}"><svg viewBox="0 0 20 16" width="18" height="14"><defs><mask id="boolMF"><rect x="0" y="0" width="20" height="16" fill="white"/><circle cx="13" cy="8" r="6" fill="black"/></mask></defs><circle cx="7" cy="8" r="6" fill="currentColor" opacity="0.65" mask="url(#boolMF)" stroke="currentColor" stroke-width="0.8"/><circle cx="13" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="0.8" stroke-dasharray="1.5,1.5"/></svg></button>
@@ -16332,25 +16400,27 @@ function renderRPanelUI(instance, container) {
                         <button class="r-ve-align-btn" data-align="dist-v" title="${currentLang==='zh'?'垂直均匀分布':'Distribute Vertical'}"><svg viewBox="0 0 14 14" width="14" height="14"><rect x="0" y="0" width="14" height="1.5" fill="currentColor"/><rect x="2" y="4.25" width="10" height="2" fill="currentColor" opacity="0.55"/><rect x="3" y="7.75" width="8" height="2" fill="currentColor" opacity="0.55"/><rect x="0" y="12.5" width="14" height="1.5" fill="currentColor"/></svg></button>
                     </div>
                     <div class="r-ve-toolbar-right">
-                        <button class="r-ve-insert-keybar-btn" title="${currentLang==='zh'?'插入或编辑 Key Bar (色阶条)':'Insert or edit Key Bar'}" style="background:#333;color:#ccc;border:1px solid #555;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:12px;margin-right:6px;"><i class="fas fa-palette"></i> Key Bar</button>
+                        <button class="r-ve-insert-keybar-btn" title="${currentLang==='zh'?'插入或编辑 Key Bar (色阶条)':'Insert or edit Key Bar'}" style="background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:4px;padding:4px 10px;cursor:pointer;font-size:12px;margin-right:6px;"><i class="fas fa-palette"></i> Key Bar</button>
                         <button class="r-ve-export-unified-btn"><i class="fas fa-file-export"></i> ${currentLang==='zh'?'导出':'Export'}</button>
                         <button class="r-ve-close-btn"><i class="fas fa-times"></i> ${currentLang==='zh'?'关闭':'Close'}</button>
                     </div>
                 </div>
                 <div class="r-ve-props-bar">
                     <label>${currentLang==='zh'?'填充':'Fill'}:</label>
-                    <input type="color" class="r-ve-fill" value="#ffffff" />
-                    <button class="r-ve-none-toggle r-ve-fill-none" title="${currentLang==='zh'?'无填充':'No fill'}">∅</button>
-                    <button class="r-ve-gradient-btn r-ve-fill-gradient-btn" title="${currentLang==='zh'?'渐变填充':'Gradient Fill'}" style="background:linear-gradient(90deg,#e53935,#1976d2);color:#fff;border:1px solid #555;border-radius:3px;padding:2px 6px;cursor:pointer;font-size:10px;margin-right:4px;">G</button>
+                    <button type="button" class="r-ve-paint-trigger" data-paint="fill" aria-haspopup="dialog" aria-expanded="false"><span class="r-ve-paint-chip" aria-hidden="true"></span><span aria-hidden="true">▾</span></button>
+                    <input type="color" class="r-ve-fill" value="#ffffff" hidden />
+                    <button class="r-ve-none-toggle r-ve-fill-none" title="${currentLang==='zh'?'无填充':'No fill'}" hidden>∅</button>
+                    <button class="r-ve-gradient-btn r-ve-fill-gradient-btn" title="${currentLang==='zh'?'渐变填充':'Gradient Fill'}" hidden>G</button>
                     <label>${currentLang==='zh'?'描边':'Stroke'}:</label>
-                    <input type="color" class="r-ve-stroke" value="#000000" />
-                    <button class="r-ve-none-toggle r-ve-stroke-none" title="${currentLang==='zh'?'无描边':'No stroke'}">∅</button>
-                    <button class="r-ve-gradient-btn r-ve-stroke-gradient-btn" title="${currentLang==='zh'?'渐变描边':'Gradient Stroke'}" style="background:linear-gradient(90deg,#ff9800,#4caf50);color:#fff;border:1px solid #555;border-radius:3px;padding:2px 6px;cursor:pointer;font-size:10px;margin-right:4px;">G</button>
+                    <button type="button" class="r-ve-paint-trigger" data-paint="stroke" aria-haspopup="dialog" aria-expanded="false"><span class="r-ve-paint-chip" aria-hidden="true"></span><span aria-hidden="true">▾</span></button>
+                    <input type="color" class="r-ve-stroke" value="#000000" hidden />
+                    <button class="r-ve-none-toggle r-ve-stroke-none" title="${currentLang==='zh'?'无描边':'No stroke'}" hidden>∅</button>
+                    <button class="r-ve-gradient-btn r-ve-stroke-gradient-btn" title="${currentLang==='zh'?'渐变描边':'Gradient Stroke'}" hidden>G</button>
                     <label>${currentLang==='zh'?'线宽':'Width'}:</label>
                     <input type="number" class="r-ve-stroke-width" value="2" min="0" max="50" step="0.5" style="width:55px;" />
                     <label>${currentLang==='zh'?'透明度':'Opacity'}:</label>
                     <input type="number" class="r-ve-opacity" min="0" max="100" step="1" value="100" style="width:55px;" />
-                    <span style="margin-left:2px; color:#666;">%</span>
+                    <span style="margin-left:2px; color:var(--ve-muted);">%</span>
                     <div class="r-ve-prop-sep"></div>
                     <label>${currentLang==='zh'?'字体':'Font'}:</label>
                     <select class="r-ve-fontfamily">
@@ -16372,13 +16442,13 @@ function renderRPanelUI(instance, container) {
                     </select>
                     <label>${currentLang==='zh'?'字号':'Size'}:</label>
                     <input type="number" class="r-ve-fontsize" value="16" min="6" max="200" style="width:55px;" />
-                    <button class="r-ve-style-btn r-ve-bold-btn" title="Bold"><b>B</b></button>
-                    <button class="r-ve-style-btn r-ve-italic-btn" title="Italic"><i>I</i></button>
+                    <button class="r-ve-style-btn r-ve-bold-btn" title="${currentLang==='zh'?'加粗':'Bold'}"><b>B</b></button>
+                    <button class="r-ve-style-btn r-ve-italic-btn" title="${currentLang==='zh'?'斜体':'Italic'}"><i>I</i></button>
                     <div class="r-ve-prop-sep"></div>
                     <label>${currentLang==='zh'?'画布':'Canvas'}:</label>
-                    <input type="number" class="r-ve-canvas-w" value="800" min="100" max="10000" style="width:65px;" title="W" />
-                    <span style="color:#666;">×</span>
-                    <input type="number" class="r-ve-canvas-h" value="600" min="100" max="10000" style="width:65px;" title="H" />
+                    <input type="number" class="r-ve-canvas-w" value="800" min="100" max="10000" style="width:65px;" title="${currentLang==='zh'?'画布宽度':'Canvas width'}" />
+                    <span style="color:var(--ve-muted);">×</span>
+                    <input type="number" class="r-ve-canvas-h" value="600" min="100" max="10000" style="width:65px;" title="${currentLang==='zh'?'画布高度':'Canvas height'}" />
                 </div>
                 <div class="r-ve-canvas-wrap">
                     <div class="r-ve-viewport"></div>
@@ -16438,14 +16508,19 @@ function renderRPanelUI(instance, container) {
         let currentTool = 'select';
         let imgW = 800, imgH = 600;
         let canvasW = 800, canvasH = 600;
+        let documentUnitsPerInch = 96, canvasOriginX = 0, canvasOriginY = 0;
         let scale = 1, panX = 0, panY = 0;
         let selectedEl = null;
         let selectedEls = []; // multi-selection array
         let isDrawing = false, drawStart = null, tempEl = null, drawAxisLock = null;
         let isMarquee = false, marqueeStartPt = null, marqueeRect = null;
+        let marqueeBoundsCache = null, marqueeCandidates = null;
         let fillIsNone = false, strokeIsNone = false;
+        let paintSwatches = null;
+        let gradientEditor = null;
         // Full SVG source text for undo (lightweight: just the raw string, not DOM)
         let svgSourceText = '';
+        let documentReady = false, lastDocumentSnapshot = '';
         const history = new TextHistory(30);
         let textHitIndex = null;
         // The actual embedded SVG element (loaded from file)
@@ -16497,15 +16572,14 @@ function renderRPanelUI(instance, container) {
             // Selection box inside draw overlay
             selBox = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
             selBox.setAttribute('fill', 'none');
-            // Keep this invisible geometry for resize/rotation calculations. The
-            // visible selection state is rendered on the object's real outline.
+            // Retain local bounds for transform calculations. The visible frame
+            // and controls are drawn in screen coordinates by the selection layer.
             selBox.setAttribute('stroke', 'none');
             selBox.setAttribute('visibility', 'hidden');
             drawSvg.appendChild(selBox);
 
-            // Resize/rotation controls are intentionally not drawn. Pointer
-            // proximity to the selected geometry is measured in screen pixels,
-            // matching Illustrator-style edge and corner interactions.
+            // Visible controls live in selectionHighlightLayer and share the
+            // same screen-space geometry as pointer hit testing.
             resizeHandle = null;
             rotHandles = [];
 
@@ -16528,6 +16602,7 @@ function renderRPanelUI(instance, container) {
             // the highlight with an inverse width to keep it constant on screen.
             if (selectionHighlightLayer && selectedEls.length && liveSvg) refreshSelectionHighlights();
             if (hoverHighlightLayer && hoveredEl && liveSvg) refreshHoverHighlight();
+            editorTools?.viewChanged();
         }
 
         function updateCanvasSize(w, h) {
@@ -16538,12 +16613,12 @@ function renderRPanelUI(instance, container) {
             if (liveSvg) {
                 liveSvg.setAttribute('width', w); liveSvg.setAttribute('height', h);
                 liveSvg.style.width = w + 'px'; liveSvg.style.height = h + 'px';
-                liveSvg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+                liveSvg.setAttribute('viewBox', `${canvasOriginX} ${canvasOriginY} ${w} ${h}`);
                 liveSvg.setAttribute('overflow', 'visible');
                 liveSvg.style.overflow = 'visible';
             }
             if (drawSvg) {
-                drawSvg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+                drawSvg.setAttribute('viewBox', `${canvasOriginX} ${canvasOriginY} ${w} ${h}`);
                 drawSvg.setAttribute('width', w); drawSvg.setAttribute('height', h);
                 drawSvg.setAttribute('overflow', 'visible');
                 drawSvg.style.overflow = 'visible';
@@ -16585,7 +16660,7 @@ function renderRPanelUI(instance, container) {
             return { x: x ?? 0, y: y ?? 0 };
         }
 
-        const richTextStyleKeys = ['fontFamily', 'fontSize', 'fill', 'fontWeight', 'fontStyle'];
+        const richTextStyleKeys = ['fontFamily', 'fontSize', 'fill', 'fontWeight', 'fontStyle', 'baselineShift'];
 
         function normalizeRichTextRuns(runs, textLength) {
             if (!Array.isArray(runs) || textLength <= 0) return [];
@@ -16708,6 +16783,7 @@ function renderRPanelUI(instance, container) {
                     if (style?.fill) span.setAttribute('fill', style.fill);
                     if (style?.fontWeight) span.setAttribute('font-weight', style.fontWeight);
                     if (style?.fontStyle) span.setAttribute('font-style', style.fontStyle);
+                    if (style?.baselineShift !== undefined) span.setAttribute('baseline-shift', style.baselineShift);
                     span.textContent = segmentText || '\u00a0';
                     textEl.appendChild(span);
                 };
@@ -16730,6 +16806,7 @@ function renderRPanelUI(instance, container) {
         }
 
         function startInlineTextEdit(svgPt, existingTextEl) {
+            if (existingTextEl && isElementLocked(existingTextEl)) return;
             overlay.querySelectorAll('.r-ve-inline-editor').forEach(e => {
                 if (typeof e._commit === 'function') e._commit();
                 else e.remove();
@@ -17040,12 +17117,17 @@ function renderRPanelUI(instance, container) {
                 svgSourceText = new XMLSerializer().serializeToString(rasterSvg);
                 saveState();
             };
-            img.src = imgUrl;
+            img.onerror=()=>{if(!editorEvents.signal.aborted)editorTools?.notify(currentLang==='zh'?'原图加载失败，请检查文件后重新打开。':'The original image could not be loaded. Check the file and reopen it.');};
+            // Keep original bytes in the SVG: external images are blocked when
+            // an SVG blob is used as an Image source or printed in the PDF sandbox.
+            require('./vector-export').imageDataUrl(imgUrl,editorEvents.signal).then(data=>{
+                if(!editorEvents.signal.aborted)img.src=data;
+            }).catch(error=>{if(!editorEvents.signal.aborted)editorTools?.notify((currentLang==='zh'?'原图加载失败：':'Image loading failed: ')+error.message);});
         }
 
         function renderSvgFromText(text, restoring = false) {
             const parser = new DOMParser();
-            const clean = require('./preview-sanitize').default.sanitize(text,{USE_PROFILES:{svg:true,svgFilters:true}});
+            const clean = require('./preview-sanitize').default.sanitizeSvg(text);
             const doc = parser.parseFromString(clean, 'image/svg+xml');
             const srcSvg = doc.querySelector('svg');
             if (!srcSvg) return;
@@ -17064,21 +17146,27 @@ function renderRPanelUI(instance, container) {
                 if (String(hAttr).includes('pt')) imgH *= 1.333;
             }
 
+            const viewValues = vb ? vb.trim().split(/[\s,]+/).map(Number) : [0,0,imgW,imgH];
+            canvasOriginX = Number.isFinite(viewValues[0]) ? viewValues[0] : 0;
+            canvasOriginY = Number.isFinite(viewValues[1]) ? viewValues[1] : 0;
+            const physicalWidth = (srcSvg.getAttribute('width') || '').match(/^\s*([\d.e+-]+)\s*(in|mm|cm|pt|pc|px)?\s*$/i);
+            const inches = physicalWidth ? Number(physicalWidth[1]) / ({in:1,mm:25.4,cm:2.54,pt:72,pc:6,px:96}[(physicalWidth[2]||'px').toLowerCase()]) : imgW/96;
+            documentUnitsPerInch = Number(srcSvg.getAttribute('data-ve-units-per-inch')) || (inches>0 ? imgW/inches : 96);
+            if (!Number.isFinite(documentUnitsPerInch) || documentUnitsPerInch<=0) documentUnitsPerInch=96;
             // Import the SVG into the live document
             const imported = document.importNode(srcSvg, true);
+            imported.setAttribute('data-ve-units-per-inch',documentUnitsPerInch);
             imported.style.cssText = `width:${imgW}px;height:${imgH}px;display:block;overflow:visible;position:relative;`;
             imported.setAttribute('width', imgW);
             imported.setAttribute('height', imgH);
             imported.setAttribute('overflow', 'visible');
             if (!imported.getAttribute('viewBox')) {
-                imported.setAttribute('viewBox', `0 0 ${imgW} ${imgH}`);
+                imported.setAttribute('viewBox', `${canvasOriginX} ${canvasOriginY} ${imgW} ${imgH}`);
             }
 
             if (!restoring) {
-            // Remove all clip-path attributes from SVG elements so content is not clipped
-            // (svglite / ggplot2 add clipPath defs that restrict content to the plot area)
-            imported.querySelectorAll('[clip-path]').forEach(el => el.removeAttribute('clip-path'));
-            imported.querySelectorAll('clipPath').forEach(el => el.remove());
+            // Preserve the plotting program's clipping. Users can explicitly release
+            // clipping from the object panel without changing the imported figure.
 
             // Geometry is resized with SVG transforms. Keep every drawable
             // element's stroke in screen-independent SVG units so changing width
@@ -17126,7 +17214,7 @@ function renderRPanelUI(instance, container) {
             bgRect = liveSvg.querySelector('rect[data-role="background"]');
             if (!bgRect) {
             bgRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-            bgRect.setAttribute('x', '0'); bgRect.setAttribute('y', '0');
+            bgRect.setAttribute('x', canvasOriginX); bgRect.setAttribute('y', canvasOriginY);
             bgRect.setAttribute('width', canvasW); bgRect.setAttribute('height', canvasH);
             bgRect.setAttribute('fill', '#ffffff');
             bgRect.setAttribute('data-role', 'background');
@@ -17134,8 +17222,33 @@ function renderRPanelUI(instance, container) {
             }
             viewport.appendChild(liveSvg);
 
+            // R and other exporters can clip the whole document to its page.
+            // Keep that clip in the saved SVG, but allow editing on the pasteboard.
+            // Smaller plot/object clips (and transformed clips) remain intact.
+            const pageClips = new Set();
+            const near = (a,b) => Math.abs(a-b) <= Math.max(1,canvasW,canvasH)*1e-7;
+            liveSvg.querySelectorAll('clipPath[id]').forEach(clip => {
+                if ((clip.getAttribute('clipPathUnits') || 'userSpaceOnUse') !== 'userSpaceOnUse' || clip.hasAttribute('transform')) return;
+                const shapes = [...clip.children].filter(el => !el.matches('title,desc'));
+                const rect = shapes[0];
+                if (shapes.length !== 1 || rect.tagName.toLowerCase() !== 'rect' || rect.hasAttribute('transform') || rect.rx.baseVal.value || rect.ry.baseVal.value) return;
+                if (near(rect.x.baseVal.value,canvasOriginX) && near(rect.y.baseVal.value,canvasOriginY) &&
+                    near(rect.width.baseVal.value,canvasW) && near(rect.height.baseVal.value,canvasH)) pageClips.add(clip.id);
+            });
+            if (pageClips.size) {
+                for (const el of [liveSvg,...liveSvg.querySelectorAll('[clip-path],[style*="clip-path"],[class]')]) {
+                    if (el.closest('defs,clipPath,mask') || el.hasAttribute('data-ve-artboard-clip')) continue;
+                    const reference = getComputedStyle(el).clipPath.match(/#([^"')]+)["']?\s*\)/);
+                    if (!reference || !pageClips.has(reference[1])) continue;
+                    const m = getMatrixInLiveSvg(el);
+                    if (m && near(m.a,1) && near(m.b,0) && near(m.c,0) && near(m.d,1) && near(m.e,0) && near(m.f,0)) {
+                        el.setAttribute('data-ve-artboard-clip','true');
+                    }
+                }
+            }
+
             // Setup draw overlay
-            drawSvg.setAttribute('viewBox', `0 0 ${imgW} ${imgH}`);
+            drawSvg.setAttribute('viewBox', `${canvasOriginX} ${canvasOriginY} ${imgW} ${imgH}`);
             drawSvg.setAttribute('width', imgW); drawSvg.setAttribute('height', imgH);
             drawSvg.setAttribute('overflow', 'visible');
             viewport.appendChild(drawSvg);
@@ -17147,29 +17260,46 @@ function renderRPanelUI(instance, container) {
         }
 
         // ===== UNDO / REDO (one SVG document plus lossless text deltas) =====
-        function saveState() {
+        function documentSnapshot() {
+            editorTools?.flushCorners();
+            gradientEditor?.flush();
+            return liveSvg ? new XMLSerializer().serializeToString(liveSvg).replace(/\sdata-ve-selected="[^"]*"/g, '') : '';
+        }
+        function saveState(label) {
             if (!liveSvg) return;
             // drawSvg contains transient selection/hover UI, never document shapes.
-            history.commit(new XMLSerializer().serializeToString(liveSvg));
+            const snapshot = documentSnapshot();
+            lastDocumentSnapshot = snapshot;
+            history.commit(snapshot);
+            if (!documentReady) {
+                documentReady = true;
+                editorTools?.replaced(snapshot,0,true);
+            } else editorTools?.committed(snapshot, label);
         }
 
         function undo() {
+            gradientEditor?.close();
             const state = history.undo();
-            if (state !== null) restoreState(state);
+            if (state !== null) restoreState(state, -1);
         }
 
         function redo() {
+            gradientEditor?.close();
             const state = history.redo();
-            if (state !== null) restoreState(state);
+            if (state !== null) restoreState(state, 1);
         }
 
-        function restoreState(state) {
+        function restoreState(state, direction = 0) {
             deselectAll();
             renderSvgFromText(state, true);
+            lastDocumentSnapshot = documentSnapshot();
+            editorTools?.replaced(lastDocumentSnapshot, direction);
         }
 
         // ===== SELECTION =====
+        function isElementLocked(el) { return !!el?.closest('[data-locked="true"]'); }
         function deselectAll() {
+            gradientEditor?.close();
             selectedEls.forEach(el => {
                 el.style.outline = '';
                 el.removeAttribute('data-ve-selected');
@@ -17186,6 +17316,8 @@ function renderRPanelUI(instance, container) {
             // Remove extra selbox rects
             drawSvg.querySelectorAll('.ve-multi-selbox').forEach(r => r.remove());
             hideContextMenu();
+            editorTools?.changedSelection();
+            paintSwatches?.sync();
         }
 
         function getMatrixInLiveSvg(el) {
@@ -17202,6 +17334,7 @@ function renderRPanelUI(instance, container) {
             const nodes = [root, ...root.querySelectorAll('*')];
             nodes.forEach(node => {
                 const tag = (node.tagName || '').toLowerCase();
+                node.style.setProperty('pointer-events','none','important');
                 node.removeAttribute('id');
                 node.removeAttribute('filter');
                 node.removeAttribute('mask');
@@ -17366,16 +17499,21 @@ function renderRPanelUI(instance, container) {
 
         function refreshSelectionHighlights() {
             if (!selectionHighlightLayer) return;
+            editorTools?.refreshCorners();
             selectedScreenGeometryCache = null;
             selectionHighlightLayer.replaceChildren();
-            getTopLevelEls(selectedEls).forEach(el => {
+            const roots = getTopLevelEls(selectedEls);
+            // The shared frame suffices for large selections; cloning every cell
+            // of a heatmap on every pointer frame wastes DOM nodes and memory.
+            if (roots.length <= 64) roots.forEach(el => {
                 const tag = (el.tagName || '').toLowerCase();
-                if (tag === 'text' || tag === 'tspan') {
-                    appendTextBoxHighlight(el, selectionHighlightLayer, '#42a5f5', 2);
-                } else {
-                    appendGeometryHighlight(el, selectionHighlightLayer, '#42a5f5', 2);
+                if (tag !== 'text' && tag !== 'tspan' && (tag !== 'g' || el.childElementCount < 100)) {
+                    appendGeometryHighlight(el, selectionHighlightLayer, '#527dff', 1);
                 }
             });
+            if (!appendSelectionFrame()) {
+                getTopLevelEls(selectedEls).forEach(el => appendTextBoxHighlight(el, selectionHighlightLayer, '#527dff', 1));
+            }
             if (activeTextRangeSelection?.textEl && liveSvg.contains(activeTextRangeSelection.textEl)) {
                 const { textEl, start, end } = activeTextRangeSelection;
                 renderCanvasTextRangeSelection(textEl, start, end);
@@ -17383,7 +17521,51 @@ function renderRPanelUI(instance, container) {
             refreshHoverHighlight();
         }
 
+        function appendSelectionFrame() {
+            const geometry = selectedScreenGeometry();
+            const matrix = drawSvg?.getScreenCTM();
+            if (!geometry || !matrix) return false;
+            let inverse;
+            try { inverse = matrix.inverse(); } catch (_) { return false; }
+            const ns = 'http://www.w3.org/2000/svg';
+            const frame = document.createElementNS(ns, 'g');
+            frame.setAttribute('class', 've-selection-frame');
+            frame.setAttribute('pointer-events', 'none');
+            // Cancel SVG/CSS zoom so outlines and handles retain their pixel size.
+            frame.setAttribute('transform', 'matrix('+[inverse.a,inverse.b,inverse.c,inverse.d,inverse.e,inverse.f].join(',')+')');
+            const add = (tag, attrs) => {
+                const node = document.createElementNS(ns, tag);
+                Object.entries(attrs).forEach(([key,value]) => {
+                    node.setAttribute(key,String(value));
+                    if(['fill','stroke','stroke-width'].includes(key))node.style.setProperty(key,String(value),'important');
+                });
+                frame.appendChild(node);
+                return node;
+            };
+            const color = '#527dff';
+            add('polygon', {class:'ve-selection-bounds',points:geometry.corners.map(p=>p.x+','+p.y).join(' '),
+                fill:'none',stroke:color,'stroke-width':1});
+            const rightHandle=geometry.handles.find(h=>h.edge==='e');
+            add('line', {x1:rightHandle.x,y1:rightHandle.y,x2:geometry.rotation.x,y2:geometry.rotation.y,
+                stroke:color,'stroke-width':1});
+            geometry.handles.forEach(handle => add('rect', {
+                'data-ve-handle':handle.edge,x:handle.x-4,y:handle.y-4,width:8,height:8,
+                fill:'#ffffff',stroke:color,'stroke-width':1
+            }));
+            add('circle', {class:'ve-selection-rotate',cx:geometry.rotation.x,cy:geometry.rotation.y,
+                r:5,fill:'#ffffff',stroke:color,'stroke-width':1});
+            add('circle', {cx:geometry.rotation.x,cy:geometry.rotation.y,r:2.5,fill:color});
+            add('circle', {class:'ve-selection-center',cx:geometry.center.x,cy:geometry.center.y,r:2.5,fill:color});
+            selectionHighlightLayer.appendChild(frame);
+            return true;
+        }
+
         function getElBoundsInSvg(el) {
+            if (!marqueeBoundsCache) return computeElBoundsInSvg(el);
+            if (!marqueeBoundsCache.has(el)) marqueeBoundsCache.set(el,computeElBoundsInSvg(el));
+            return marqueeBoundsCache.get(el);
+        }
+        function computeElBoundsInSvg(el) {
             try {
                 const bbox = el.getBBox();
                 const elCTM = el.getScreenCTM();
@@ -17462,6 +17644,7 @@ function renderRPanelUI(instance, container) {
             el.setAttribute('data-ve-selected', 'true');
             showSelBoxForElement(el, 2);
             syncPropsFromElement(el);
+            editorTools?.changedSelection();
         }
 
         function multiSelect(els) {
@@ -17469,8 +17652,7 @@ function renderRPanelUI(instance, container) {
             if (!els || els.length === 0) return;
             selectedEls = els;
             selectedEl = els[0];
-            // Compute the shared interaction bounds. Visible feedback is drawn on
-            // each object's actual geometry, not as per-element rectangles.
+            // A multi-selection shares one transform frame.
             let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
             els.forEach(el => {
                 el.setAttribute('data-ve-selected', 'true');
@@ -17483,13 +17665,15 @@ function renderRPanelUI(instance, container) {
             if (minX < Infinity) showSelBoxForBounds({ x: minX, y: minY, w: maxX - minX, h: maxY - minY }, 3);
             refreshSelectionHighlights();
             if (els.length === 1) syncPropsFromElement(els[0]);
+            else paintSwatches?.sync();
+            editorTools?.changedSelection();
         }
 
         function syncPropsFromElement(el) {
             const cs = getComputedStyle(el);
             // Fill
             try {
-                const fill = el.getAttribute('fill') || el.style.fill || cs.fill;
+                const fill = cs.fill || el.style.fill || el.getAttribute('fill');
                 if (fill === 'none' || fill === 'transparent') {
                     fillIsNone = true; fillNoneBtn.classList.add('active'); fillInput.style.opacity = '0.3';
                 } else {
@@ -17499,7 +17683,7 @@ function renderRPanelUI(instance, container) {
             } catch(e) {}
             // Stroke
             try {
-                const stroke = el.getAttribute('stroke') || el.style.stroke || cs.stroke;
+                const stroke = cs.stroke || el.style.stroke || el.getAttribute('stroke');
                 if (stroke === 'none' || stroke === 'transparent') {
                     strokeIsNone = true; strokeNoneBtn.classList.add('active'); strokeInput.style.opacity = '0.3';
                 } else {
@@ -17528,6 +17712,7 @@ function renderRPanelUI(instance, container) {
                 const fst = el.getAttribute('font-style') || el.style.fontStyle || cs.fontStyle;
                 italicBtn.classList.toggle('active', fst === 'italic');
             }
+            paintSwatches?.sync();
         }
 
         function rgbToHex(c) {
@@ -17545,6 +17730,8 @@ function renderRPanelUI(instance, container) {
             const editable = ['rect','circle','ellipse','line','text','path','polyline','polygon','image','g'];
             let el = target.closest(editable.join(','));
             if (!el || el === liveSvg) return null;
+            const isolated = editorTools?.isolation();
+            if (isolated) return isolated !== el && isolated.contains(el) ? el : null;
             // If the element is inside a user-created group, select the group instead
             const userGroup = el.closest('g[data-user-group="true"]');
             if (userGroup && userGroup !== liveSvg && liveSvg.contains(userGroup)) {
@@ -17642,6 +17829,7 @@ function renderRPanelUI(instance, container) {
         }
 
         function showTextEditPanel(textEl = selectedTextElement()) {
+            if (textEl && isElementLocked(textEl)) {editorTools?.notify(currentLang==='zh'?'请先解锁文字对象':'Unlock the text object first');return;}
             const isZh = currentLang === 'zh';
             overlay.querySelectorAll('.r-ve-text-panel').forEach(panel => {
                 panel._flushLiveChanges?.();
@@ -17669,10 +17857,14 @@ function renderRPanelUI(instance, container) {
             let currentColor = textEl?.getAttribute('fill') || style?.fill || fillInput.value || '#000000';
             try { currentColor = rgbToHex(currentColor); } catch (_) { currentColor = '#000000'; }
             if (!/^#[0-9a-f]{6}$/i.test(currentColor)) currentColor = '#000000';
-            const fontOptions = Array.from(fontFamilySelect.options).map(option => {
-                const selected = currentFont === option.value || currentFont.replace(/["']/g, '').includes(option.textContent.trim());
+            const normalizedFamily = value=>value.split(',')[0].trim().replace(/["']/g,'').toLowerCase();
+            let fontMatched = false;
+            let fontOptions = Array.from(fontFamilySelect.options).map(option => {
+                const selected = normalizedFamily(currentFont) === normalizedFamily(option.value);
+                fontMatched ||= selected;
                 return `<option value="${escapeHtml(option.value)}"${selected ? ' selected' : ''}>${escapeHtml(option.textContent)}</option>`;
             }).join('');
+            if (!fontMatched) fontOptions += `<option value="${escapeHtml(currentFont)}" selected>${escapeHtml(currentFont)}</option>`;
 
             panel.innerHTML = `
                 <div class="r-ve-text-panel-head">
@@ -17697,6 +17889,9 @@ function renderRPanelUI(instance, container) {
                 <div class="r-ve-text-panel-actions-row">
                     <button type="button" class="r-ve-text-format${currentWeight === 'bold' || parseInt(currentWeight) >= 700 ? ' active' : ''}" data-format="bold" ${textEl ? '' : 'disabled'}><b>B</b></button>
                     <button type="button" class="r-ve-text-format${currentStyle === 'italic' ? ' active' : ''}" data-format="italic" ${textEl ? '' : 'disabled'}><i>I</i></button>
+                    <button type="button" class="r-ve-text-script" data-script="super" ${textEl ? '' : 'disabled'}>x²</button>
+                    <button type="button" class="r-ve-text-script" data-script="sub" ${textEl ? '' : 'disabled'}>x₂</button>
+                    <button type="button" class="r-ve-text-script" data-script="0" ${textEl ? '' : 'disabled'}>${isZh?'正常':'Normal'}</button>
                     <span class="r-ve-text-panel-divider"></span>
                     <button type="button" class="r-ve-text-align${currentAnchor === 'start' ? ' active' : ''}" data-anchor="start" title="${isZh ? '左对齐' : 'Align left'}" ${textEl ? '' : 'disabled'}><i class="fas fa-align-left"></i></button>
                     <button type="button" class="r-ve-text-align${currentAnchor === 'middle' ? ' active' : ''}" data-anchor="middle" title="${isZh ? '居中对齐' : 'Align center'}" ${textEl ? '' : 'disabled'}><i class="fas fa-align-center"></i></button>
@@ -17870,6 +18065,24 @@ function renderRPanelUI(instance, container) {
                     applyLiveTextChanges(horizontalBox);
                 };
             });
+            panel.querySelectorAll('.r-ve-text-script').forEach(button => {
+                button.onclick = () => applySelectionStyle({baselineShift:button.dataset.script,
+                    fontSize:button.dataset.script==='0'?currentSize:currentSize*.7},true);
+            });
+            const baselineLabel = document.createElement('label');
+            baselineLabel.textContent = isZh?'基线偏移（pt）':'Baseline shift (pt)';
+            const baselineInput = document.createElement('input');
+            baselineInput.type='number';baselineInput.step='.1';baselineInput.value='0';
+            baselineInput.onchange=()=>{const value=parseFloat(baselineInput.value);if(Number.isFinite(value))applySelectionStyle({baselineShift:String(value*96/72)},true);};
+            baselineLabel.appendChild(baselineInput);panel.querySelector('.r-ve-text-panel-grid').appendChild(baselineLabel);
+            const fontWarning = document.createElement('p');fontWarning.className='ve-font-warning';panel.appendChild(fontWarning);
+            const warnFont = () => {
+                const family=panel.querySelector('.r-ve-text-panel-font').value.split(',')[0].trim().replace(/["']/g,'');
+                const available=require('./vector-fonts').available(family);
+                fontWarning.textContent=available?'':(isZh?'此字体可能不可用，显示和导出可能使用替代字体：':'This font may be unavailable; display and export may substitute it: ')+family;
+            };
+            panel.querySelector('.r-ve-text-panel-font').addEventListener('change',warnFont);
+            warnFont();
             requestAnimationFrame(() => contentInput.focus());
         }
 
@@ -17883,10 +18096,10 @@ function renderRPanelUI(instance, container) {
             const isGroup = selectedEl && selectedEl.tagName.toLowerCase() === 'g' && selectedEl.getAttribute('data-role') !== 'background';
             const contextText = !hasMulti ? selectedTextElement() : null;
             const items = [
-                { icon: 'fa-arrow-up',      label: isZh ? '上移一层' : 'Bring Forward',      action: 'up',       disabled: !selectedEl || isBg || hasMulti },
-                { icon: 'fa-arrow-down',    label: isZh ? '下移一层' : 'Send Backward',       action: 'down',     disabled: !selectedEl || isBg || hasMulti },
-                { icon: 'fa-angle-double-up', label: isZh ? '移到最顶层' : 'Bring to Front',  action: 'top',      disabled: !selectedEl || isBg || hasMulti },
-                { icon: 'fa-angle-double-down', label: isZh ? '移到最底层' : 'Send to Back',  action: 'bottom',   disabled: !selectedEl || isBg || hasMulti },
+                { icon: 'fa-arrow-up',      label: isZh ? '上移一层' : 'Bring Forward',      action: 'up',       disabled: !selectedEl || isBg },
+                { icon: 'fa-arrow-down',    label: isZh ? '下移一层' : 'Send Backward',       action: 'down',     disabled: !selectedEl || isBg },
+                { icon: 'fa-angle-double-up', label: isZh ? '移到最顶层' : 'Bring to Front',  action: 'top',      disabled: !selectedEl || isBg },
+                { icon: 'fa-angle-double-down', label: isZh ? '移到最底层' : 'Send to Back',  action: 'bottom',   disabled: !selectedEl || isBg },
                 { sep: true },
                 { icon: 'fa-clone',         label: isZh ? '复制元素' : 'Duplicate',            action: 'dup',      disabled: !selectedEl || isBg },
                 { icon: 'fa-copy',          label: isZh ? '复制' : 'Copy (Ctrl+C)',            action: 'copy',     disabled: !selectedEl },
@@ -17894,6 +18107,7 @@ function renderRPanelUI(instance, container) {
                 { sep: true },
                 { icon: 'fa-object-group',  label: isZh ? '组合 (Ctrl+G)' : 'Group (Ctrl+G)',  action: 'group',    disabled: !hasMulti },
                 { icon: 'fa-object-ungroup', label: isZh ? '解组合 (Ctrl+Shift+G)' : 'Ungroup (Ctrl+Shift+G)', action: 'ungroup', disabled: !isGroup },
+                ...(editorTools?.contextItems() || []),
                 { sep: true },
                 { icon: 'fa-crosshairs',    label: isZh ? '多选同类型' : 'Select Same Type',   action: 'sel-type', disabled: !selectedEl || isBg },
                 { icon: 'fa-fill-drip',     label: isZh ? '多选同填充' : 'Select Same Fill',   action: 'sel-fill', disabled: !selectedEl || isBg },
@@ -17921,8 +18135,9 @@ function renderRPanelUI(instance, container) {
                 }
                 const row = document.createElement('div');
                 row.className = 'r-ve-ctx-item' + (it.disabled ? ' disabled' : '');
+                row.dataset.action = it.action;
                 row.innerHTML = `<i class="fas ${it.icon}"></i> ${it.label}`;
-                if (!it.disabled) row.onclick = () => { execCtxAction(it.action); hideContextMenu(); };
+                if (!it.disabled) row.onclick = () => { if(it.run)it.run();else execCtxAction(it.action);hideContextMenu(); };
                 ctxMenu.appendChild(row);
             });
 
@@ -17931,8 +18146,8 @@ function renderRPanelUI(instance, container) {
             requestAnimationFrame(() => {
                 if (!ctxMenu) return;
                 const r = ctxMenu.getBoundingClientRect();
-                if (r.right > window.innerWidth) ctxMenu.style.left = (window.innerWidth - r.width - 4) + 'px';
-                if (r.bottom > window.innerHeight) ctxMenu.style.top = (window.innerHeight - r.height - 4) + 'px';
+                if (r.right > window.innerWidth) ctxMenu.style.left = Math.max(4,window.innerWidth - r.width - 4) + 'px';
+                if (r.bottom > window.innerHeight) ctxMenu.style.top = Math.max(4,window.innerHeight - r.height - 4) + 'px';
             });
         }
 
@@ -17943,34 +18158,40 @@ function renderRPanelUI(instance, container) {
         let clipboardEl = null;
         let clipboardEls = null;
 
+        function reorderSelected(action) {
+            const roots = getTopLevelEls(selectedEls).filter(el => !isElementLocked(el) && el.getAttribute('data-role') !== 'background');
+            const chosen = new Set(roots);
+            for (const parent of new Set(roots.map(el => el.parentNode))) {
+                const siblings = [...parent.children].filter(el => el.matches('g,rect,circle,ellipse,line,path,polygon,polyline,text,image,use') && el.getAttribute('data-role') !== 'background');
+                const selected = siblings.filter(el => chosen.has(el));
+                if (action === 'top') selected.forEach(el => parent.appendChild(el));
+                else if (action === 'bottom') {
+                    const first = siblings.find(el => !chosen.has(el));
+                    if (first) selected.forEach(el => first.before(el));
+                } else {
+                    const up = action === 'up',step = up ? -1 : 1;
+                    for (let i=up?siblings.length-2:1;up?i>=0:i<siblings.length;i+=step) {
+                        const j=i-step,el=siblings[i],neighbor=siblings[j];
+                        if (!chosen.has(el) || chosen.has(neighbor)) continue;
+                        up ? neighbor.after(el) : neighbor.before(el);
+                        [siblings[i],siblings[j]]=[neighbor,el];
+                    }
+                }
+            }
+            refreshSelectionHighlights();
+            saveState(currentLang === 'zh' ? '调整叠放顺序' : 'Reorder');
+        }
+
         function execCtxAction(action) {
             if (!liveSvg) return;
             const el = selectedEl;
             switch (action) {
                 case 'up':
-                    if (el && el.nextElementSibling) {
-                        el.parentNode.insertBefore(el.nextElementSibling, el);
-                        saveState();
-                    }
-                    break;
                 case 'down':
-                    if (el && el.previousElementSibling) {
-                        el.parentNode.insertBefore(el, el.previousElementSibling);
-                        saveState();
-                    }
-                    break;
                 case 'top':
-                    if (el) { el.parentNode.appendChild(el); saveState(); }
+                case 'bottom':
+                    reorderSelected(action);
                     break;
-                case 'bottom': {
-                    if (el) {
-                        const after = liveSvg.querySelector('[data-role="background"]');
-                        if (after && after !== el) { after.after(el); }
-                        else { el.parentNode.insertBefore(el, el.parentNode.firstChild); }
-                        saveState();
-                    }
-                    break;
-                }
                 case 'dup':
                     if (selectedEls.length > 1) {
                         const duped = [];
@@ -18016,16 +18237,16 @@ function renderRPanelUI(instance, container) {
                     }
                     break;
                 case 'lock':
-                    if (el) {
-                        const locked = el.getAttribute('data-locked') === 'true';
-                        el.setAttribute('data-locked', locked ? 'false' : 'true');
-                        el.style.opacity = locked ? '' : '0.6';
+                    if (selectedEls.length) {
+                        const targets=getTopLevelEls(selectedEls),locked=targets.every(target=>target.getAttribute('data-locked')==='true');
+                        targets.forEach(target=>target.setAttribute('data-locked',locked?'false':'true'));
+                        refreshSelectionHighlights();saveState();
                         rlog(locked ? (currentLang==='zh'?'已解锁':'Unlocked') : (currentLang==='zh'?'已锁定，不可拖动':'Locked'));
                     }
                     break;
                 case 'hide':
-                    if (el) {
-                        el.setAttribute('visibility', 'hidden');
+                    if (selectedEls.length) {
+                        getTopLevelEls(selectedEls).filter(target=>!isElementLocked(target)&&target.getAttribute('data-role')!=='background').forEach(target=>target.setAttribute('visibility','hidden'));
                         deselectAll();
                         saveState();
                     }
@@ -18061,8 +18282,8 @@ function renderRPanelUI(instance, container) {
                     const isZh = currentLang === 'zh';
                     const rotDialog = document.createElement('div');
                     rotDialog.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);' +
-                        'background:#2d2d30;border:1px solid #555;border-radius:8px;padding:18px 24px;z-index:90000;' +
-                        'color:#fff;font-size:14px;min-width:220px;box-shadow:0 6px 24px rgba(0,0,0,0.5);';
+                        'background:var(--ve-surface);border:1px solid var(--ve-border);border-radius:8px;padding:18px 24px;z-index:90000;' +
+                        'color:var(--ve-text);font-size:14px;min-width:220px;box-shadow:0 6px 24px rgba(38,56,75,.16);';
                     rotDialog.innerHTML = `
                         <div style="font-weight:bold;margin-bottom:12px;">${isZh ? '旋转元素' : 'Rotate Element'}</div>
                         <div style="margin-bottom:10px;">
@@ -18072,10 +18293,10 @@ function renderRPanelUI(instance, container) {
                         <div style="margin-bottom:14px;">
                             <label>${isZh ? '角度' : 'Angle'}:
                             <input type="number" id="rot-angle-input" value="90" min="0" max="360" step="1"
-                                style="width:70px;padding:3px 6px;background:#3c3c3c;color:#fff;border:1px solid #666;border-radius:4px;margin-left:6px;">°</label>
+                                style="width:70px;padding:3px 6px;background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:4px;margin-left:6px;">°</label>
                         </div>
                         <div style="display:flex;gap:8px;justify-content:flex-end;">
-                            <button id="rot-cancel-btn" style="padding:5px 14px;background:#555;border:none;color:#fff;border-radius:4px;cursor:pointer;">${isZh ? '取消' : 'Cancel'}</button>
+                            <button id="rot-cancel-btn" style="padding:5px 14px;background:var(--ve-control);border:1px solid var(--ve-border);color:var(--ve-text);border-radius:4px;cursor:pointer;">${isZh ? '取消' : 'Cancel'}</button>
                             <button id="rot-ok-btn" style="padding:5px 14px;background:#0078d4;border:none;color:#fff;border-radius:4px;cursor:pointer;">${isZh ? '确定' : 'OK'}</button>
                         </div>`;
                     (overlay.querySelector('.r-ve-window') || overlay).appendChild(rotDialog);
@@ -18124,6 +18345,7 @@ function renderRPanelUI(instance, container) {
 
         function groupSelected() {
             if (selectedEls.length < 2 || !liveSvg) return;
+            if (selectedEls.some(isElementLocked)) return;
             const ns = 'http://www.w3.org/2000/svg';
             const g = document.createElementNS(ns, 'g');
             g.setAttribute('data-user-group', 'true');
@@ -18141,6 +18363,7 @@ function renderRPanelUI(instance, container) {
         function ungroupSelected() {
             const el = selectedEl;
             if (!el || el.tagName.toLowerCase() !== 'g' || !liveSvg) return;
+            if (isElementLocked(el)) return;
             const parent = el.parentNode;
             const nextSib = el.nextSibling;
             const children = Array.from(el.childNodes);
@@ -18200,6 +18423,8 @@ function renderRPanelUI(instance, container) {
         }
 
         canvasWrap.addEventListener('contextmenu', (e) => {
+            if (e.target.closest('.ve-workbench-panel,.ve-confirm')) return;
+            editorTools?.finishPath();
             e.preventDefault();
             e.stopPropagation();
             // If right-clicking on an element, select it first
@@ -18211,13 +18436,42 @@ function renderRPanelUI(instance, container) {
             showContextMenu(e);
         });
 
-        // Hide context menu on any left-click
-        canvasWrap.addEventListener('mousedown', (e) => {
-            if (e.button === 0) hideContextMenu();
-        }, true);
+        // Menus close when interacting elsewhere, including the top toolbar.
+        document.addEventListener('mousedown', (e) => {
+            if (ctxMenu && !ctxMenu.contains(e.target)) hideContextMenu();
+        }, {capture:true,signal:editorEvents.signal});
 
         // ===== TOOL SWITCHING =====
         let polygonSides = 6; // default polygon sides
+        const shapeButton=overlay.querySelector('.ve-shape-tool'),shapeMenu=overlay.querySelector('.ve-shape-menu');
+        const shapeTools=[
+            ['rectangle','矩形','Rectangle','<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6.5" width="18" height="11" rx="1" /></svg>'],
+            ['square','正方形','Square','<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="1" /></svg>'],
+            ['circle','椭圆','Ellipse','<svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="12" rx="9" ry="6" /></svg>'],
+            ['polygon','多边形','Polygon','<i class="fas fa-draw-polygon" aria-hidden="true"></i>']
+        ];
+        const shapeLabel=item=>item[currentLang==='zh'?1:2];
+        shapeMenu.innerHTML=shapeTools.map(item=>`<button type="button" role="menuitem" data-shape-tool="${item[0]}">${item[3]}${shapeLabel(item)}</button>`).join('');
+        function closeShapeMenu(){shapeMenu.hidden=true;shapeButton.setAttribute('aria-expanded','false');}
+        listen(shapeButton,'contextmenu',event=>{
+            event.preventDefault();event.stopPropagation();shapeMenu.hidden=!shapeMenu.hidden;
+            shapeButton.setAttribute('aria-expanded',String(!shapeMenu.hidden));
+            if(!shapeMenu.hidden)shapeMenu.querySelector(`[data-shape-tool="${shapeButton.dataset.tool}"]`).focus();
+        });
+        listen(document,'mousedown',event=>{if(!event.target.closest('.ve-shape-group'))closeShapeMenu();},{capture:true});
+        listen(shapeMenu,'keydown',event=>{
+            const items=[...shapeMenu.querySelectorAll('button')],at=items.indexOf(document.activeElement);
+            if(['ArrowUp','ArrowDown'].includes(event.key)){event.preventDefault();event.stopPropagation();items[(at+(event.key==='ArrowUp'?items.length-1:1))%items.length].focus();}
+            if(event.key==='Escape'){event.preventDefault();event.stopPropagation();closeShapeMenu();shapeButton.focus();}
+        });
+        shapeMenu.querySelectorAll('button').forEach(button=>{button.onclick=async()=>{
+            closeShapeMenu();
+            const item=shapeTools.find(item=>item[0]===button.dataset.shapeTool);
+            if(!await chooseCanvasTool(item[0],shapeButton))return;
+            shapeButton.dataset.tool=item[0];shapeButton.innerHTML=item[3];
+            shapeButton.title=shapeLabel(item)+(currentLang==='zh'?'；右键展开工具集':'; right-click for tools');
+            shapeButton.setAttribute('aria-label',shapeButton.title);shapeButton.blur();
+        };});
 
         // Custom polygon sides dialog (replaces prompt() which doesn't work in Electron)
         function showPolygonSidesDialog(defaultSides) {
@@ -18225,7 +18479,7 @@ function renderRPanelUI(instance, container) {
                 const isZh = currentLang === 'zh';
                 const dlg = document.createElement('dialog');
                 dlg.className = 'native-category-dialog';
-                dlg.style.cssText = 'border:none; border-radius:10px; padding:0; background:#fff; box-shadow:0 6px 24px rgba(0,0,0,0.25); z-index:200000; min-width:280px;';
+                dlg.style.cssText = 'border:none; border-radius:10px; padding:0; background:#fff; box-shadow:0 6px 24px rgba(38,56,75,.16); z-index:200000; min-width:280px;';
                 dlg.innerHTML = `
                     <div style="padding:14px 18px 8px; font-size:15px; font-weight:600; color:#333; border-bottom:1px solid #eee;">
                         ${isZh ? '多边形边数' : 'Polygon Sides'}
@@ -18257,6 +18511,23 @@ function renderRPanelUI(instance, container) {
             });
         }
 
+        function activateCanvasTool(tool,btn=overlay.querySelector(`.r-ve-tool[data-tool="${tool}"]`)) {
+                closeShapeMenu();
+                currentTool = tool;
+                overlay.querySelectorAll('.r-ve-tool').forEach(b => b.classList.remove('active'));
+                btn?.classList.add('active');
+                canvasWrap.classList.remove('ve-cursor-locked');canvasWrap.style.removeProperty('--ve-interaction-cursor');
+                canvasWrap.style.cursor = tool === 'select'||tool==='anchor' ? 'default' : tool === 'move' ? 'grab' : 'crosshair';
+                editorTools?.setTool(tool);
+        }
+        async function chooseCanvasTool(tool,btn){
+            if(tool==='polygon'){
+                const sides=await showPolygonSidesDialog(polygonSides);
+                if(sides===null)return false;
+                polygonSides=sides;
+            }
+            activateCanvasTool(tool,btn);return true;
+        }
         overlay.querySelectorAll('.r-ve-tool').forEach(btn => {
             btn.onclick = async () => {
                 const tool = btn.dataset.tool;
@@ -18264,20 +18535,7 @@ function renderRPanelUI(instance, container) {
                 if (tool === 'undo') { undo(); return; }
                 if (tool === 'redo') { redo(); return; }
                 if (tool === 'delete') { deleteSelected(); return; }
-                if (tool === 'zoomin') { scale *= 1.25; applyTransform(); return; }
-                if (tool === 'zoomout') { scale /= 1.25; applyTransform(); return; }
-                if (tool === 'polygon') {
-                    // Custom dialog for polygon sides (prompt() doesn't work in Electron)
-                    const sides = await showPolygonSidesDialog(polygonSides);
-                    if (sides === null) return; // cancelled
-                    polygonSides = sides;
-                }
-                currentTool = tool;
-                overlay.querySelectorAll('.r-ve-tool').forEach(b => b.classList.remove('active'));
-                btn.classList.add('active');
-                canvasWrap.classList.remove('ve-cursor-locked');
-                canvasWrap.style.removeProperty('--ve-interaction-cursor');
-                canvasWrap.style.cursor = tool === 'select' ? 'default' : tool === 'move' ? 'grab' : 'crosshair';
+                await chooseCanvasTool(tool,btn);
             };
         });
 
@@ -18295,15 +18553,16 @@ function renderRPanelUI(instance, container) {
         }
 
         function deleteSelected() {
+            if(editorTools?.deleteGuide())return;
             if (selectedEls.length > 0) {
                 selectedEls.forEach(el => {
-                    if (el.getAttribute('data-role') === 'background') return;
+                    if (el.getAttribute('data-role') === 'background' || isElementLocked(el)) return;
                     el.remove();
                 });
                 deselectAll();
                 saveState();
             } else if (selectedEl) {
-                if (selectedEl.getAttribute('data-role') === 'background') return;
+                if (selectedEl.getAttribute('data-role') === 'background' || isElementLocked(selectedEl)) return;
                 selectedEl.remove();
                 deselectAll();
                 saveState();
@@ -18369,184 +18628,84 @@ function renderRPanelUI(instance, container) {
             return '';
         }
 
-        function getTransformedPath(el) {
-            // Get path data with CTM applied
-            const d = elemToPath(el);
-            if (!d) return '';
-            // Apply element's CTM to transform the path
-            const ctm = el.getCTM();
-            if (!ctm || (ctm.a === 1 && ctm.b === 0 && ctm.c === 0 && ctm.d === 1 && ctm.e === 0 && ctm.f === 0)) return d;
-            return d; // Path will be drawn with transform applied via canvas
-        }
-
-        function performBooleanOp(op) {
+        let booleanBusy = false;
+        async function performBooleanOp(op) {
             const isZh = currentLang === 'zh';
-            if (selectedEls.length < 2) {
-                rlog(isZh ? '⚠️ 请先选择至少2个图形' : '⚠️ Select at least 2 shapes first');
-                return;
+            if (booleanBusy) return;
+            const elements = getTopLevelEls(selectedEls).slice();
+            if (elements.length < 2 || elements.length > 200) {
+                rlog(isZh ? '请选择 2–200 个基本图形' : 'Select 2–200 basic shapes'); return;
             }
-
-            // Check that all selected elements are basic shapes
-            const supportedTags = ['rect', 'circle', 'ellipse', 'path', 'polygon', 'polyline'];
-            const nonShape = selectedEls.find(el => !supportedTags.includes(el.tagName.toLowerCase()));
-            if (nonShape) {
-                rlog(isZh ? '⚠️ 布尔运算仅支持基本图形(矩形、圆形、椭圆、路径、多边形)' : '⚠️ Boolean operations only work with basic shapes');
-                return;
+            if (elements.some(el => !['rect','circle','ellipse','path','polygon','polyline'].includes(el.tagName.toLowerCase()) ||
+                el.closest('[data-locked="true"],[clip-path],[mask],[filter]'))) {
+                rlog(isZh ? '请使用未锁定的基本图形；带裁剪、蒙版或滤镜的对象需先解除对应效果。' : 'Use unlocked basic shapes; release clipping, masks or filters first.'); return;
             }
-
-            // Use canvas compositing to perform the boolean operation
-            // 1. Calculate bounds of all selected elements
-            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-            selectedEls.forEach(el => {
-                const b = getElBoundsInSvg(el);
-                if (b) {
-                    minX = Math.min(minX, b.x); minY = Math.min(minY, b.y);
-                    maxX = Math.max(maxX, b.x + b.w); maxY = Math.max(maxY, b.y + b.h);
+            booleanBusy = true;
+            overlay.querySelectorAll('.r-ve-bool-btn').forEach(button => button.disabled = true);
+            const before = documentSnapshot();
+            try {
+                const root = liveSvg.getScreenCTM();
+                const paths = elements.map(el => {
+                    const m = root.inverse().multiply(el.getScreenCTM());
+                    return {d:elemToPath(el),matrix:[m.a,m.b,m.c,m.d,m.e,m.f],fillRule:getComputedStyle(el).fillRule};
+                });
+                if (paths.reduce((n,p)=>n+p.d.length,0)>8*1024*1024) throw Error(isZh?'路径数据过大，请分批处理':'Path data is too large; process smaller batches');
+                const result = await geometryJobs.run('boolean',{paths,operation:op});
+                if (editorEvents.signal.aborted) return;
+                if (before !== documentSnapshot() || elements.some(el=>!liveSvg.contains(el))) {
+                    rlog(isZh ? '运算期间图形已改变，结果未应用，请重试。' : 'Artwork changed during the operation; retry.'); return;
                 }
-            });
-            const pad = 2;
-            minX -= pad; minY -= pad; maxX += pad; maxY += pad;
-            const bw = maxX - minX, bh = maxY - minY;
-            if (bw < 1 || bh < 1) return;
-
-            const dpr = 2;
-            const canvas = document.createElement('canvas');
-            canvas.width = Math.round(bw * dpr);
-            canvas.height = Math.round(bh * dpr);
-            const ctx = canvas.getContext('2d');
-            ctx.scale(dpr, dpr);
-            ctx.translate(-minX, -minY);
-
-            // Get fill color from first element
-            const firstEl = selectedEls[0];
-            const fill = firstEl.getAttribute('fill') || getComputedStyle(firstEl).fill || '#000000';
-            const stroke = firstEl.getAttribute('stroke') || 'none';
-            const strokeW = parseFloat(firstEl.getAttribute('stroke-width') || 0);
-
-            // Draw shapes using Path2D and canvas compositing
-            function drawElToCtx(el, context) {
-                const path = new Path2D();
-                const ctm = el.getCTM();
-                const svgCTM = liveSvg.getCTM();
-                let m = null;
-                if (ctm && svgCTM) {
-                    const inv = svgCTM.inverse();
-                    const combined = inv.multiply(ctm);
-                    m = new DOMMatrix([combined.a, combined.b, combined.c, combined.d, combined.e, combined.f]);
+                const first = elements[0], parent = first.parentNode;
+                let pathEl = null;
+                if (result.d) {
+                    pathEl = document.createElementNS('http://www.w3.org/2000/svg','path');
+                    pathEl.setAttribute('d',result.d);
+                    const m = parent.getScreenCTM().inverse().multiply(liveSvg.getScreenCTM());
+                    pathEl.setAttribute('transform','matrix('+[m.a,m.b,m.c,m.d,m.e,m.f].join(',')+')');
+                    const style = getComputedStyle(first);
+                    for (const name of ['fill','stroke','stroke-width','fill-opacity','stroke-opacity','opacity','stroke-linecap','stroke-linejoin','stroke-dasharray']) {
+                        const value = style.getPropertyValue(name).replace(/url\(["']?[^)#]*#([^"')]+)["']?\)/g,'url(#$1)');
+                        pathEl.setAttribute(name,value);pathEl.style.setProperty(name,value);
+                    }
+                    pathEl.setAttribute('fill-rule','nonzero');
+                    pathEl.setAttribute('vector-effect','non-scaling-stroke');
+                    parent.insertBefore(pathEl,first);
                 }
-
-                const d = elemToPath(el);
-                if (!d) return;
-                const tempPath = new Path2D(d);
-                if (m) {
-                    path.addPath(tempPath, m);
-                } else {
-                    path.addPath(tempPath);
-                }
-                context.fill(path);
+                elements.forEach(el=>el.remove());
+                deselectAll();if(pathEl)selectElement(pathEl);
+                saveState(isZh?'矢量布尔运算':'Vector boolean');
+                rlog(isZh ? '✅ 布尔运算完成，结果保留为矢量路径。' : '✅ Boolean completed as an editable vector path.');
+            } catch (error) { if(!editorEvents.signal.aborted)editorTools?.notify(error.message); }
+            finally {
+                booleanBusy = false;
+                overlay.querySelectorAll('.r-ve-bool-btn').forEach(button=>button.disabled=false);
             }
-
-            // Map operation to canvas composite operation
-            const compositeOps = {
-                'union': 'source-over',      // A + B
-                'subtract': 'destination-out', // A - B
-                'intersect': 'source-in',     // A ∩ B
-                'exclude': 'xor'              // A △ B (symmetric difference)
-            };
-
-            // Draw first element
-            ctx.fillStyle = fill === 'none' ? '#000000' : fill;
-            drawElToCtx(selectedEls[0], ctx);
-
-            // Apply operation with remaining elements
-            for (let i = 1; i < selectedEls.length; i++) {
-                if (op === 'union') {
-                    ctx.globalCompositeOperation = 'source-over';
-                } else if (op === 'subtract') {
-                    ctx.globalCompositeOperation = 'destination-out';
-                } else if (op === 'intersect') {
-                    ctx.globalCompositeOperation = 'source-in';
-                } else if (op === 'exclude') {
-                    ctx.globalCompositeOperation = 'xor';
-                } else if (op === 'minus-back') {
-                    ctx.globalCompositeOperation = 'source-out';
-                }
-                ctx.fillStyle = fill === 'none' ? '#000000' : fill;
-                drawElToCtx(selectedEls[i], ctx);
-            }
-
-            // Convert canvas to image and insert into SVG (wrapped in a group)
-            const dataUrl = canvas.toDataURL('image/png');
-            const ns = 'http://www.w3.org/2000/svg';
-            const imgEl = document.createElementNS(ns, 'image');
-            imgEl.setAttribute('href', dataUrl);
-            imgEl.setAttribute('x', minX);
-            imgEl.setAttribute('y', minY);
-            imgEl.setAttribute('width', bw);
-            imgEl.setAttribute('height', bh);
-            imgEl.setAttribute('data-bool-op', op);
-
-            // Wrap in a group so the boolean result is in "grouped" state
-            const boolGroup = document.createElementNS(ns, 'g');
-            boolGroup.setAttribute('data-user-group', 'true');
-            boolGroup.setAttribute('data-bool-op', op);
-            boolGroup.appendChild(imgEl);
-
-            // Remove original elements and insert result group
-            const parent = selectedEls[0].parentNode;
-            const nextSibling = selectedEls[selectedEls.length - 1].nextSibling;
-            selectedEls.forEach(el => el.remove());
-            if (nextSibling) {
-                parent.insertBefore(boolGroup, nextSibling);
-            } else {
-                parent.appendChild(boolGroup);
-            }
-
-            deselectAll();
-            selectElement(boolGroup);
-            saveState();
-
-            const opNames = {
-                'union': isZh ? '合并' : 'Unite',
-                'subtract': isZh ? '减去前方' : 'Minus Front',
-                'intersect': isZh ? '相交' : 'Intersect',
-                'exclude': isZh ? '排除' : 'Exclude',
-                'minus-back': isZh ? '减去后方' : 'Minus Back'
-            };
-            rlog((isZh ? '✅ 布尔运算完成: ' : '✅ Boolean operation done: ') + opNames[op]);
         }
 
-        // Property changes — fill
-        fillNoneBtn.onclick = () => {
-            fillIsNone = !fillIsNone;
-            fillNoneBtn.classList.toggle('active', fillIsNone);
-            fillInput.style.opacity = fillIsNone ? '0.3' : '1';
-            selectedEls.forEach(el => setAttrOrStyle(el, 'fill', fillIsNone ? 'none' : fillInput.value));
-        };
-        fillInput.oninput = () => {
-            if (fillIsNone) { fillIsNone = false; fillNoneBtn.classList.remove('active'); fillInput.style.opacity = '1'; }
-            selectedEls.forEach(el => setAttrOrStyle(el, 'fill', fillInput.value));
-        };
-        // Property changes — stroke
-        strokeNoneBtn.onclick = () => {
-            strokeIsNone = !strokeIsNone;
-            strokeNoneBtn.classList.toggle('active', strokeIsNone);
-            strokeInput.style.opacity = strokeIsNone ? '0.3' : '1';
-            selectedEls.forEach(el => setAttrOrStyle(el, 'stroke', strokeIsNone ? 'none' : strokeInput.value));
-        };
-        strokeInput.oninput = () => {
-            if (strokeIsNone) { strokeIsNone = false; strokeNoneBtn.classList.remove('active'); strokeInput.style.opacity = '1'; }
-            selectedEls.forEach(el => setAttrOrStyle(el, 'stroke', strokeInput.value));
-        };
+
+        // Apply paint once per gesture; native color dragging commits on change.
+        function applyPaint(attr,value,sync=true){
+            if(!value.startsWith('url(')&&gradientEditor?.attr===attr)gradientEditor.close();
+            const none=value==='none',input=attr==='fill'?fillInput:strokeInput,button=attr==='fill'?fillNoneBtn:strokeNoneBtn;
+            if(attr==='fill')fillIsNone=none;else strokeIsNone=none;
+            button.classList.toggle('active',none);input.style.opacity=none?'0.3':'1';
+            selectedEls.forEach(el=>setAttrOrStyle(el,attr,value));
+            if(sync)paintSwatches?.sync();
+        }
+        fillNoneBtn.onclick=()=>applyPaint('fill',fillIsNone?fillInput.value:'none');
+        strokeNoneBtn.onclick=()=>applyPaint('stroke',strokeIsNone?strokeInput.value:'none');
+        fillInput.oninput=()=>applyPaint('fill',fillInput.value,false);
+        strokeInput.oninput=()=>applyPaint('stroke',strokeInput.value,false);
         strokeWidthInput.oninput = () => { selectedEls.forEach(el => setAttrOrStyle(el, 'stroke-width', strokeWidthInput.value)); };
         opacityInput.oninput = () => {
             const op = getOpacityValue();
-            selectedEls.forEach(el => { el.setAttribute('opacity', op); el.style.opacity = op; });
+            selectedEls.filter(el=>!isElementLocked(el)).forEach(el => { el.setAttribute('opacity', op); el.style.opacity = op; });
         };
         // Font controls (support multi-select)
         const applyToTextEls = (fn) => {
             const targets = selectedEls.length > 0 ? selectedEls : (selectedEl ? [selectedEl] : []);
             targets.forEach(el => {
+                if (isElementLocked(el)) return;
                 const tag = el.tagName.toLowerCase();
                 if (tag === 'text' || tag === 'tspan') fn(el);
             });
@@ -18609,40 +18768,43 @@ function renderRPanelUI(instance, container) {
         function showGradientEditor(target, attr) {
             // target: 'fill' | 'stroke'
             const isZh = currentLang === 'zh';
-            // Remove any existing gradient editor
-            overlay.querySelectorAll('.r-ve-gradient-panel').forEach(p => p.remove());
+            gradientEditor?.close();
+            const targets=selectedEls.filter(el=>!isElementLocked(el));
+            if(!targets.length)return;
 
             const panel = document.createElement('div');
             panel.className = 'r-ve-gradient-panel';
-            panel.style.cssText = 'position:absolute;top:80px;right:12px;z-index:10000;background:#2a2a2a;border:1px solid #555;border-radius:8px;padding:14px;width:240px;box-shadow:0 8px 24px rgba(0,0,0,0.5);color:#ccc;font-size:12px;';
+            panel.style.cssText = 'position:absolute;top:80px;right:12px;z-index:10000;background:var(--ve-surface);border:1px solid var(--ve-border);border-radius:8px;padding:14px;width:240px;box-shadow:0 8px 24px rgba(38,56,75,.16);color:var(--ve-text);font-size:12px;';
             const title = attr === 'fill' ? (isZh ? '填充渐变' : 'Fill Gradient') : (isZh ? '描边渐变' : 'Stroke Gradient');
             panel.innerHTML = `
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-                    <span style="font-weight:700;color:#90caf9;">${title}</span>
-                    <button class="r-ve-grad-close" style="background:none;border:none;color:#999;cursor:pointer;font-size:14px;"><i class="fas fa-times"></i></button>
+                    <span style="font-weight:700;color:var(--ve-accent);">${title}</span>
+                    <button class="r-ve-grad-close" style="background:none;border:none;color:var(--ve-muted);cursor:pointer;font-size:14px;"><i class="fas fa-times"></i></button>
                 </div>
                 <label style="font-size:11px;">${isZh?'类型':'Type'}:</label>
                 <div style="display:flex;gap:4px;margin:4px 0 10px;">
                     <button class="r-ve-grad-type" data-type="linear" style="flex:1;padding:4px;background:#1976d2;color:#fff;border:1px solid #1976d2;border-radius:3px;cursor:pointer;font-size:11px;">${isZh?'线性':'Linear'}</button>
-                    <button class="r-ve-grad-type" data-type="radial" style="flex:1;padding:4px;background:#444;color:#bbb;border:1px solid #555;border-radius:3px;cursor:pointer;font-size:11px;">${isZh?'径向':'Radial'}</button>
+                    <button class="r-ve-grad-type" data-type="radial" style="flex:1;padding:4px;background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:3px;cursor:pointer;font-size:11px;">${isZh?'径向':'Radial'}</button>
                 </div>
                 <div class="r-ve-grad-angle-wrap">
                 <label style="font-size:11px;">${isZh?'角度':'Angle'}: <span class="r-ve-grad-angle-val">0</span>°</label>
                 <input type="range" class="r-ve-grad-angle" min="0" max="360" value="0" style="width:100%;margin:4px 0 10px;accent-color:#1976d2;" />
                 </div>
-                <label style="font-size:11px;">${isZh?'颜色停靠点':'Color Stops'} <span style="color:#666;font-size:10px;">(${isZh?'双击圆点改色，拖动调位':'dbl-click dot to color, drag to move'})</span>:</label>
-                <div class="r-ve-grad-preview" style="width:100%;height:28px;border-radius:4px;border:1px solid #555;margin:6px 0 16px;position:relative;cursor:crosshair;overflow:visible;background:linear-gradient(90deg,#e53935,#1976d2);"></div>
-                <div class="r-ve-grad-stops-list" style="max-height:120px;overflow-y:auto;margin-bottom:8px;"></div>
-                <button class="r-ve-grad-add-stop" style="width:100%;padding:5px;background:#333;color:#90caf9;border:1px solid #555;border-radius:4px;cursor:pointer;font-size:11px;margin-bottom:8px;">+ ${isZh?'添加停靠点':'Add Stop'}</button>
-                <div style="display:flex;gap:6px;">
-                    <button class="r-ve-grad-apply" style="flex:1;padding:6px;background:#1976d2;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;">${isZh?'应用':'Apply'}</button>
-                    <button class="r-ve-grad-remove" style="flex:1;padding:6px;background:#c62828;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">${isZh?'移除渐变':'Remove'}</button>
+                <label style="font-size:11px;">${isZh?'颜色停靠点':'Color Stops'} <span style="color:var(--ve-muted);font-size:10px;">(${isZh?'点击选中，双击改色，拖动调位':'click to select, double-click to color, drag to move'})</span>:</label>
+                <div class="r-ve-grad-preview" style="width:100%;height:16px;border-radius:4px;border:1px solid var(--ve-border);margin:8px 0 16px;position:relative;cursor:crosshair;overflow:visible;background:linear-gradient(90deg,#e53935,#1976d2);"></div>
+                <div class="r-ve-grad-selected-stop">
+                    <label>${isZh?'颜色':'Color'}<input class="r-ve-grad-color" type="color" /></label>
+                    <button class="r-ve-grad-delete" type="button" title="${isZh?'删除选中色标':'Delete selected stop'}" aria-label="${isZh?'删除选中色标':'Delete selected stop'}"><i class="fas fa-trash"></i></button>
+                    <label>${isZh?'不透明度':'Opacity'}<span><input class="r-ve-grad-opacity" type="number" min="0" max="100" step="1" /> %</span></label>
+                    <label>${isZh?'位置':'Position'}<span><input class="r-ve-grad-position" type="number" min="0" max="100" step="1" /> %</span></label>
                 </div>
             `;
             overlay.querySelector('.r-ve-window').appendChild(panel);
 
             let gradType = 'linear';
             let gradAngle = 0;
+            let originalGradient=null,gradEl=null,frame=0,pending=false,dirty=false,geometryChanged=false,dragCleanup=null;
+            const gradId=`bioeng_grad_${++gradientCounter}_${Date.now()}`;
             let stops = [
                 { color: '#e53935', offset: 0 },
                 { color: '#1976d2', offset: 100 }
@@ -18650,11 +18812,12 @@ function renderRPanelUI(instance, container) {
 
             // Try to read existing gradient from selected element
             if (selectedEl) {
-                const val = selectedEl.getAttribute(attr) || '';
-                const match = val.match(/^url\(#(.+)\)$/);
+                const val = getComputedStyle(targets[0]).getPropertyValue(attr);
+                const match = val.match(/#([^"')]+)["']?\s*\)/);
                 if (match) {
-                    const existGrad = liveSvg.querySelector('#' + match[1]);
-                    if (existGrad) {
+                    const existGrad = liveSvg.querySelector('#' + CSS.escape(match[1]));
+                    if (existGrad?.matches('linearGradient,radialGradient')) {
+                        originalGradient=existGrad;
                         gradType = existGrad.tagName === 'radialGradient' ? 'radial' : 'linear';
                         if (gradType === 'linear') {
                             const x1 = parseFloat(existGrad.getAttribute('x1') || 0);
@@ -18668,9 +18831,9 @@ function renderRPanelUI(instance, container) {
                         if (existStops.length > 0) {
                             stops = [];
                             existStops.forEach(s => {
-                                const off = parseFloat(s.getAttribute('offset') || '0');
-                                const col = s.getAttribute('stop-color') || '#000000';
-                                stops.push({ color: col, offset: off <= 1 ? Math.round(off * 100) : Math.round(off) });
+                                const raw=s.getAttribute('offset')||'0',off=parseFloat(raw);
+                                const col = rgbToHex(getComputedStyle(s).stopColor);
+                                stops.push({ color: col, offset: Math.max(0,Math.min(100,raw.includes('%')?off:off*100)), opacity:getComputedStyle(s).stopOpacity });
                             });
                         }
                     }
@@ -18680,7 +18843,12 @@ function renderRPanelUI(instance, container) {
             const angleInput = panel.querySelector('.r-ve-grad-angle');
             const angleVal = panel.querySelector('.r-ve-grad-angle-val');
             const preview = panel.querySelector('.r-ve-grad-preview');
-            const stopsList = panel.querySelector('.r-ve-grad-stops-list');
+            let selectedStop=stops[0];
+            const colorInput=panel.querySelector('.r-ve-grad-color');
+            const opacityInput=panel.querySelector('.r-ve-grad-opacity');
+            const positionInput=panel.querySelector('.r-ve-grad-position');
+            const deleteStop=panel.querySelector('.r-ve-grad-delete');
+            const stopMarkers=new Map();
             const typeBtns = panel.querySelectorAll('.r-ve-grad-type');
 
             angleInput.value = gradAngle;
@@ -18689,150 +18857,178 @@ function renderRPanelUI(instance, container) {
             function updateTypeUI() {
                 typeBtns.forEach(b => {
                     const active = b.dataset.type === gradType;
-                    b.style.background = active ? '#1976d2' : '#444';
-                    b.style.color = active ? '#fff' : '#bbb';
-                    b.style.borderColor = active ? '#1976d2' : '#555';
+                    b.style.background = active ? '#1976d2' : 'var(--ve-control)';
+                    b.style.color = active ? '#fff' : 'var(--ve-text)';
+                    b.style.borderColor = active ? '#1976d2' : 'var(--ve-border)';
                 });
                 panel.querySelector('.r-ve-grad-angle-wrap').style.display = gradType === 'linear' ? 'block' : 'none';
             }
 
+            // One definition per panel session; pointer input only schedules a frame.
+            function flush() {
+                cancelAnimationFrame(frame);frame=0;
+                if(!pending||editorEvents.signal.aborted)return;
+                pending=false;
+                const tag=gradType==='linear'?'linearGradient':'radialGradient';
+                if(!gradEl){
+                    gradEl=originalGradient?.cloneNode(true)||document.createElementNS('http://www.w3.org/2000/svg',tag);
+                    // Cloned stops must not introduce duplicate IDs from imported SVGs.
+                    gradEl.querySelectorAll('[id]').forEach(node=>node.removeAttribute('id'));
+                    gradEl.id=gradId;getOrCreateDefs().appendChild(gradEl);
+                    applyPaint(attr,`url(#${gradId})`,false);
+                }
+                if(gradEl.tagName!==tag){
+                    const replacement=document.createElementNS('http://www.w3.org/2000/svg',tag);
+                    replacement.id=gradId;gradEl.replaceWith(replacement);gradEl=replacement;
+                }
+                if(geometryChanged||!originalGradient){
+                    gradEl.removeAttribute('gradientTransform');gradEl.setAttribute('gradientUnits','objectBoundingBox');
+                    if(gradType==='linear'){
+                        const rad=gradAngle*Math.PI/180,x=Math.cos(rad),y=Math.sin(rad);
+                        for(const [name,value] of Object.entries({x1:(1-x)/2,y1:(1-y)/2,x2:(1+x)/2,y2:(1+y)/2}))gradEl.setAttribute(name,value.toFixed(6));
+                    }else for(const [name,value] of Object.entries({cx:.5,cy:.5,r:.5}))gradEl.setAttribute(name,value);
+                }
+                const sorted=stops.slice().sort((a,b)=>a.offset-b.offset),nodes=[...gradEl.querySelectorAll('stop')];
+                sorted.forEach((stop,index)=>{
+                    const node=nodes[index]||document.createElementNS('http://www.w3.org/2000/svg','stop');
+                    node.setAttribute('offset',String(stop.offset/100));node.setAttribute('stop-color',stop.color);
+                    node.style.setProperty('stop-color',stop.color,'important');
+                    const opacity=String(stop.opacity??1);
+                    node.setAttribute('stop-opacity',opacity);node.style.setProperty('stop-opacity',opacity,'important');
+                    if(!node.parentNode)gradEl.appendChild(node);
+                });
+                nodes.slice(sorted.length).forEach(node=>node.remove());
+            }
+            function queuePreview(){
+                pending=true;dirty=true;
+                if(!frame)frame=requestAnimationFrame(()=>{frame=0;flush();});
+            }
+            function commit(){
+                flush();if(!dirty)return;dirty=false;
+                paintSwatches?.sync();saveState(isZh?'渐变':'Gradient');
+            }
+            function close(){
+                dragCleanup?.();commit();gradientEditor=null;panel.remove();
+                editorEvents.signal.removeEventListener('abort',onAbort);
+            }
+            gradientEditor={attr,flush,commit,close};
+            // The editor-level abort owns cleanup, including a close during a drag.
+            const onAbort=()=>{cancelAnimationFrame(frame);dragCleanup?.();panel.remove();gradientEditor=null;};
+            editorEvents.signal.addEventListener('abort',onAbort,{once:true});
+
+            function stopPaint(s) {
+                return s.color+Math.round(Number(s.opacity??1)*255).toString(16).padStart(2,'0');
+            }
+            function updatePreviewBackground() {
+                const css=stops.slice().sort((a,b)=>a.offset-b.offset).map(s=>`${stopPaint(s)} ${s.offset}%`).join(',');
+                preview.style.backgroundImage=(gradType==='linear'?`linear-gradient(${gradAngle+90}deg,${css})`:`radial-gradient(circle,${css})`)+',repeating-conic-gradient(#d2deea 0% 25%,#fff 0% 50%)';
+                preview.style.backgroundSize='100% 100%,8px 8px';
+            }
+            function selectStop(stop) {
+                selectedStop=stop;
+                colorInput.value=stop.color;
+                opacityInput.value=Math.round(Number(stop.opacity??1)*100);
+                positionInput.value=stop.offset;
+                deleteStop.disabled=stops.length<=2;
+                stopMarkers.forEach((marker,s)=>{
+                    marker.classList.toggle('is-selected',s===stop);
+                    marker.setAttribute('aria-pressed',String(s===stop));
+                });
+            }
             function renderPreview() {
                 stops.sort((a, b) => a.offset - b.offset);
-                const css = stops.map(s => `${s.color} ${s.offset}%`).join(',');
-                if (gradType === 'linear') {
-                    preview.style.background = `linear-gradient(${gradAngle}deg, ${css})`;
-                } else {
-                    preview.style.background = `radial-gradient(circle, ${css})`;
-                }
+                updatePreviewBackground();
                 // Render draggable stop markers on preview bar
                 preview.querySelectorAll('.r-ve-grad-marker').forEach(m => m.remove());
-                stops.forEach((s, idx) => {
-                    const mk = document.createElement('div');
+                stopMarkers.clear();
+                stops.forEach(s => {
+                    const mk = document.createElement('button');
+                    mk.type='button';
                     mk.className = 'r-ve-grad-marker';
-                    mk.style.cssText = `position:absolute;left:${s.offset}%;top:50%;transform:translate(-50%,-50%);width:14px;height:14px;border-radius:50%;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,0.5);background:${s.color};cursor:grab;z-index:2;`;
+                    mk.style.left=s.offset+'%';
+                    mk.style.backgroundColor=s.color;
                     mk.title = `${s.offset}%`;
+                    mk.setAttribute('aria-label',(isZh?'色标位置 ':'Stop position ')+mk.title);
+                    stopMarkers.set(s,mk);
                     mk.addEventListener('mousedown', (mev) => {
+                        if(mev.button!==0)return;
                         mev.stopPropagation(); mev.preventDefault();
+                        selectStop(s);
                         const barRect = preview.getBoundingClientRect();
+                        const startX=mev.clientX,startY=mev.clientY;let dragging=false;
                         const onMove = (me) => {
+                            if(!dragging&&Math.hypot(me.clientX-startX,me.clientY-startY)<3)return;
+                            dragging=true;
                             const pct = Math.max(0, Math.min(100, Math.round(((me.clientX - barRect.left) / barRect.width) * 100)));
+                            if(s.offset===pct)return;
                             s.offset = pct; mk.style.left = pct + '%'; mk.title = pct + '%';
-                            const css2 = stops.slice().sort((a,b)=>a.offset-b.offset).map(st=>`${st.color} ${st.offset}%`).join(',');
-                            preview.style.background = gradType==='linear' ? `linear-gradient(${gradAngle}deg,${css2})` : `radial-gradient(circle,${css2})`;
+                            mk.setAttribute('aria-label',(isZh?'色标位置 ':'Stop position ')+mk.title);
+                            positionInput.value=pct;
+                            updatePreviewBackground();
+                            queuePreview();
                         };
-                        const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); renderStops(); renderPreview(); };
+                        dragCleanup?.();
+                        dragCleanup=()=>{window.removeEventListener('mousemove',onMove);window.removeEventListener('mouseup',onUp);dragCleanup=null;};
+                        // Keep the same circle across both clicks of a double-click.
+                        const onUp = () => { dragCleanup?.();if(dragging){renderPreview();commit();} };
                         listen(window, 'mousemove', onMove); listen(window, 'mouseup', onUp);
                     });
-                    mk.addEventListener('click', (ce) => ce.stopPropagation());
+                    mk.addEventListener('click', (ce) => {ce.stopPropagation();selectStop(s);});
+                    mk.addEventListener('focus',()=>selectStop(s));
+                    mk.addEventListener('keydown',ke=>{
+                        if(ke.key===' ')ke.stopPropagation();
+                        if(ke.key==='Delete'||ke.key==='Backspace'){
+                            ke.preventDefault();ke.stopPropagation();selectStop(s);deleteStop.click();
+                        }
+                    });
+                    mk.addEventListener('keyup',ke=>{if(ke.key===' ')ke.stopPropagation();});
                     mk.addEventListener('dblclick', (dev) => {
                         dev.stopPropagation();
-                        const ci = document.createElement('input'); ci.type = 'color'; ci.value = s.color;
-                        ci.style.cssText = 'position:absolute;left:0;top:0;width:0;height:0;opacity:0;pointer-events:none;';
-                        preview.appendChild(ci);
-                        ci.oninput = () => { s.color = ci.value; renderPreview(); renderStops(); };
-                        ci.addEventListener('change', () => ci.remove());
-                        ci.click();
+                        selectStop(s);
+                        if(colorInput.showPicker)colorInput.showPicker();else colorInput.click();
                     });
                     preview.appendChild(mk);
                 });
+                selectStop(selectedStop);
             }
 
-            function renderStops() {
-                stopsList.innerHTML = '';
-                stops.forEach((s, i) => {
-                    const row = document.createElement('div');
-                    row.style.cssText = 'display:flex;align-items:center;gap:4px;margin-bottom:4px;';
-                    row.innerHTML = `
-                        <input type="color" value="${s.color}" style="width:28px;height:22px;padding:0;border:1px solid #555;border-radius:3px;cursor:pointer;" />
-                        <input type="number" value="${s.offset}" min="0" max="100" step="1" style="width:50px;background:#333;color:#ccc;border:1px solid #555;border-radius:3px;padding:3px;font-size:11px;" />
-                        <span style="color:#666;font-size:10px;">%</span>
-                        <button style="background:none;border:none;color:#c62828;cursor:pointer;font-size:12px;padding:2px;${stops.length <= 2 ? 'visibility:hidden;' : ''}"><i class="fas fa-trash"></i></button>
-                    `;
-                    const cInp = row.querySelector('input[type="color"]');
-                    const oInp = row.querySelector('input[type="number"]');
-                    const delBtn = row.querySelector('button');
-                    cInp.oninput = () => { s.color = cInp.value; renderPreview(); };
-                    oInp.oninput = () => { s.offset = parseInt(oInp.value) || 0; renderPreview(); };
-                    delBtn.onclick = () => { if (stops.length > 2) { stops.splice(i, 1); renderStops(); renderPreview(); } };
-                    stopsList.appendChild(row);
-                });
+            colorInput.oninput=()=>{selectedStop.color=colorInput.value;renderPreview();queuePreview();};
+            colorInput.onchange=commit;
+            for(const [input,field,scale] of [[positionInput,'offset',1],[opacityInput,'opacity',100]]){
+                input.oninput=()=>{
+                    if(input.value===''||!Number.isFinite(input.valueAsNumber))return;
+                    selectedStop[field]=Math.max(0,Math.min(100,input.valueAsNumber))/scale;
+                    renderPreview();queuePreview();
+                };
+                input.onchange=()=>{selectStop(selectedStop);commit();};
             }
-
-            typeBtns.forEach(b => { b.onclick = () => { gradType = b.dataset.type; updateTypeUI(); renderPreview(); }; });
-            angleInput.oninput = () => { gradAngle = parseInt(angleInput.value) || 0; angleVal.textContent = gradAngle; renderPreview(); };
-
-            panel.querySelector('.r-ve-grad-add-stop').onclick = () => {
-                const mid = stops.length > 0 ? Math.round((stops[0].offset + stops[stops.length - 1].offset) / 2) : 50;
-                stops.push({ color: '#888888', offset: mid });
-                renderStops();
-                renderPreview();
+            deleteStop.onclick=()=>{
+                if(stops.length<=2)return;
+                const index=stops.indexOf(selectedStop);
+                stops.splice(index,1);selectedStop=stops[Math.min(index,stops.length-1)];
+                renderPreview();queuePreview();commit();
             };
+
+            typeBtns.forEach(b => { b.onclick = () => { gradType = b.dataset.type;geometryChanged=true; updateTypeUI(); renderPreview();queuePreview();commit(); }; });
+            angleInput.oninput = () => { gradAngle = parseInt(angleInput.value) || 0;geometryChanged=true; angleVal.textContent = gradAngle; renderPreview();queuePreview(); };
+            angleInput.onchange=commit;
 
             // Click on preview bar to add stop at position
             preview.onclick = (ev) => {
-                if (ev.target.classList.contains('r-ve-grad-marker')) return;
+                if (ev.target !== preview) return;
                 const rect = preview.getBoundingClientRect();
                 const pct = Math.round(((ev.clientX - rect.left) / rect.width) * 100);
-                stops.push({ color: '#888888', offset: pct });
-                renderStops();
+                selectedStop={color:'#888888',offset:Math.max(0,Math.min(100,pct))};
+                stops.push(selectedStop);
                 renderPreview();
+                queuePreview();commit();
             };
 
-            panel.querySelector('.r-ve-grad-apply').onclick = () => {
-                if (selectedEls.length === 0) return;
-                const defs = getOrCreateDefs();
-                gradientCounter++;
-                const gradId = `bioeng_grad_${gradientCounter}_${Date.now()}`;
-                stops.sort((a, b) => a.offset - b.offset);
-
-                let gradEl;
-                if (gradType === 'linear') {
-                    const rad = gradAngle * Math.PI / 180;
-                    const x2 = Math.round(Math.cos(rad) * 10000) / 10000;
-                    const y2 = Math.round(Math.sin(rad) * 10000) / 10000;
-                    const x1 = -x2, y1 = -y2;
-                    // Normalize to 0-1 range
-                    const mapTo01 = (v) => (v + 1) / 2;
-                    gradEl = document.createElementNS('http://www.w3.org/2000/svg', 'linearGradient');
-                    gradEl.setAttribute('id', gradId);
-                    gradEl.setAttribute('x1', mapTo01(x1));
-                    gradEl.setAttribute('y1', mapTo01(y1));
-                    gradEl.setAttribute('x2', mapTo01(x2));
-                    gradEl.setAttribute('y2', mapTo01(y2));
-                } else {
-                    gradEl = document.createElementNS('http://www.w3.org/2000/svg', 'radialGradient');
-                    gradEl.setAttribute('id', gradId);
-                    gradEl.setAttribute('cx', '0.5');
-                    gradEl.setAttribute('cy', '0.5');
-                    gradEl.setAttribute('r', '0.5');
-                }
-                stops.forEach(s => {
-                    const stop = document.createElementNS('http://www.w3.org/2000/svg', 'stop');
-                    stop.setAttribute('offset', (s.offset / 100).toFixed(2));
-                    stop.setAttribute('stop-color', s.color);
-                    gradEl.appendChild(stop);
-                });
-                defs.appendChild(gradEl);
-                selectedEls.forEach(el => { el.setAttribute(attr, `url(#${gradId})`); el.style[attr] = ''; });
-                saveState();
-            };
-
-            panel.querySelector('.r-ve-grad-remove').onclick = () => {
-                selectedEls.forEach(el => {
-                    const val = el.getAttribute(attr) || '';
-                    const m = val.match(/^url\(#(.+)\)$/);
-                    if (m) { const old = liveSvg.querySelector('#' + m[1]); if (old) old.remove(); }
-                    el.setAttribute(attr, attr === 'fill' ? fillInput.value : strokeInput.value);
-                });
-                saveState();
-                panel.remove();
-            };
-
-            panel.querySelector('.r-ve-grad-close').onclick = () => panel.remove();
+            panel.querySelector('.r-ve-grad-close').onclick=close;
 
             updateTypeUI();
-            renderStops();
             renderPreview();
+            if(!originalGradient){queuePreview();commit();}
         }
 
         // Bind gradient buttons
@@ -19329,11 +19525,11 @@ function renderRPanelUI(instance, container) {
 
             const panel = document.createElement('div');
             panel.className = 'r-ve-keybar-panel';
-            panel.style.cssText = 'position:absolute;top:72px;right:12px;z-index:10000;background:#2a2a2a;border:1px solid #555;border-radius:8px;padding:14px;width:360px;box-shadow:0 8px 24px rgba(0,0,0,.5);color:#ccc;font-size:12px;';
+            panel.style.cssText = 'position:absolute;top:72px;right:12px;z-index:10000;background:var(--ve-surface);border:1px solid var(--ve-border);border-radius:8px;padding:14px;width:360px;box-shadow:0 8px 24px rgba(38,56,75,.16);color:var(--ve-text);font-size:12px;';
             panel.innerHTML = `
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;"><span style="font-weight:700;color:#90caf9"><i class="fas fa-palette"></i> ${isZh?'编辑 Key Bar':'Edit Key Bar'}</span><button class="r-ve-kb-close" style="background:none;border:none;color:#999;cursor:pointer"><i class="fas fa-times"></i></button></div>
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;"><span style="font-weight:700;color:var(--ve-accent)"><i class="fas fa-palette"></i> ${isZh?'编辑 Key Bar':'Edit Key Bar'}</span><button class="r-ve-kb-close" style="background:none;border:none;color:var(--ve-muted);cursor:pointer"><i class="fas fa-times"></i></button></div>
                 <div style="color:#888;font-size:10px;margin-bottom:8px">${isZh?'已将全部色阶合并为一个连续 Keybar，并自动归纳为主颜色。':'All exported strips are merged into one continuous Keybar with principal colors.'}</div>
-                <div class="r-ve-kb-edit-preview" style="height:24px;border:1px solid #555;border-radius:3px;margin-bottom:10px"></div>
+                <div class="r-ve-kb-edit-preview" style="height:24px;border:1px solid var(--ve-border);border-radius:3px;margin-bottom:10px"></div>
                 <label style="font-size:11px">${isZh?'渐变模式':'Gradient mode'}:</label>
                 <div style="display:flex;gap:4px;margin:4px 0 12px">
                     <button class="r-ve-kb-edit-mode" data-mode="3color" style="flex:1;padding:6px;border-radius:3px;cursor:pointer;font-size:11px">${isZh?'三色渐变':'3-Color'}</button>
@@ -19342,11 +19538,11 @@ function renderRPanelUI(instance, container) {
                 </div>
                 <div class="r-ve-kb-edit-colors" style="display:flex;gap:10px;align-items:center;margin-bottom:12px"></div>
                 <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:5px">
-                    <label style="font-size:11px">${isZh?'最小值':'Minimum'}<input class="r-ve-kb-edit-min" type="text" value="${escapeHtml(String(info.min))}" style="box-sizing:border-box;width:100%;margin-top:4px;background:#333;color:#ccc;border:1px solid #555;border-radius:3px;padding:6px"></label>
-                    <label style="font-size:11px">${isZh?'最大值':'Maximum'}<input class="r-ve-kb-edit-max" type="text" value="${escapeHtml(String(info.max))}" style="box-sizing:border-box;width:100%;margin-top:4px;background:#333;color:#ccc;border:1px solid #555;border-radius:3px;padding:6px"></label>
-                    <label style="font-size:11px">${isZh?'步进值':'Step'}<input class="r-ve-kb-edit-step" type="number" min="0" step="any" value="${escapeHtml(String(info.step))}" style="box-sizing:border-box;width:100%;margin-top:4px;background:#333;color:#ccc;border:1px solid #555;border-radius:3px;padding:6px"></label>
+                    <label style="font-size:11px">${isZh?'最小值':'Minimum'}<input class="r-ve-kb-edit-min" type="text" value="${escapeHtml(String(info.min))}" style="box-sizing:border-box;width:100%;margin-top:4px;background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:3px;padding:6px"></label>
+                    <label style="font-size:11px">${isZh?'最大值':'Maximum'}<input class="r-ve-kb-edit-max" type="text" value="${escapeHtml(String(info.max))}" style="box-sizing:border-box;width:100%;margin-top:4px;background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:3px;padding:6px"></label>
+                    <label style="font-size:11px">${isZh?'步进值':'Step'}<input class="r-ve-kb-edit-step" type="number" min="0" step="any" value="${escapeHtml(String(info.step))}" style="box-sizing:border-box;width:100%;margin-top:4px;background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:3px;padding:6px"></label>
                 </div>
-                <div style="font-size:10px;color:#777;margin-bottom:12px">${isZh?'按最小值、最大值和步进重新生成刻度，并按各图形的原始数值重新着色。':'Ticks and all figure colors are regenerated from the range, step, and original values.'}</div>
+                <div style="font-size:10px;color:var(--ve-muted);margin-bottom:12px">${isZh?'按最小值、最大值和步进重新生成刻度，并按各图形的原始数值重新着色。':'Ticks and all figure colors are regenerated from the range, step, and original values.'}</div>
                 <button class="r-ve-kb-apply" style="width:100%;padding:8px;background:#1976d2;color:white;border:0;border-radius:5px;cursor:pointer;font-weight:600"><i class="fas fa-check"></i> ${isZh?'应用到整个图像':'Apply to whole figure'}</button>`;
             overlay.querySelector('.r-ve-window').appendChild(panel);
 
@@ -19378,9 +19574,9 @@ function renderRPanelUI(instance, container) {
             function renderMode() {
                 modeBtns.forEach(btn => {
                     const active=btn.dataset.mode===kbMode;
-                    btn.style.background=active?'#1976d2':'#444';
-                    btn.style.color=active?'#fff':'#bbb';
-                    btn.style.border=`1px solid ${active?'#1976d2':'#555'}`;
+                    btn.style.background=active?'#1976d2':'var(--ve-control)';
+                    btn.style.color=active?'#fff':'var(--ve-text)';
+                    btn.style.border=`1px solid ${active?'#1976d2':'var(--ve-border)'}`;
                 });
                 const fields = kbMode==='3color'
                     ? [['start',isZh?'低值色':'Low'],['middle',isZh?'中间色':'Middle'],['end',isZh?'高值色':'High']]
@@ -19391,7 +19587,7 @@ function renderRPanelUI(instance, container) {
                 fields.forEach(([key,label])=>{
                     const field=document.createElement('label');
                     field.style.cssText='flex:1;font-size:11px;display:flex;align-items:center;gap:6px';
-                    field.innerHTML=`<input type="color" value="${colorState[key]}" style="width:38px;height:28px;padding:0;background:#333;border:1px solid #555;border-radius:3px;cursor:pointer"><span>${label}</span>`;
+                    field.innerHTML=`<input type="color" value="${colorState[key]}" style="width:38px;height:28px;padding:0;background:var(--ve-control);border:1px solid var(--ve-border);border-radius:3px;cursor:pointer"><span>${label}</span>`;
                     field.querySelector('input').oninput=e=>{colorState[key]=e.target.value;renderPreview();};
                     colorsWrap.appendChild(field);
                 });
@@ -19491,41 +19687,41 @@ function renderRPanelUI(instance, container) {
             overlay.querySelectorAll('.r-ve-keybar-panel').forEach(p => p.remove());
             const panel = document.createElement('div');
             panel.className = 'r-ve-keybar-panel';
-            panel.style.cssText = 'position:absolute;top:80px;left:50%;transform:translateX(-50%);z-index:10000;background:#2a2a2a;border:1px solid #555;border-radius:8px;padding:16px;width:320px;box-shadow:0 8px 24px rgba(0,0,0,0.5);color:#ccc;font-size:12px;';
+            panel.style.cssText = 'position:absolute;top:80px;left:50%;transform:translateX(-50%);z-index:10000;background:var(--ve-surface);border:1px solid var(--ve-border);border-radius:8px;padding:16px;width:320px;box-shadow:0 8px 24px rgba(38,56,75,.16);color:var(--ve-text);font-size:12px;';
             panel.innerHTML = `
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-                    <span style="font-weight:700;color:#90caf9;font-size:13px;"><i class="fas fa-palette"></i> ${isZh?'插入 Key Bar':'Insert Key Bar'}</span>
-                    <button class="r-ve-kb-close" style="background:none;border:none;color:#999;cursor:pointer;font-size:14px;"><i class="fas fa-times"></i></button>
+                    <span style="font-weight:700;color:var(--ve-accent);font-size:13px;"><i class="fas fa-palette"></i> ${isZh?'插入 Key Bar':'Insert Key Bar'}</span>
+                    <button class="r-ve-kb-close" style="background:none;border:none;color:var(--ve-muted);cursor:pointer;font-size:14px;"><i class="fas fa-times"></i></button>
                 </div>
                 <label style="font-size:11px;">${isZh?'渐变模式':'Mode'}:</label>
                 <div style="display:flex;gap:4px;margin:4px 0 10px;">
                     <button class="r-ve-kb-mode" data-mode="3color" style="flex:1;padding:5px;background:#1976d2;color:#fff;border:1px solid #1976d2;border-radius:3px;cursor:pointer;font-size:11px;">${isZh?'三色渐变':'3-Color'}</button>
-                    <button class="r-ve-kb-mode" data-mode="2color" style="flex:1;padding:5px;background:#444;color:#bbb;border:1px solid #555;border-radius:3px;cursor:pointer;font-size:11px;">${isZh?'双色渐变':'2-Color'}</button>
-                    <button class="r-ve-kb-mode" data-mode="mono" style="flex:1;padding:5px;background:#444;color:#bbb;border:1px solid #555;border-radius:3px;cursor:pointer;font-size:11px;">${isZh?'单色渐变':'Mono'}</button>
+                    <button class="r-ve-kb-mode" data-mode="2color" style="flex:1;padding:5px;background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:3px;cursor:pointer;font-size:11px;">${isZh?'双色渐变':'2-Color'}</button>
+                    <button class="r-ve-kb-mode" data-mode="mono" style="flex:1;padding:5px;background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:3px;cursor:pointer;font-size:11px;">${isZh?'单色渐变':'Mono'}</button>
                 </div>
                 <div class="r-ve-kb-colors" style="margin-bottom:10px;">
                     <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
                         <label style="width:32px;font-size:11px;">${isZh?'左':'Left'}:</label>
-                        <input type="color" class="r-ve-kb-c1" value="#1565c0" style="width:32px;height:24px;padding:0;border:1px solid #555;border-radius:3px;cursor:pointer;" />
+                        <input type="color" class="r-ve-kb-c1" value="#1565c0" style="width:32px;height:24px;padding:0;border:1px solid var(--ve-border);border-radius:3px;cursor:pointer;" />
                         <label style="width:32px;font-size:11px;">${isZh?'中':'Mid'}:</label>
-                        <input type="color" class="r-ve-kb-c2" value="#ffffff" style="width:32px;height:24px;padding:0;border:1px solid #555;border-radius:3px;cursor:pointer;" />
+                        <input type="color" class="r-ve-kb-c2" value="#ffffff" style="width:32px;height:24px;padding:0;border:1px solid var(--ve-border);border-radius:3px;cursor:pointer;" />
                         <label style="width:32px;font-size:11px;">${isZh?'右':'Right'}:</label>
-                        <input type="color" class="r-ve-kb-c3" value="#c62828" style="width:32px;height:24px;padding:0;border:1px solid #555;border-radius:3px;cursor:pointer;" />
+                        <input type="color" class="r-ve-kb-c3" value="#c62828" style="width:32px;height:24px;padding:0;border:1px solid var(--ve-border);border-radius:3px;cursor:pointer;" />
                     </div>
                 </div>
-                <div class="r-ve-kb-preview" style="width:100%;height:20px;border-radius:3px;border:1px solid #555;margin-bottom:10px;background:linear-gradient(90deg,#1565c0,#ffffff,#c62828);"></div>
+                <div class="r-ve-kb-preview" style="width:100%;height:20px;border-radius:3px;border:1px solid var(--ve-border);margin-bottom:10px;background:linear-gradient(90deg,#1565c0,#ffffff,#c62828);"></div>
                 <div style="display:flex;gap:8px;margin-bottom:10px;">
-                    <div style="flex:1;"><label style="font-size:11px;">${isZh?'宽度':'Width'}:</label><input type="number" class="r-ve-kb-w" value="200" min="20" max="2000" style="width:100%;background:#333;color:#ccc;border:1px solid #555;border-radius:3px;padding:4px;font-size:12px;box-sizing:border-box;" /></div>
-                    <div style="flex:1;"><label style="font-size:11px;">${isZh?'高度':'Height'}:</label><input type="number" class="r-ve-kb-h" value="20" min="5" max="500" style="width:100%;background:#333;color:#ccc;border:1px solid #555;border-radius:3px;padding:4px;font-size:12px;box-sizing:border-box;" /></div>
+                    <div style="flex:1;"><label style="font-size:11px;">${isZh?'宽度':'Width'}:</label><input type="number" class="r-ve-kb-w" value="200" min="20" max="2000" style="width:100%;background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:3px;padding:4px;font-size:12px;box-sizing:border-box;" /></div>
+                    <div style="flex:1;"><label style="font-size:11px;">${isZh?'高度':'Height'}:</label><input type="number" class="r-ve-kb-h" value="20" min="5" max="500" style="width:100%;background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:3px;padding:4px;font-size:12px;box-sizing:border-box;" /></div>
                 </div>
                 <div style="display:flex;gap:8px;margin-bottom:10px;">
-                    <div style="flex:1;"><label style="font-size:11px;">${isZh?'最小值':'Min'}:</label><input type="text" class="r-ve-kb-min" value="0" style="width:100%;background:#333;color:#ccc;border:1px solid #555;border-radius:3px;padding:4px;font-size:12px;box-sizing:border-box;" /></div>
-                    <div style="flex:1;"><label style="font-size:11px;">${isZh?'最大值':'Max'}:</label><input type="text" class="r-ve-kb-max" value="100" style="width:100%;background:#333;color:#ccc;border:1px solid #555;border-radius:3px;padding:4px;font-size:12px;box-sizing:border-box;" /></div>
+                    <div style="flex:1;"><label style="font-size:11px;">${isZh?'最小值':'Min'}:</label><input type="text" class="r-ve-kb-min" value="0" style="width:100%;background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:3px;padding:4px;font-size:12px;box-sizing:border-box;" /></div>
+                    <div style="flex:1;"><label style="font-size:11px;">${isZh?'最大值':'Max'}:</label><input type="text" class="r-ve-kb-max" value="100" style="width:100%;background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:3px;padding:4px;font-size:12px;box-sizing:border-box;" /></div>
                 </div>
                 <div style="display:flex;gap:6px;margin-bottom:6px;">
-                    <div style="flex:1;"><label style="font-size:11px;">${isZh?'标签字号':'Label Size'}:</label><input type="number" class="r-ve-kb-fs" value="12" min="6" max="60" style="width:100%;background:#333;color:#ccc;border:1px solid #555;border-radius:3px;padding:4px;font-size:12px;box-sizing:border-box;" /></div>
+                    <div style="flex:1;"><label style="font-size:11px;">${isZh?'标签字号':'Label Size'}:</label><input type="number" class="r-ve-kb-fs" value="12" min="6" max="60" style="width:100%;background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:3px;padding:4px;font-size:12px;box-sizing:border-box;" /></div>
                     <div style="flex:1;"><label style="font-size:11px;">${isZh?'方向':'Direction'}:</label>
-                        <select class="r-ve-kb-dir" style="width:100%;background:#333;color:#ccc;border:1px solid #555;border-radius:3px;padding:4px;font-size:12px;">
+                        <select class="r-ve-kb-dir" style="width:100%;background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:3px;padding:4px;font-size:12px;">
                             <option value="horizontal">${isZh?'水平':'Horizontal'}</option>
                             <option value="vertical">${isZh?'垂直':'Vertical'}</option>
                         </select>
@@ -19545,9 +19741,9 @@ function renderRPanelUI(instance, container) {
             function updateModeUI() {
                 modeBtns.forEach(b => {
                     const active = b.dataset.mode === kbMode;
-                    b.style.background = active ? '#1976d2' : '#444';
-                    b.style.color = active ? '#fff' : '#bbb';
-                    b.style.borderColor = active ? '#1976d2' : '#555';
+                    b.style.background = active ? '#1976d2' : 'var(--ve-control)';
+                    b.style.color = active ? '#fff' : 'var(--ve-text)';
+                    b.style.borderColor = active ? '#1976d2' : 'var(--ve-border)';
                 });
                 c2.parentElement.querySelector('label:nth-of-type(2)').style.display = kbMode === '3color' ? '' : 'none';
                 c2.style.display = kbMode === '3color' ? '' : 'none';
@@ -19677,8 +19873,11 @@ function renderRPanelUI(instance, container) {
         canvasHInput.onchange = () => { updateCanvasSize(canvasW, parseInt(canvasHInput.value) || canvasH); };
 
         function setAttrOrStyle(el, attr, val) {
+            if (isElementLocked(el)) return;
             const styleStr = el.getAttribute('style') || '';
-            if (styleStr.includes(attr)) {
+            if (attr==='fill'||attr==='stroke') {
+                el.style.setProperty(attr,val,'important');
+            } else if (styleStr.includes(attr)) {
                 el.style[attr.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = val;
             }
             el.setAttribute(attr, val);
@@ -19702,11 +19901,11 @@ function renderRPanelUI(instance, container) {
         let isPanning = false, panStartX = 0, panStartY = 0;
         let isDragging = false, dragStartPt = null, dragOrigTransform = '';
         let dragRoots = []; // top-level elements for multi-select drag (excludes children of other selected elements)
-        let dragMoved = false;
+        let dragMoved = false, dragAxisLock = null, dragShiftToggle = null;
         let pendingTextEdit = null;
         let textPointerPress = null;
         let isResizing = false, resizeStartPt = null, resizeOrigBBox = null, resizeOrigTransform = '', resizeVisualBounds = null;
-        let resizeOrigCTM = null; // element CTM at resize start (for correct delta projection after rotation)
+        let resizeScreenToLocal = null; // inverse screen CTM at drag start, including ancestor transforms
         let resizeMulti = false, resizeMultiData = []; // for multi-element resize
         let resizeGroupBounds = null; // combined bounds of all selected elements
         let isRotating = false, rotStartAngle = 0, rotCenterPt = null;
@@ -19715,120 +19914,98 @@ function renderRPanelUI(instance, container) {
         let activeEdge = 'se';
         let lastTextClick = null;
         function selectedScreenGeometry() {
-            if (!selectedEls.length) return null;
+            if (!selectedEls.length || !liveSvg) return null;
             const viewportRect = viewport.getBoundingClientRect();
-            const cacheKey = `${selectedEls.length}|${viewportRect.left}|${viewportRect.top}|${viewportRect.width}|${viewportRect.height}`;
+            const cacheKey = [selectedEls.length, viewportRect.left, viewportRect.top,
+                viewportRect.width, viewportRect.height].join('|');
             if (selectedScreenGeometryCache?.key === cacheKey) return selectedScreenGeometryCache.value;
-            const roots = getTopLevelEls(selectedEls);
-            const rects = roots.map(el => el.getBoundingClientRect()).filter(r => r.width > 0 || r.height > 0);
-            if (!rects.length) return null;
-            const left = Math.min(...rects.map(r => r.left));
-            const top = Math.min(...rects.map(r => r.top));
-            const right = Math.max(...rects.map(r => r.right));
-            const bottom = Math.max(...rects.map(r => r.bottom));
-            const boundary = [];
-            const corners = [];
-            const geometrySelector = 'path,rect,circle,ellipse,line,polyline,polygon,image,text';
-            const geometryNodes = [];
-            roots.forEach(root => {
-                if (root.matches?.(geometrySelector)) geometryNodes.push(root);
-                root.querySelectorAll?.(geometrySelector).forEach(node => geometryNodes.push(node));
-            });
-
-            function toScreen(el, point) {
-                const m = el.getScreenCTM?.();
-                return m ? {x:m.a*point.x+m.c*point.y+m.e, y:m.b*point.x+m.d*point.y+m.f} : null;
-            }
-            function addCorner(el, x, y) {
-                const p = toScreen(el, {x,y});
-                if (p) corners.push(p);
-            }
-            // Keep hover work bounded for exceptionally complex imported groups.
-            geometryNodes.slice(0, 240).forEach(el => {
-                const tag = (el.tagName || '').toLowerCase();
-                try {
-                    if (tag === 'rect' || tag === 'image' || tag === 'text') {
-                        const b = el.getBBox();
-                        [[b.x,b.y],[b.x+b.width,b.y],[b.x+b.width,b.y+b.height],[b.x,b.y+b.height]].forEach(([x,y])=>addCorner(el,x,y));
-                    } else if (tag === 'line') {
-                        addCorner(el, Number(el.getAttribute('x1')||0), Number(el.getAttribute('y1')||0));
-                        addCorner(el, Number(el.getAttribute('x2')||0), Number(el.getAttribute('y2')||0));
-                    } else if (tag === 'polygon' || tag === 'polyline') {
-                        Array.from(el.points || []).forEach(point => addCorner(el, point.x, point.y));
-                    }
-
-                    if (typeof el.getTotalLength === 'function' && typeof el.getPointAtLength === 'function') {
-                        const length = el.getTotalLength();
-                        const ctm = el.getScreenCTM?.();
-                        const screenScale = ctm ? Math.max(Math.hypot(ctm.a,ctm.b), Math.hypot(ctm.c,ctm.d)) : 1;
-                        const steps = Math.max(12, Math.min(320, Math.ceil(length * screenScale / 4)));
-                        for (let i=0; i<=steps; i++) {
-                            const point = el.getPointAtLength(length * i / steps);
-                            const screenPoint = toScreen(el, point);
-                            if (screenPoint) boundary.push(screenPoint);
-                        }
-                    } else {
-                        // Images and text do not expose path length; sample their
-                        // actual four boundary segments instead of only corners.
-                        const b = el.getBBox();
-                        for (let i=0; i<=20; i++) {
-                            const t=i/20;
-                            [[b.x+b.width*t,b.y],[b.x+b.width,b.y+b.height*t],[b.x+b.width*(1-t),b.y+b.height],[b.x,b.y+b.height*(1-t)]].forEach(([x,y])=>{
-                                const point=toScreen(el,{x,y}); if(point) boundary.push(point);
-                            });
-                        }
-                    }
-                } catch (err) {}
-            });
-            const effectiveCorners = corners.length ? corners : (boundary.length
-                ? [
-                    boundary.reduce((best,p)=>p.x+p.y<best.x+best.y?p:best,boundary[0]),
-                    boundary.reduce((best,p)=>p.x-p.y>best.x-best.y?p:best,boundary[0]),
-                    boundary.reduce((best,p)=>p.x-p.y<best.x-best.y?p:best,boundary[0]),
-                    boundary.reduce((best,p)=>p.x+p.y>best.x+best.y?p:best,boundary[0])
-                ]
-                : [{x:left,y:top},{x:right,y:top},{x:left,y:bottom},{x:right,y:bottom}]);
-            const result = {
-                left, top, right, bottom,
-                boundary,
-                // Groups too complex to sample still get a safe bounding-box
-                // fallback; ordinary shapes use only their real vertices.
-                corners: effectiveCorners
+            const roots = getTopLevelEls(selectedEls).filter(el => liveSvg.contains(el));
+            if (!roots.length) return null;
+            let box, matrix;
+            try {
+                if (roots.length === 1) {
+                    box = roots[0].getBBox();
+                    matrix = roots[0].getScreenCTM();
+                } else {
+                    const bounds = roots.map(getElBoundsInSvg).filter(Boolean);
+                    if (!bounds.length) return null;
+                    const x = Math.min(...bounds.map(b => b.x)), y = Math.min(...bounds.map(b => b.y));
+                    box = {x, y, width:Math.max(...bounds.map(b => b.x+b.w))-x,
+                        height:Math.max(...bounds.map(b => b.y+b.h))-y};
+                    matrix = liveSvg.getScreenCTM();
+                }
+            } catch (_) { return null; }
+            if (!matrix) return null;
+            const toScreen = (x,y) => ({x:matrix.a*x+matrix.c*y+matrix.e, y:matrix.b*x+matrix.d*y+matrix.f});
+            const corners = [
+                toScreen(box.x,box.y), toScreen(box.x+box.width,box.y),
+                toScreen(box.x+box.width,box.y+box.height), toScreen(box.x,box.y+box.height)
+            ];
+            const center = {x:(corners[0].x+corners[2].x)/2, y:(corners[0].y+corners[2].y)/2};
+            const unit = (x,y,fallback) => {
+                const length = Math.hypot(x,y);
+                return length > 0.0001 ? {x:x/length,y:y/length} : fallback;
             };
-            selectedScreenGeometryCache = {key:cacheKey, value:result};
+            const axisX = unit(matrix.a,matrix.b,{x:1,y:0});
+            const axisY = unit(matrix.c,matrix.d,{x:0,y:1});
+            const cornerNames = ['nw','ne','se','sw'], sideNames = ['n','e','s','w'];
+            const handles = [];
+            const addHandle = (edge,point) => {
+                const dx=(edge.includes('e')?1:0)-(edge.includes('w')?1:0);
+                const dy=(edge.includes('s')?1:0)-(edge.includes('n')?1:0);
+                handles.push({...point,edge,angle:Math.atan2(axisX.y*dx+axisY.y*dy,axisX.x*dx+axisY.x*dy)*180/Math.PI});
+            };
+            corners.forEach((point,index) => {
+                addHandle(cornerNames[index],point);
+                const next=corners[(index+1)%4];
+                addHandle(sideNames[index],{x:(point.x+next.x)/2,y:(point.y+next.y)/2});
+            });
+            const rightHandle = handles.find(h => h.edge === 'e');
+            const rotation = {x:rightHandle.x+axisX.x*28,y:rightHandle.y+axisX.y*28};
+            const result = {
+                left:Math.min(...corners.map(p=>p.x)), top:Math.min(...corners.map(p=>p.y)),
+                right:Math.max(...corners.map(p=>p.x)), bottom:Math.max(...corners.map(p=>p.y)),
+                corners,center,handles,rotation
+            };
+            selectedScreenGeometryCache = {key:cacheKey,value:result};
             return result;
         }
 
         function selectedInteractionAt(clientX, clientY) {
+            const corner=editorTools?.cornerAt(clientX,clientY);
+            if(corner)return corner;
             const g = selectedScreenGeometry();
             if (!g) return null;
-            const cornerRadius = Math.min(9, Math.max(4, Math.min(g.right-g.left,g.bottom-g.top) * 0.18));
-            let nearestCorner = null;
-            g.corners.forEach(c => {
-                const distance = Math.hypot(clientX - c.x, clientY - c.y);
-                if (!nearestCorner || distance < nearestCorner.distance) nearestCorner = {...c, distance};
-            });
-            if (nearestCorner && nearestCorner.distance <= cornerRadius) {
-                return {type:'rotate'};
+            if (Math.hypot(clientX-g.rotation.x,clientY-g.rotation.y) <= 9) {
+                return {type:'rotate',handle:true};
             }
-            const edgeTolerance = 7;
-            let nearest = null;
-            g.boundary.forEach(point => {
-                const distance = Math.hypot(clientX-point.x, clientY-point.y);
-                if (!nearest || distance < nearest.distance) nearest={...point,distance};
+            let nearestHandle = null;
+            g.handles.forEach(handle => {
+                if (Math.abs(clientX-handle.x)>7 || Math.abs(clientY-handle.y)>7) return;
+                const distance=Math.hypot(clientX-handle.x,clientY-handle.y);
+                if (!nearestHandle || distance<nearestHandle.distance) nearestHandle={...handle,distance};
             });
-            if (!nearest || nearest.distance > edgeTolerance) return null;
-            const cx=(g.left+g.right)/2, cy=(g.top+g.bottom)/2;
-            const nx=(nearest.x-cx)/Math.max(1,g.right-g.left);
-            const ny=(nearest.y-cy)/Math.max(1,g.bottom-g.top);
-            const edge = Math.abs(nx) >= Math.abs(ny) ? (nx<0?'w':'e') : (ny<0?'n':'s');
-            return {type:'resize', edge};
+            if (nearestHandle) return {type:'resize',edge:nearestHandle.edge,angle:nearestHandle.angle,handle:true};
+            const edges=['n','e','s','w'];
+            let nearestEdge = null;
+            g.corners.forEach((point,index) => {
+                const next=g.corners[(index+1)%4],dx=next.x-point.x,dy=next.y-point.y;
+                const lengthSquared=dx*dx+dy*dy;
+                const t=lengthSquared ? Math.max(0,Math.min(1,((clientX-point.x)*dx+(clientY-point.y)*dy)/lengthSquared)) : 0;
+                const distance=Math.hypot(clientX-point.x-t*dx,clientY-point.y-t*dy);
+                if (!nearestEdge || distance<nearestEdge.distance) nearestEdge={edge:edges[index],distance};
+            });
+            if (!nearestEdge || nearestEdge.distance>4) return null;
+            return {type:'resize',edge:nearestEdge.edge,angle:g.handles.find(h=>h.edge===nearestEdge.edge).angle};
         }
 
         function cursorForInteraction(hit) {
             if (!hit) return currentTool === 'move' || spacebarDown ? 'grab' : 'default';
+            if (hit.type === 'corner') return 'crosshair';
             if (hit.type === 'rotate') return rotCursorUrl;
-            return hit.edge === 'n' || hit.edge === 's' ? 'ns-resize' : 'ew-resize';
+            const angle=Number.isFinite(hit.angle) ? hit.angle
+                : ({n:-90,s:90,e:0,w:180,ne:-45,nw:-135,se:45,sw:135}[hit.edge] || 0);
+            return ['ew-resize','nwse-resize','ns-resize','nesw-resize'][((Math.round(angle/45)%4)+4)%4];
         }
 
         function setCanvasInteractionCursor(hit) {
@@ -19847,6 +20024,7 @@ function renderRPanelUI(instance, container) {
         }
 
         function beginResizeInteraction(e) {
+            if (selectedEls.some(isElementLocked)) return;
             isResizing = true;
             resizeStartPt = { x: e.clientX, y: e.clientY };
             getTopLevelEls(selectedEls).forEach(preserveStrokeWidthDuringResize);
@@ -19854,10 +20032,13 @@ function renderRPanelUI(instance, container) {
                 resizeMulti = true;
                 resizeMultiData = [];
                 let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-                selectedEls.forEach(el => {
+                getTopLevelEls(selectedEls).forEach(el => {
                     const b = getElBoundsInSvg(el);
                     if (b) { minX=Math.min(minX,b.x); minY=Math.min(minY,b.y); maxX=Math.max(maxX,b.x+b.w); maxY=Math.max(maxY,b.y+b.h); }
-                    resizeMultiData.push({el, origTransform:el.getAttribute('transform')||'', origBBox:(()=>{try{return el.getBBox();}catch(err){return null;}})()});
+                    const parentCTM = el.parentNode?.getScreenCTM?.() || liveSvg.getScreenCTM();
+                    resizeMultiData.push({el, origTransform:el.getAttribute('transform')||'',
+                        svgToParent:parentCTM.inverse().multiply(liveSvg.getScreenCTM()),
+                        origBBox:(()=>{try{return el.getBBox();}catch(err){return null;}})()});
                 });
                 resizeGroupBounds = {x:minX,y:minY,w:maxX-minX,h:maxY-minY};
                 resizeOrigBBox = resizeGroupBounds;
@@ -19867,19 +20048,17 @@ function renderRPanelUI(instance, container) {
                 resizeOrigTransform = selectedEl.getAttribute('transform') || '';
                 resizeVisualBounds = getElBoundsInSvg(selectedEl);
                 try {
-                    const elCTM = selectedEl.getScreenCTM();
-                    const parentCTM = selectedEl.parentNode?.getScreenCTM?.() || liveSvg.getScreenCTM();
-                    resizeOrigCTM = elCTM && parentCTM ? parentCTM.inverse().multiply(elCTM) : null;
-                } catch(err) { resizeOrigCTM = null; }
+                    resizeScreenToLocal = selectedEl.getScreenCTM()?.inverse() || null;
+                } catch(err) { resizeScreenToLocal = null; }
             }
         }
 
         function beginRotateInteraction(e, pt) {
+            if (selectedEls.some(isElementLocked)) return;
             isRotating = true;
             const bounds = selectedScreenGeometry();
             const centerClient = {x:(bounds.left+bounds.right)/2, y:(bounds.top+bounds.bottom)/2};
-            const svgRect = viewport.getBoundingClientRect();
-            rotCenterPt = {x:(centerClient.x-svgRect.left)/scale, y:(centerClient.y-svgRect.top)/scale};
+            rotCenterPt = getPointInSvg({clientX:centerClient.x,clientY:centerClient.y});
             rotStartAngle = Math.atan2(pt.y-rotCenterPt.y, pt.x-rotCenterPt.x);
             const svgCTM = liveSvg.getScreenCTM();
             rotOrigTransforms = selectedEls.map(el => {
@@ -19922,6 +20101,11 @@ function renderRPanelUI(instance, container) {
         }
 
         function getPointInSvg(e) {
+            const matrix=liveSvg?.getScreenCTM();
+            if (matrix) {
+                const inverse=matrix.inverse();
+                return {x:inverse.a*e.clientX+inverse.c*e.clientY+inverse.e,y:inverse.b*e.clientX+inverse.d*e.clientY+inverse.f};
+            }
             const rect = viewport.getBoundingClientRect();
             return {
                 x: (e.clientX - rect.left) / scale,
@@ -19935,8 +20119,14 @@ function renderRPanelUI(instance, container) {
 
         function collectMarqueeHits(mx, my, mw, mh) {
             if (!liveSvg || mw <= 0 || mh <= 0) return [];
+            if (marqueeCandidates) {
+                const tolerance=Math.max(.5,1/Math.max(.05,scale||1));
+                return marqueeCandidates.filter(({b})=>b&&rectsIntersect(mx-tolerance,my-tolerance,mw+tolerance*2,mh+tolerance*2,b.x,b.y,b.w,b.h)).map(({el})=>el);
+            }
             const hits=[];
             const seen=new Set();
+            const candidates=[];
+            const selectionScope=editorTools?.isolation()||liveSvg;
             const tolerance=Math.max(0.5,1/Math.max(0.05,scale||1));
             // Touch selection: an element is selected as soon as its visual bounds
             // intersect the marquee. Structural imported <g> containers remain
@@ -19949,30 +20139,37 @@ function renderRPanelUI(instance, container) {
             // Imported SVG <g> nodes are structural containers and often span the
             // entire figure. Never include them as marquee candidates. Only groups
             // explicitly created by the user participate as one selectable object.
-            liveSvg.querySelectorAll('g[data-user-group="true"]').forEach(group=>{
+            selectionScope.querySelectorAll('g[data-user-group="true"]').forEach(group=>{
                 if(group.closest('defs,clipPath,mask')||group.getAttribute('visibility')==='hidden')return;
                 const parentUserGroup=group.parentElement?.closest?.('g[data-user-group="true"]');
-                if(parentUserGroup)return;
+                if(parentUserGroup&&parentUserGroup!==selectionScope)return;
                 const b=getElBoundsInSvg(group);
+                candidates.push({el:group,b});
                 if(touchesMarquee(b)){hits.push(group);seen.add(group);}
             });
 
             const leafSelector='rect,circle,ellipse,line,text,path,polyline,polygon,image';
-            liveSvg.querySelectorAll(leafSelector).forEach(el=>{
+            selectionScope.querySelectorAll(leafSelector).forEach(el=>{
                 if(seen.has(el)||el.closest('defs,clipPath,mask'))return;
                 if(el.getAttribute('visibility')==='hidden'||el.getAttribute('data-role')==='background')return;
                 // Children of a user-created group are represented by that group,
                 // preventing both parent and descendants from being selected.
-                if(el.closest('g[data-user-group="true"]'))return;
+                const ownerGroup=el.closest('g[data-user-group="true"]');
+                if(ownerGroup&&ownerGroup!==selectionScope)return;
                 const b=getElBoundsInSvg(el);
+                candidates.push({el,b});
                 if(touchesMarquee(b)){hits.push(el);seen.add(el);}
             });
+            marqueeCandidates=candidates;
             return hits;
         }
 
         canvasWrap.addEventListener('mousedown', (e) => {
             if (e.button !== 0) return; // only left button
+            if (!liveSvg) return;
+            if (e.target.closest('.ve-workbench-panel,.ve-confirm')) return;
             pointerFrame.flush();
+            marqueeBoundsCache=null;marqueeCandidates=null;
 
             // Close any open inline text editor when clicking outside it
             const openEditor = overlay.querySelector('.r-ve-inline-editor');
@@ -19983,9 +20180,8 @@ function renderRPanelUI(instance, container) {
 
             const pt = getPointInSvg(e);
 
-            // Text-body presses take priority over the selected outline. This keeps
-            // dragging easy at every zoom while resize/rotate remains available in
-            // the narrow area immediately outside the glyph bounds.
+            // Text-body presses move/edit text; explicit frame controls take
+            // priority when the pointer is over a resize or rotation handle.
             let textDownTarget = null;
             let repeatedTextClick = false;
             if (currentTool === 'select' && !spacebarDown) {
@@ -20012,8 +20208,13 @@ function renderRPanelUI(instance, container) {
                     : null;
             }
 
-            const interaction = currentTool === 'select' && !spacebarDown && selectedEls.length && !textDownTarget
+            const selectionHit = currentTool === 'select' && !spacebarDown && selectedEls.length
                 ? selectedInteractionAt(e.clientX, e.clientY) : null;
+            const interaction = selectionHit && (!textDownTarget || selectionHit.handle) ? selectionHit : null;
+            if(interaction?.type==='corner'){
+                setCanvasInteractionCursor(interaction);editorTools.beginCorner(interaction.index,e);
+                e.preventDefault();e.stopPropagation();return;
+            }
             if (interaction?.type === 'resize') {
                 activeEdge = interaction.edge;
                 setCanvasInteractionCursor(interaction);
@@ -20055,16 +20256,21 @@ function renderRPanelUI(instance, container) {
                 // hover highlight can be followed by selection of an underlying
                 // rect/group, so the expected text selection box never appears.
                 const target = textDownTarget || findEditableTargetAtPointer(e);
+                dragAxisLock = null;
+                dragShiftToggle = null;
                 if (target) {
                     if (e.shiftKey && selectedEls.length > 0) {
-                        // Shift+click: toggle add/remove from multi-selection
+                        // Defer removal until release so Shift can also constrain dragging.
                         const idx = selectedEls.indexOf(target);
-                        if (idx >= 0) { selectedEls.splice(idx, 1); } else { selectedEls.push(target); }
-                        multiSelect([...selectedEls]);
-                        e.preventDefault();
-                        return;
+                        if (isElementLocked(target)) {
+                            multiSelect(idx >= 0 ? selectedEls.filter(el => el !== target) : [...selectedEls,target]);
+                            e.preventDefault();
+                            return;
+                        }
+                        if (idx >= 0) dragShiftToggle = target;
+                        else multiSelect([...selectedEls,target]);
                     }
-                    if (target.getAttribute('data-locked') === 'true') {
+                    if (isElementLocked(target)) {
                         selectElement(target);
                         e.preventDefault();
                         return; // locked — no drag
@@ -20098,6 +20304,7 @@ function renderRPanelUI(instance, container) {
                     deselectAll();
                     // Start marquee selection
                     isMarquee = true;
+                    marqueeBoundsCache=new Map();
                     marqueeStartPt = pt;
                     if (marqueeRect) {
                         marqueeRect.setAttribute('x', pt.x); marqueeRect.setAttribute('y', pt.y);
@@ -20154,31 +20361,19 @@ function renderRPanelUI(instance, container) {
                 e.preventDefault();
                 e.stopPropagation(); // prevent click from bubbling to overlay (would close editor)
                 return;
-            } else if (currentTool === 'pen') {
-                tempEl = document.createElementNS(ns, 'polyline');
-                tempEl.setAttribute('fill', 'none'); tempEl.setAttribute('stroke', curStroke);
-                tempEl.setAttribute('stroke-width', strokeWidthInput.value); tempEl.setAttribute('opacity', curOpacity);
-                tempEl.setAttribute('stroke-linecap', 'round'); tempEl.setAttribute('stroke-linejoin', 'round');
-                tempEl.setAttribute('vector-effect', 'non-scaling-stroke');
-                tempEl.setAttribute('points', `${pt.x},${pt.y}`);
-                liveSvg.appendChild(tempEl);
             }
             e.preventDefault();
         });
 
         const pointerFrame = latestFrame(e => handleCanvasMove(e));
-        canvasWrap.addEventListener('mousemove', e => {
-            // Freehand input retains every sample. Other tools need the latest
-            // position once per frame, including a final flush before mouseup.
-            if (currentTool === 'pen' && isDrawing) handleCanvasMove(e);
-            else pointerFrame.schedule(e);
-        });
+        canvasWrap.addEventListener('mousemove', e => pointerFrame.schedule(e));
         function handleCanvasMove(e) {
+            if (e.target?.closest?.('.ve-workbench-panel,.ve-confirm')) return;
             if (!isPanning && !isResizing && !isRotating && !isDragging && !isDrawing && !isMarquee && currentTool === 'select') {
-                // Inside a selected text's actual body the pointer means select/move.
-                // Resize/rotate cursors remain available immediately outside it.
+                // Keep text-body movement except at explicit frame controls.
                 const textBodyTarget = findTextTargetAtPoint(e.clientX, e.clientY, true);
-                setCanvasInteractionCursor(textBodyTarget ? null : selectedInteractionAt(e.clientX, e.clientY));
+                const selectionHit = selectedInteractionAt(e.clientX, e.clientY);
+                setCanvasInteractionCursor(textBodyTarget && !selectionHit?.handle ? null : selectionHit);
                 const hoverTarget=findEditableTargetAtPointer(e);
                 setHoveredElement(hoverTarget&&hoverTarget.getAttribute('data-role')!=='background'?hoverTarget:null);
             } else if (hoveredEl) {
@@ -20199,26 +20394,11 @@ function renderRPanelUI(instance, container) {
                 let dx, dy;
 
                 // Always project screen delta into the coordinate space appropriate for the element
-                if (!resizeMulti && resizeOrigCTM) {
-                    // For single element (possibly rotated): project delta into element's local space
-                    const m = resizeOrigCTM;
-                    const det = m.a * m.d - m.b * m.c;
-                    let dxSvg, dySvg;
-                    if (svgCTM) {
-                        const inv = svgCTM.inverse();
-                        dxSvg = inv.a * dxS + inv.c * dyS;
-                        dySvg = inv.b * dxS + inv.d * dyS;
-                    } else {
-                        dxSvg = dxS / scale;
-                        dySvg = dyS / scale;
-                    }
-                    if (Math.abs(det) > 1e-6) {
-                        dx = (m.d * dxSvg - m.c * dySvg) / det;
-                        dy = (-m.b * dxSvg + m.a * dySvg) / det;
-                    } else {
-                        dx = dxSvg;
-                        dy = dySvg;
-                    }
+                if (!resizeMulti && resizeScreenToLocal) {
+                    // Include nested group transforms so the handle follows the pointer.
+                    const m = resizeScreenToLocal;
+                    dx = m.a * dxS + m.c * dyS;
+                    dy = m.b * dxS + m.d * dyS;
                 } else {
                     if (svgCTM) {
                         const inv = svgCTM.inverse();
@@ -20234,17 +20414,21 @@ function renderRPanelUI(instance, container) {
                 const origW = (resizeMulti ? resizeGroupBounds.w : resizeOrigBBox.width) || 1;
                 const origH = (resizeMulti ? resizeGroupBounds.h : resizeOrigBBox.height) || 1;
 
-                const horizontalEdge = activeEdge === 'e' || activeEdge === 'w';
-                const verticalEdge = activeEdge === 'n' || activeEdge === 's';
+                const horizontalEdge = activeEdge.includes('e') || activeEdge.includes('w');
+                const verticalEdge = activeEdge.includes('n') || activeEdge.includes('s');
                 const rawSx = horizontalEdge
-                    ? Math.max(0.05, (origW + (activeEdge === 'w' ? -dx : dx)) / origW)
+                    ? Math.max(0.05, (origW + (activeEdge.includes('w') ? -dx : dx)) / origW)
                     : 1;
                 const rawSy = verticalEdge
-                    ? Math.max(0.05, (origH + (activeEdge === 'n' ? -dy : dy)) / origH)
+                    ? Math.max(0.05, (origH + (activeEdge.includes('n') ? -dy : dy)) / origH)
                     : 1;
-                // Shift keeps proportions even though the pointer originates from
-                // a side edge.  Without Shift, only the hovered dimension changes.
-                const proportionalScale = e.shiftKey ? (horizontalEdge ? rawSx : rawSy) : null;
+                // Side handles change one dimension; corner handles change both.
+                // Shift keeps proportions, using the dominant corner movement.
+                const proportionalScale = e.shiftKey
+                    ? (horizontalEdge && verticalEdge
+                        ? (Math.abs(rawSx-1)>Math.abs(rawSy-1) ? rawSx : rawSy)
+                        : (horizontalEdge ? rawSx : rawSy))
+                    : null;
                 const finalSx = proportionalScale === null ? rawSx : proportionalScale;
                 const finalSy = proportionalScale === null ? rawSy : proportionalScale;
 
@@ -20261,20 +20445,22 @@ function renderRPanelUI(instance, container) {
 
                 if (resizeMulti) {
                     // Scale around the edge opposite the one being dragged.
-                    const gx = activeEdge === 'w' ? resizeGroupBounds.x + resizeGroupBounds.w : resizeGroupBounds.x;
-                    const gy = activeEdge === 'n' ? resizeGroupBounds.y + resizeGroupBounds.h : resizeGroupBounds.y;
+                    const gx = activeEdge.includes('w') ? resizeGroupBounds.x + resizeGroupBounds.w : resizeGroupBounds.x;
+                    const gy = activeEdge.includes('n') ? resizeGroupBounds.y + resizeGroupBounds.h : resizeGroupBounds.y;
+                    const scaling = liveSvg.createSVGMatrix().translate(gx,gy)
+                        .scaleNonUniform(finalSx,finalSy).translate(-gx,-gy);
                     resizeMultiData.forEach(d => {
-                        const b = d.origBBox;
-                        if (!b) return;
-                        const ox = b.x, oy = b.y;
+                        if (!d.origBBox) return;
+                        // One SVG-space frame can span elements in different groups.
+                        const m = d.svgToParent.multiply(scaling).multiply(d.svgToParent.inverse());
                         d.el.setAttribute('transform',
-                            `translate(${gx}, ${gy}) scale(${finalSx}, ${finalSy}) translate(${-gx}, ${-gy}) ${d.origTransform}`);
+                            `matrix(${m.a},${m.b},${m.c},${m.d},${m.e},${m.f}) ${d.origTransform}`);
                     });
                     refreshSelectionHighlights();
                 } else if (selectedEl) {
                     // Single element resize: apply scale in element's local space
-                    const ox = activeEdge === 'w' ? resizeOrigBBox.x + resizeOrigBBox.width : resizeOrigBBox.x;
-                    const oy = activeEdge === 'n' ? resizeOrigBBox.y + resizeOrigBBox.height : resizeOrigBBox.y;
+                    const ox = activeEdge.includes('w') ? resizeOrigBBox.x + resizeOrigBBox.width : resizeOrigBBox.x;
+                    const oy = activeEdge.includes('n') ? resizeOrigBBox.y + resizeOrigBBox.height : resizeOrigBBox.y;
                     selectedEl.setAttribute('transform',
                         `${resizeOrigTransform} translate(${ox}, ${oy}) scale(${finalSx}, ${finalSy}) translate(${-ox}, ${-oy})`);
                     // Update selection box to follow during drag (use showSelBoxForElement)
@@ -20314,6 +20500,19 @@ function renderRPanelUI(instance, container) {
                 dragMoved = true;
                 pendingTextEdit = null;
                 lastTextClick = null;
+                if (!e.shiftKey) dragAxisLock = null;
+                else if (!dragAxisLock) dragAxisLock = Math.abs(dxScreen) >= Math.abs(dyScreen) ? 'horizontal' : 'vertical';
+                let moveX=dxScreen,moveY=dyScreen;
+                if (dragAxisLock === 'horizontal') moveY = 0;
+                if (dragAxisLock === 'vertical') moveX = 0;
+                if (editorTools) {
+                    const rootCTM=liveSvg.getScreenCTM(), inverse=rootCTM.inverse();
+                    const snapped=editorTools.snapDrag(dragRoots,inverse.a*moveX+inverse.c*moveY,inverse.b*moveX+inverse.d*moveY,e.altKey,dragAxisLock);
+                    moveX=rootCTM.a*snapped.dx+rootCTM.c*snapped.dy;
+                    moveY=rootCTM.b*snapped.dx+rootCTM.d*snapped.dy;
+                }
+                if (dragAxisLock === 'horizontal') moveY = 0;
+                if (dragAxisLock === 'vertical') moveX = 0;
                 dragRoots.forEach(sel => {
                     const orig = sel._origTransform || '';
                     const parentNode = sel.parentNode;
@@ -20323,11 +20522,11 @@ function renderRPanelUI(instance, container) {
                     let dxLocal, dyLocal;
                     if (parentCTM) {
                         const inv = parentCTM.inverse();
-                        dxLocal = inv.a * dxScreen + inv.c * dyScreen;
-                        dyLocal = inv.b * dxScreen + inv.d * dyScreen;
+                        dxLocal = inv.a * moveX + inv.c * moveY;
+                        dyLocal = inv.b * moveX + inv.d * moveY;
                     } else {
-                        dxLocal = dxScreen / scale;
-                        dyLocal = dyScreen / scale;
+                        dxLocal = moveX / scale;
+                        dyLocal = moveY / scale;
                     }
                     sel.setAttribute('transform', `translate(${dxLocal}, ${dyLocal}) ${orig}`);
                 });
@@ -20428,10 +20627,6 @@ function renderRPanelUI(instance, container) {
                 }
             } else if (currentTool === 'line') {
                 tempEl.setAttribute('x2', axisPoint.x); tempEl.setAttribute('y2', axisPoint.y);
-            } else if (currentTool === 'pen') {
-                const point = liveSvg.createSVGPoint();
-                point.x = axisPoint.x; point.y = axisPoint.y;
-                tempEl.points.appendItem(point);
             }
         }
 
@@ -20439,6 +20634,7 @@ function renderRPanelUI(instance, container) {
 
         canvasWrap.addEventListener('mouseup', () => {
             pointerFrame.flush();
+            editorTools?.clearGuides();
             if (isPanning) {
                 isPanning = false;
                 setCanvasInteractionCursor(null);
@@ -20450,7 +20646,7 @@ function renderRPanelUI(instance, container) {
                 setCanvasInteractionCursor(null);
                 resizeOrigBBox = null;
                 resizeVisualBounds = null;
-                resizeOrigCTM = null;
+                resizeScreenToLocal = null;
                 // Bake the compound transform into a local matrix (relative to liveSvg, not absolute CTM)
                 if (resizeMulti && selectedEls.length > 0) {
                     selectedEls.forEach(el => {
@@ -20489,6 +20685,9 @@ function renderRPanelUI(instance, container) {
                 return;
             }
             if (isDragging) {
+                const shiftToggle = !dragMoved ? dragShiftToggle : null;
+                dragAxisLock = null;
+                dragShiftToggle = null;
                 const editRequest = !dragMoved ? pendingTextEdit : null;
                 const clickedText = !dragMoved && textPointerPress?.textNode && liveSvg.contains(textPointerPress.textNode)
                     ? textPointerPress.textNode
@@ -20508,7 +20707,9 @@ function renderRPanelUI(instance, container) {
                 }
                 pendingTextEdit = null;
                 textPointerPress = null;
-                if (editRequest?.textNode && liveSvg.contains(editRequest.textNode)) {
+                if (shiftToggle) {
+                    multiSelect(selectedEls.filter(el => el !== shiftToggle));
+                } else if (editRequest?.textNode && liveSvg.contains(editRequest.textNode)) {
                     selectElement(editRequest.textNode);
                     syncPropsFromElement(editRequest.textNode);
                     startInlineTextEdit(editRequest.svgPt, editRequest.textNode);
@@ -20536,6 +20737,7 @@ function renderRPanelUI(instance, container) {
                         if (hits.length > 0) multiSelect(hits);
                     }
                 }
+                marqueeBoundsCache=null;marqueeCandidates=null;
                 return;
             }
             if (isDrawing) {
@@ -20545,13 +20747,22 @@ function renderRPanelUI(instance, container) {
             }
         });
 
-        // Double-click: edit text inline
+        // Double-click selects anchors for shapes; text keeps inline editing.
         canvasWrap.addEventListener('dblclick', (e) => {
             if (currentTool !== 'select') return;
+            if (e.target.closest('.ve-workbench-panel,.ve-confirm')) return;
             if (overlay.querySelector('.r-ve-inline-editor')) {
                 e.preventDefault();
                 e.stopPropagation();
                 return;
+            }
+            const shape=e.target.closest?.('path,rect,circle,ellipse,line,polyline,polygon');
+            if(shape&&liveSvg?.contains(shape)&&shape.getAttribute('data-role')!=='background'&&
+                !shape.closest('defs,clipPath,mask')&&!isElementLocked(shape)&&
+                selectedEls.some(el=>el===shape||el.contains(shape))){
+                selectElement(shape);
+                activateCanvasTool('anchor');
+                e.preventDefault();e.stopPropagation();return;
             }
             if (beginInlineTextEditAtPointer(e)) {
                 e.preventDefault();
@@ -20596,6 +20807,7 @@ function renderRPanelUI(instance, container) {
 
         // Wheel zoom
         canvasWrap.addEventListener('wheel', (e) => {
+            if (e.target.closest('.ve-workbench-panel')) return;
             e.preventDefault();
             const d = e.deltaY > 0 ? 0.9 : 1.1;
             const rect = canvasWrap.getBoundingClientRect();
@@ -20608,8 +20820,33 @@ function renderRPanelUI(instance, container) {
 
         // Keyboard
         let spacebarDown = false;
+        let ctrlTap=false;
+        const blocksCtrlTap=target=>target?.closest?.('input,textarea,select,[contenteditable="true"],dialog')||document.querySelector('.ve-confirm,dialog[open]');
+        listen(window,'keydown',event=>{
+            if(event.key!=='Control'){ctrlTap=false;return;}
+            if(!event.repeat)ctrlTap=!event.altKey&&!event.shiftKey&&!event.metaKey&&!blocksCtrlTap(event.target)&&!isDrawing&&!isDragging&&!isResizing&&!isRotating&&!isPanning&&!isMarquee&&!editorTools?.roundingActive();
+        },{capture:true});
+        listen(window,'keyup',event=>{
+            const switchToSelect=event.key==='Control'&&ctrlTap&&!blocksCtrlTap(event.target);
+            ctrlTap=false;
+            if(switchToSelect)activateCanvasTool('select');
+        },{capture:true});
+        for(const type of ['mousedown','pointerdown','wheel','blur'])listen(window,type,()=>{ctrlTap=false;},{capture:true});
         const keyHandler = (e) => {
             if (!document.body.contains(overlay)) { document.removeEventListener('keydown', keyHandler); document.removeEventListener('keyup', keyUpHandler); return; }
+            if (overlay.querySelector('.ve-confirm')) return;
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); editorTools?.save().catch(error=>rlog(error.message)); return; }
+            // Toolbar focus must not swallow document undo; text fields keep native editing undo.
+            const editingText = e.target.closest?.('input,textarea,[contenteditable="true"]');
+            const historyKey = e.key.toLowerCase();
+            if (!editingText && !e.isComposing && !e.altKey && (e.ctrlKey || e.metaKey) && (historyKey === 'z' || historyKey === 'y')) {
+                e.preventDefault();
+                e.stopPropagation();
+                if (historyKey === 'y' || e.shiftKey) redo();
+                else undo();
+                return;
+            }
+            if (e.target.closest?.('.ve-advanced-controls,.ve-pen-menu,.ve-shape-menu,.r-ve-swatches,.r-ve-paint-trigger')) return;
             // Ignore spacebar when typing in text editor
             if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
             if (e.key === ' ' && !spacebarDown) {
@@ -20618,8 +20855,6 @@ function renderRPanelUI(instance, container) {
                 e.preventDefault();
                 return;
             }
-            if (e.ctrlKey && e.key === 'z') { e.preventDefault(); undo(); }
-            if (e.ctrlKey && e.key === 'y') { e.preventDefault(); redo(); }
             if (e.ctrlKey && e.key === 'c') {
                 if (selectedEls.length > 1) { clipboardEls = selectedEls.map(el => el.cloneNode(true)); clipboardEl = null; }
                 else if (selectedEl) { clipboardEl = selectedEl.cloneNode(true); clipboardEls = null; }
@@ -20628,7 +20863,7 @@ function renderRPanelUI(instance, container) {
             if (e.ctrlKey && e.key === 'd') { e.preventDefault(); execCtxAction('dup'); }
             if (e.ctrlKey && e.shiftKey && (e.key === 'g' || e.key === 'G')) { e.preventDefault(); ungroupSelected(); }
             else if (e.ctrlKey && (e.key === 'g' || e.key === 'G')) { e.preventDefault(); groupSelected(); }
-            if ((e.key === 'Delete' || e.key === 'Backspace') && (selectedEl || selectedEls.length > 0)) { e.preventDefault(); deleteSelected(); }
+            if ((e.key === 'Delete' || e.key === 'Backspace') && (selectedEl || selectedEls.length > 0 || editorTools?.hasSelectedGuide())) { e.preventDefault(); deleteSelected(); }
             if (e.key === 'Escape') { deselectAll(); hideContextMenu(); }
         };
         const keyUpHandler = (e) => {
@@ -20648,6 +20883,7 @@ function renderRPanelUI(instance, container) {
         overlay.querySelector('.r-ve-export-unified-btn').onclick = () => showUnifiedExportDialog();
 
         function showUnifiedExportDialog() {
+            editorTools?.finishPath();
             deselectAll();
             if (!liveSvg) return;
             const svgClone = liveSvg.cloneNode(true);
@@ -20659,53 +20895,53 @@ function renderRPanelUI(instance, container) {
             const dpiOptions = [72, 96, 150, 200, 300, 600];
 
             const dlg = document.createElement('div');
-            dlg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:90000;display:flex;align-items:center;justify-content:center;animation:fadeIn .15s;pointer-events:auto;';
+            dlg.style.cssText = 'position:fixed;inset:0;background:rgba(38,56,75,.16);z-index:90000;display:flex;align-items:center;justify-content:center;animation:fadeIn .15s;pointer-events:auto;';
             dlg.innerHTML = `
-                <div style="background:#2d2d2d;border-radius:10px;box-shadow:0 12px 48px rgba(0,0,0,0.6);max-width:720px;width:92%;overflow:hidden;">
-                    <div style="padding:14px 18px;background:#1a1a2e;border-bottom:1px solid #444;display:flex;align-items:center;justify-content:space-between;">
-                        <span style="color:#90caf9;font-weight:700;font-size:14px;"><i class="fas fa-file-export"></i> ${isZh?'导出预览':'Export Preview'}</span>
-                        <button class="r-ve-export-dlg-close" style="background:none;border:none;color:#999;cursor:pointer;font-size:16px;padding:4px;"><i class="fas fa-times"></i></button>
+                <div style="background:var(--ve-surface);border-radius:10px;box-shadow:0 12px 48px rgba(38,56,75,.16);max-width:720px;width:92%;overflow:hidden;">
+                    <div style="padding:14px 18px;background:var(--ve-control);border-bottom:1px solid var(--ve-border);display:flex;align-items:center;justify-content:space-between;">
+                        <span style="color:var(--ve-accent);font-weight:700;font-size:14px;"><i class="fas fa-file-export"></i> ${isZh?'导出预览':'Export Preview'}</span>
+                        <button class="r-ve-export-dlg-close" style="background:none;border:none;color:var(--ve-muted);cursor:pointer;font-size:16px;padding:4px;"><i class="fas fa-times"></i></button>
                     </div>
                     <div style="padding:18px;display:flex;gap:20px;align-items:flex-start;">
                         <div style="flex:1;min-width:0;">
-                            <div style="color:#aaa;font-size:11px;margin-bottom:6px;">${isZh?'预览':'Preview'}</div>
-                            <div class="r-ve-export-preview" style="background:#1e1e1e;border:1px solid #444;border-radius:6px;overflow:hidden;display:flex;align-items:center;justify-content:center;min-height:220px;max-height:420px;position:relative;">
+                            <div style="color:var(--ve-muted);font-size:11px;margin-bottom:6px;">${isZh?'预览':'Preview'}</div>
+                            <div class="r-ve-export-preview" style="background:var(--ve-canvas);border:1px solid var(--ve-border);border-radius:6px;overflow:hidden;display:flex;align-items:center;justify-content:center;min-height:220px;max-height:420px;position:relative;">
                                 <canvas class="r-ve-export-canvas" style="max-width:100%;max-height:420px;image-rendering:auto;"></canvas>
-                                <div class="r-ve-export-loading" style="position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,0.4);color:#90caf9;font-size:13px;"><i class="fas fa-spinner fa-spin"></i> ${isZh?'渲染中…':'Rendering…'}</div>
+                                <div class="r-ve-export-loading" style="position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(38,56,75,.16);color:var(--ve-accent);font-size:13px;"><i class="fas fa-spinner fa-spin"></i> ${isZh?'渲染中…':'Rendering…'}</div>
                             </div>
-                            <div class="r-ve-export-size-info" style="color:#666;font-size:11px;margin-top:6px;text-align:center;"></div>
+                            <div class="r-ve-export-size-info" style="color:var(--ve-muted);font-size:11px;margin-top:6px;text-align:center;"></div>
                         </div>
                         <div style="width:195px;flex-shrink:0;">
-                            <div style="color:#aaa;font-size:11px;margin-bottom:8px;">${isZh?'导出设置':'Export Settings'}</div>
-                            <label style="color:#ccc;font-size:12px;display:block;margin-bottom:4px;">${isZh?'文件格式':'Format'}:</label>
-                            <select class="r-ve-export-fmt" style="width:100%;background:#333;color:#ccc;border:1px solid #555;border-radius:4px;padding:6px 8px;font-size:13px;cursor:pointer;margin-bottom:12px;">
+                            <div style="color:var(--ve-muted);font-size:11px;margin-bottom:8px;">${isZh?'导出设置':'Export Settings'}</div>
+                            <label style="color:var(--ve-text);font-size:12px;display:block;margin-bottom:4px;">${isZh?'文件格式':'Format'}:</label>
+                            <select class="r-ve-export-fmt" style="width:100%;background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:4px;padding:6px 8px;font-size:13px;cursor:pointer;margin-bottom:12px;">
                                 ${formats.map(fm => `<option value="${fm}" ${fm==='tif'?'selected':''}>${fm.toUpperCase()}${fm==='tif'?' ('+(isZh?'默认':'Default')+')':''}</option>`).join('')}
                             </select>
                             <div class="r-ve-export-dpi-group">
-                                <label style="color:#ccc;font-size:12px;display:block;margin-bottom:4px;">DPI:</label>
-                                <input type="number" class="r-ve-export-dpi" value="300" min="36" max="2400" step="1" style="width:100%;background:#333;color:#ccc;border:1px solid #555;border-radius:4px;padding:6px 8px;font-size:13px;margin-bottom:6px;box-sizing:border-box;" />
+                                <label style="color:var(--ve-text);font-size:12px;display:block;margin-bottom:4px;">DPI:</label>
+                                <input type="number" class="r-ve-export-dpi" value="300" min="36" max="2400" step="1" style="width:100%;background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:4px;padding:6px 8px;font-size:13px;margin-bottom:6px;box-sizing:border-box;" />
                                 <div class="r-ve-dpi-presets" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:12px;">
-                                    ${dpiOptions.map(d => `<button class="r-ve-dpi-preset" data-dpi="${d}" style="flex:1;min-width:40px;padding:3px 0;background:${d===300?'#1976d2':'#444'};color:${d===300?'#fff':'#bbb'};border:1px solid ${d===300?'#1976d2':'#555'};border-radius:3px;font-size:11px;cursor:pointer;transition:.15s;">${d}</button>`).join('')}
+                                    ${dpiOptions.map(d => `<button class="r-ve-dpi-preset" data-dpi="${d}" style="flex:1;min-width:40px;padding:3px 0;background:${d===300?'#1976d2':'var(--ve-control)'};color:${d===300?'#fff':'var(--ve-text)'};border:1px solid ${d===300?'#1976d2':'var(--ve-border)'};border-radius:3px;font-size:11px;cursor:pointer;transition:.15s;">${d}</button>`).join('')}
                                 </div>
                             </div>
                             <div class="r-ve-export-size-group" style="margin-bottom:12px;">
-                                <label style="color:#ccc;font-size:12px;display:block;margin-bottom:4px;">${isZh?'尺寸 (英寸)':'Size (inches)'}:</label>
+                                <label style="color:var(--ve-text);font-size:12px;display:block;margin-bottom:4px;">${isZh?'尺寸 (英寸)':'Size (inches)'}:</label>
                                 <div style="display:flex;gap:4px;align-items:center;">
-                                    <input type="number" class="r-ve-export-inch-w" step="0.1" min="0.5" max="200" style="flex:1;width:0;background:#333;color:#ccc;border:1px solid #555;border-radius:4px;padding:5px 6px;font-size:12px;box-sizing:border-box;" />
-                                    <span style="color:#666;font-size:12px;">×</span>
-                                    <input type="number" class="r-ve-export-inch-h" step="0.1" min="0.5" max="200" style="flex:1;width:0;background:#333;color:#ccc;border:1px solid #555;border-radius:4px;padding:5px 6px;font-size:12px;box-sizing:border-box;" />
-                                    <button class="r-ve-lock-ratio" title="${isZh?'锁定宽高比':'Lock aspect ratio'}" style="background:none;border:1px solid #555;border-radius:4px;color:#90caf9;cursor:pointer;padding:3px 6px;font-size:12px;line-height:1;">
+                                    <input type="number" class="r-ve-export-inch-w" step="0.1" min="0.5" max="200" style="flex:1;width:0;background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:4px;padding:5px 6px;font-size:12px;box-sizing:border-box;" />
+                                    <span style="color:var(--ve-muted);font-size:12px;">×</span>
+                                    <input type="number" class="r-ve-export-inch-h" step="0.1" min="0.5" max="200" style="flex:1;width:0;background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:4px;padding:5px 6px;font-size:12px;box-sizing:border-box;" />
+                                    <button class="r-ve-lock-ratio" title="${isZh?'锁定宽高比':'Lock aspect ratio'}" style="background:none;border:1px solid var(--ve-border);border-radius:4px;color:var(--ve-accent);cursor:pointer;padding:3px 6px;font-size:12px;line-height:1;">
                                         <i class="fas fa-lock"></i>
                                     </button>
                                 </div>
                             </div>
-                            <label style="color:#ccc;font-size:12px;display:block;margin-bottom:4px;">${isZh?'输出尺寸':'Output Size'}:</label>
-                            <div class="r-ve-export-dims" style="color:#90caf9;font-size:13px;font-weight:600;margin-bottom:12px;">—</div>
+                            <label style="color:var(--ve-text);font-size:12px;display:block;margin-bottom:4px;">${isZh?'输出尺寸':'Output Size'}:</label>
+                            <div class="r-ve-export-dims" style="color:var(--ve-accent);font-size:13px;font-weight:600;margin-bottom:12px;">—</div>
                             <div class="r-ve-export-bg-group" style="display:none;margin-bottom:12px;">
-                                <label style="color:#ccc;font-size:12px;display:block;margin-bottom:4px;">${isZh?'背景':'Background'}:</label>
+                                <label style="color:var(--ve-text);font-size:12px;display:block;margin-bottom:4px;">${isZh?'背景':'Background'}:</label>
                                 <div style="display:flex;gap:4px;">
                                     <button class="r-ve-bg-opt" data-bg="white" style="flex:1;padding:5px;background:#1976d2;color:#fff;border:1px solid #1976d2;border-radius:3px;cursor:pointer;font-size:11px;">${isZh?'白色':'White'}</button>
-                                    <button class="r-ve-bg-opt" data-bg="transparent" style="flex:1;padding:5px;background:#444;color:#bbb;border:1px solid #555;border-radius:3px;cursor:pointer;font-size:11px;">${isZh?'透明':'Transparent'}</button>
+                                    <button class="r-ve-bg-opt" data-bg="transparent" style="flex:1;padding:5px;background:var(--ve-control);color:var(--ve-text);border:1px solid var(--ve-border);border-radius:3px;cursor:pointer;font-size:11px;">${isZh?'透明':'Transparent'}</button>
                                 </div>
                             </div>
                             <button class="r-ve-export-confirm" style="width:100%;padding:10px;background:#1976d2;color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;transition:.15s;">
@@ -20728,10 +20964,21 @@ function renderRPanelUI(instance, container) {
             const inchWInput = dlg.querySelector('.r-ve-export-inch-w');
             const inchHInput = dlg.querySelector('.r-ve-export-inch-h');
             const lockRatioBtn = dlg.querySelector('.r-ve-lock-ratio');
+            const imageController=new AbortController();
+            let imageLoadError=null;
+            confirmBtn.disabled=true;
+            loadingEl.style.display='flex';
+            const imagesReady=require('./vector-export').inlineImages(svgClone,imageController.signal).catch(error=>{imageLoadError=error;});
+            imagesReady.then(()=>{if(dlg.isConnected&&!editorEvents.signal.aborted)confirmBtn.disabled=!!imageLoadError;});
+            function reportImageFailure(){
+                const message=(isZh?'图片资源加载失败，已停止导出：':'Image resource loading failed; export stopped: ')+imageLoadError.message;
+                sizeInfo.textContent=message;loadingEl.style.display='none';confirmBtn.disabled=true;
+                return message;
+            }
 
             // Size in inches (SVG coords are in points = 1/72 inch)
-            let exportInchW = +(imgW / 72).toFixed(2);
-            let exportInchH = +(imgH / 72).toFixed(2);
+            let exportInchW = +(canvasW / documentUnitsPerInch).toFixed(4);
+            let exportInchH = +(canvasH / documentUnitsPerInch).toFixed(4);
             let lockRatio = true;
             let exportBg = 'white'; // 'white' or 'transparent'
             const bgGroup = dlg.querySelector('.r-ve-export-bg-group');
@@ -20741,9 +20988,9 @@ function renderRPanelUI(instance, container) {
                 bgGroup.style.display = (fmt === 'png') ? 'block' : 'none';
                 bgBtns.forEach(b => {
                     const active = b.dataset.bg === exportBg;
-                    b.style.background = active ? '#1976d2' : '#444';
-                    b.style.color = active ? '#fff' : '#bbb';
-                    b.style.borderColor = active ? '#1976d2' : '#555';
+                    b.style.background = active ? '#1976d2' : 'var(--ve-control)';
+                    b.style.color = active ? '#fff' : 'var(--ve-text)';
+                    b.style.borderColor = active ? '#1976d2' : 'var(--ve-border)';
                 });
             }
             bgBtns.forEach(b => { b.onclick = () => { exportBg = b.dataset.bg; updateBgUI(); renderPreview(); }; });
@@ -20755,12 +21002,12 @@ function renderRPanelUI(instance, container) {
                 const icon = lockRatioBtn.querySelector('i');
                 if (lockRatio) {
                     icon.className = 'fas fa-lock';
-                    lockRatioBtn.style.color = '#90caf9';
-                    lockRatioBtn.style.borderColor = '#90caf9';
+                    lockRatioBtn.style.color = 'var(--ve-accent)';
+                    lockRatioBtn.style.borderColor = 'var(--ve-accent)';
                 } else {
                     icon.className = 'fas fa-lock-open';
-                    lockRatioBtn.style.color = '#666';
-                    lockRatioBtn.style.borderColor = '#555';
+                    lockRatioBtn.style.color = 'var(--ve-muted)';
+                    lockRatioBtn.style.borderColor = 'var(--ve-border)';
                 }
             }
             updateLockBtn();
@@ -20784,8 +21031,8 @@ function renderRPanelUI(instance, container) {
             };
 
             // Close
-            dlg.querySelector('.r-ve-export-dlg-close').onclick = () => dlg.remove();
-            dlg.addEventListener('mousedown', (ev) => { if (ev.target === dlg) dlg.remove(); });
+            dlg.querySelector('.r-ve-export-dlg-close').onclick = () => destroyExport();
+            dlg.addEventListener('mousedown', (ev) => { if (ev.target === dlg) destroyExport(); });
 
             function getCurrentFmt() { return fmtSelect.value; }
 
@@ -20794,7 +21041,26 @@ function renderRPanelUI(instance, container) {
                 dpiGroup.style.display = (fm === 'png' || fm === 'tif') ? 'block' : 'none';
             }
 
-            function renderPreview() {
+            let previewTimer=0,previewGeneration=0,previewUrl=null;
+            function destroyExport() {
+                imageController.abort();
+                clearTimeout(previewTimer);previewGeneration++;
+                if(previewUrl)URL.revokeObjectURL(previewUrl);previewUrl=null;
+                previewCanvas.width=previewCanvas.height=0;
+                editorEvents.signal.removeEventListener('abort',destroyExport);
+                dlg.remove();
+            }
+            editorEvents.signal.addEventListener('abort',destroyExport,{once:true});
+            function formatExportSize(bytes) {
+                return bytes>=1048576 ? `${(bytes/1048576).toFixed(2)} MB` : `${(bytes/1024).toFixed(1)} KB`;
+            }
+            function renderPreview() { clearTimeout(previewTimer);const generation=++previewGeneration;previewTimer=setTimeout(()=>renderPreviewNow(generation),80); }
+            async function renderPreviewNow(generation) {
+                if(!dlg.isConnected||editorEvents.signal.aborted)return;
+                await imagesReady;
+                if(generation!==previewGeneration||!dlg.isConnected||editorEvents.signal.aborted)return;
+                if(imageLoadError){reportImageFailure();return;}
+                if(previewUrl)URL.revokeObjectURL(previewUrl);
                 const fm = getCurrentFmt();
                 const hasDpi = fm === 'png' || fm === 'tif';
                 const dpi = hasDpi ? parseInt(dpiSelect.value) : (fm === 'pdf' ? 150 : 72);
@@ -20803,15 +21069,31 @@ function renderRPanelUI(instance, container) {
                 const curH = exportInchH * 72;
                 const outW = Math.round(exportInchW * dpi);
                 const outH = Math.round(exportInchH * dpi);
+                if(!Number.isFinite(outW*outH)||outW<1||outH<1||exportInchW<=0||exportInchH<=0){
+                    dimsDisplay.textContent='—';sizeInfo.textContent=isZh?'请输入有效的尺寸和 DPI':'Enter valid dimensions and DPI';loadingEl.style.display='none';return;
+                }
+                if(hasDpi&&outW*outH>require('./vector-export').MAX_PIXELS){
+                    dimsDisplay.textContent=`${outW} × ${outH} px`;
+                    sizeInfo.textContent=isZh?'超过 3200 万像素，请降低 DPI 或尺寸':'Exceeds 32 megapixels; reduce DPI or dimensions';loadingEl.style.display='none';return;
+                }
+                sizeInfo.title='';
+                if(fm==='tif'){
+                    sizeInfo.textContent=(isZh?'预计 TIF 文件大小：≈ ':'Estimated TIF size: ≈ ')+formatExportSize(require('./vector-codecs').tiffSize(outW,outH));
+                    sizeInfo.title=isZh?'按实际输出像素计算，与当前未压缩 RGBA TIFF 编码一致':'Calculated from output pixels using the actual uncompressed RGBA TIFF encoding';
+                }else if(fm==='png'){
+                    sizeInfo.textContent=(isZh?'像素数据：≈ ':'Pixel data: ≈ ')+formatExportSize(outW*outH*4)+(isZh?'；PNG 文件大小取决于压缩结果':'; PNG file size depends on compression');
+                }else if(fm==='pdf'){
+                    sizeInfo.textContent=isZh?'矢量 PDF 文件大小取决于图形内容':'Vector PDF file size depends on artwork content';
+                }else sizeInfo.textContent='';
 
                 // Update svgClone dimensions, viewBox, and background rect to match user size
                 svgClone.setAttribute('width', curW);
                 svgClone.setAttribute('height', curH);
-                svgClone.setAttribute('viewBox', `0 0 ${curW} ${curH}`);
+                svgClone.setAttribute('viewBox', `${canvasOriginX} ${canvasOriginY} ${canvasW} ${canvasH}`);
                 const cloneBg = svgClone.querySelector('[data-role="background"]');
                 if (cloneBg) {
-                    cloneBg.setAttribute('width', curW);
-                    cloneBg.setAttribute('height', curH);
+                    cloneBg.setAttribute('width', canvasW);
+                    cloneBg.setAttribute('height', canvasH);
                     // For PNG transparent mode, hide background rect
                     if (fm === 'png' && exportBg === 'transparent') {
                         cloneBg.setAttribute('fill', 'none');
@@ -20822,51 +21104,43 @@ function renderRPanelUI(instance, container) {
 
                 if (fm === 'svg') {
                     dimsDisplay.textContent = `${Math.round(curW)} × ${Math.round(curH)} (SVG)`;
+                } else if(fm==='pdf') {
+                    dimsDisplay.textContent = `${exportInchW} × ${exportInchH} in (PDF)`;
                 } else {
                     dimsDisplay.textContent = `${outW} × ${outH} px`;
                 }
 
                 loadingEl.style.display = 'flex';
-                previewCanvas.width = outW;
-                previewCanvas.height = outH;
+                const previewScale = Math.min(1,900/Math.max(outW,outH));
+                previewCanvas.width = Math.max(1,Math.round(outW*previewScale));
+                previewCanvas.height = Math.max(1,Math.round(outH*previewScale));
                 const ctx = previewCanvas.getContext('2d');
-                ctx.clearRect(0, 0, outW, outH);
+                ctx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
                 // Draw checkered bg for transparent PNG preview
                 if (fm === 'png' && exportBg === 'transparent') {
-                    const tileSize = Math.max(8, outW / 40);
-                    for (let yy = 0; yy < outH; yy += tileSize) {
-                        for (let xx = 0; xx < outW; xx += tileSize) {
+                    const tileSize = Math.max(8, previewCanvas.width / 40);
+                    for (let yy = 0; yy < previewCanvas.height; yy += tileSize) {
+                        for (let xx = 0; xx < previewCanvas.width; xx += tileSize) {
                             ctx.fillStyle = ((xx / tileSize + yy / tileSize) % 2 < 1) ? '#e0e0e0' : '#ffffff';
                             ctx.fillRect(xx, yy, tileSize, tileSize);
                         }
                     }
                 }
-                const scaleFactor = outW / curW;
+                const scaleFactor = previewCanvas.width / curW;
                 ctx.scale(scaleFactor, scaleFactor);
 
                 const data = new XMLSerializer().serializeToString(svgClone);
+                if(fm==='svg')sizeInfo.textContent='≈ '+formatExportSize(new TextEncoder().encode(data).length);
                 const svgBlob = new Blob([data], {type:'image/svg+xml;charset=utf-8'});
-                const url = URL.createObjectURL(svgBlob);
+                const url = previewUrl = URL.createObjectURL(svgBlob);
                 const img = new Image();
                 img.onload = () => {
+                    if(generation!==previewGeneration||!dlg.isConnected){URL.revokeObjectURL(url);return;}
                     ctx.drawImage(img, 0, 0, curW, curH);
                     URL.revokeObjectURL(url);
                     loadingEl.style.display = 'none';
-                    if (fm === 'svg') {
-                        const svgBytes = new TextEncoder().encode(data).length;
-                        const kb = (svgBytes / 1024).toFixed(1);
-                        sizeInfo.textContent = `≈ ${kb} KB`;
-                    } else {
-                        previewCanvas.toBlob(b => {
-                            if (b) {
-                                const kb = (b.size / 1024).toFixed(1);
-                                const mb = (b.size / 1048576).toFixed(2);
-                                sizeInfo.textContent = b.size > 1048576 ? `≈ ${mb} MB` : `≈ ${kb} KB`;
-                            }
-                        }, 'image/png');
-                    }
                 };
-                img.onerror = () => { loadingEl.style.display = 'none'; };
+                img.onerror = () => { if(generation===previewGeneration&&dlg.isConnected)loadingEl.style.display = 'none'; };
                 img.src = url;
             }
 
@@ -20878,9 +21152,9 @@ function renderRPanelUI(instance, container) {
                 // Update preset button highlights
                 dlg.querySelectorAll('.r-ve-dpi-preset').forEach(btn => {
                     const active = parseInt(btn.dataset.dpi) === parseInt(dpiSelect.value);
-                    btn.style.background = active ? '#1976d2' : '#444';
-                    btn.style.color = active ? '#fff' : '#bbb';
-                    btn.style.borderColor = active ? '#1976d2' : '#555';
+                    btn.style.background = active ? '#1976d2' : 'var(--ve-control)';
+                    btn.style.color = active ? '#fff' : 'var(--ve-text)';
+                    btn.style.borderColor = active ? '#1976d2' : 'var(--ve-border)';
                 });
                 renderPreview();
             };
@@ -20893,46 +21167,41 @@ function renderRPanelUI(instance, container) {
             });
 
             // Confirm export
-            confirmBtn.onclick = () => {
+            confirmBtn.onclick = async () => {
+                await imagesReady;
+                if(!dlg.isConnected||editorEvents.signal.aborted)return;
+                if(imageLoadError){editorTools?.notify(reportImageFailure());return;}
                 const fm = getCurrentFmt();
 
                 if (fm === 'svg') {
-                    // Ensure viewBox and bg rect match before export
-                    const svgW = exportInchW * 72, svgH = exportInchH * 72;
-                    svgClone.setAttribute('width', svgW);
-                    svgClone.setAttribute('height', svgH);
-                    svgClone.setAttribute('viewBox', `0 0 ${svgW} ${svgH}`);
-                    const svgBg = svgClone.querySelector('[data-role="background"]');
-                    if (svgBg) { svgBg.setAttribute('width', svgW); svgBg.setAttribute('height', svgH); }
-                    const data = new XMLSerializer().serializeToString(svgClone);
-                    downloadBlob(new Blob([data], {type:'image/svg+xml;charset=utf-8'}), f.name.replace(/\.\w+$/,'') + '.svg');
-                    dlg.remove();
+                    confirmBtn.disabled=true;
+                    try {
+                        editorTools?.finishPath();
+                        const savedSnapshot=documentSnapshot(),savedKey=editorRecoveryKey;
+                        // Ensure viewBox and bg rect match before export
+                        svgClone.setAttribute('width', exportInchW+'in');
+                        svgClone.setAttribute('height', exportInchH+'in');
+                        svgClone.setAttribute('viewBox', `${canvasOriginX} ${canvasOriginY} ${canvasW} ${canvasH}`);
+                        const svgBg = svgClone.querySelector('[data-role="background"]');
+                        if (svgBg) { svgBg.setAttribute('width', canvasW); svgBg.setAttribute('height', canvasH); }
+                        svgClone.style.removeProperty('width');svgClone.style.removeProperty('height');svgClone.style.overflow='hidden';
+                        const data = new XMLSerializer().serializeToString(svgClone);
+                        const saved=await ipcRenderer.invoke('vector-save-file',{name:f.name.replace(/\.\w+$/,'')+'.svg',bytes:new TextEncoder().encode(data)});
+                        if(saved){await editorTools?.markSaved(savedSnapshot,savedKey);destroyExport();}
+                    }catch(error){editorTools?.notify(error.message);}finally{confirmBtn.disabled=false;}
                     return;
                 }
 
                 if (fm === 'pdf') {
-                    const c2 = document.createElement('canvas');
-                    const dpr = 2;
-                    const pdfW = exportInchW * 72, pdfH = exportInchH * 72;
-                    svgClone.setAttribute('width', pdfW);
-                    svgClone.setAttribute('height', pdfH);
-                    svgClone.setAttribute('viewBox', `0 0 ${pdfW} ${pdfH}`);
-                    const pdfBg = svgClone.querySelector('[data-role="background"]');
-                    if (pdfBg) { pdfBg.setAttribute('width', pdfW); pdfBg.setAttribute('height', pdfH); }
-                    c2.width = pdfW * dpr; c2.height = pdfH * dpr;
-                    const ctx2 = c2.getContext('2d');
-                    ctx2.scale(dpr, dpr);
-                    const data = new XMLSerializer().serializeToString(svgClone);
-                    const blob = new Blob([data], {type:'image/svg+xml;charset=utf-8'});
-                    const url = URL.createObjectURL(blob);
-                    const img = new Image();
-                    img.onload = () => {
-                        ctx2.drawImage(img, 0, 0, pdfW, pdfH);
-                        URL.revokeObjectURL(url);
-                        exportAsPdf(c2, f.name.replace(/\.\w+$/,'') + '.pdf');
-                        dlg.remove();
-                    };
-                    img.src = url;
+                    confirmBtn.disabled = true;
+                    try {
+                        const {exportSvg} = require('./vector-export');
+                        const svg = exportSvg(new XMLSerializer().serializeToString(svgClone),{x:canvasOriginX,y:canvasOriginY,w:canvasW,h:canvasH});
+                        const bytes = await ipcRenderer.invoke('vector-export-pdf',{svg,width:exportInchW,height:exportInchH});
+                        if (!editorEvents.signal.aborted) downloadBlob(new Blob([bytes],{type:'application/pdf'}),f.name.replace(/\.\w+$/,'')+'.pdf');
+                        destroyExport();
+                    } catch (error) { editorTools?.notify(error.message); }
+                    finally { confirmBtn.disabled = false; }
                     return;
                 }
 
@@ -20941,6 +21210,9 @@ function renderRPanelUI(instance, container) {
                 const outW = Math.round(exportInchW * dpi);
                 const outH = Math.round(exportInchH * dpi);
                 const expCanvas = document.createElement('canvas');
+                if (!Number.isFinite(outW*outH) || outW<1 || outH<1 || outW*outH>32000000) {
+                    rlog(isZh?'导出超过 3200 万像素，请降低 DPI 或尺寸。':'Export exceeds 32 megapixels; reduce DPI or physical size.'); return;
+                }
                 expCanvas.width = outW; expCanvas.height = outH;
                 const ctx = expCanvas.getContext('2d');
                 const curW = exportInchW * 72, curH = exportInchH * 72;
@@ -20948,11 +21220,11 @@ function renderRPanelUI(instance, container) {
                 // Ensure svgClone matches export settings
                 svgClone.setAttribute('width', curW);
                 svgClone.setAttribute('height', curH);
-                svgClone.setAttribute('viewBox', `0 0 ${curW} ${curH}`);
+                svgClone.setAttribute('viewBox', `${canvasOriginX} ${canvasOriginY} ${canvasW} ${canvasH}`);
                 const expBg = svgClone.querySelector('[data-role="background"]');
                 if (expBg) {
-                    expBg.setAttribute('width', curW);
-                    expBg.setAttribute('height', curH);
+                    expBg.setAttribute('width', canvasW);
+                    expBg.setAttribute('height', canvasH);
                     expBg.setAttribute('fill', (fm === 'png' && exportBg === 'transparent') ? 'none' : '#ffffff');
                 }
 
@@ -20962,16 +21234,15 @@ function renderRPanelUI(instance, container) {
                 const blob = new Blob([data], {type:'image/svg+xml;charset=utf-8'});
                 const url = URL.createObjectURL(blob);
                 const img = new Image();
-                img.onload = () => {
+                img.onload = async () => {
                     ctx.drawImage(img, 0, 0, curW, curH);
                     URL.revokeObjectURL(url);
-                    const ext = fm === 'tif' ? '.tif' : '.png';
-                    const filename = f.name.replace(/\.\w+$/, '') + ext;
-                    expCanvas.toBlob(b => {
-                        downloadBlob(b, filename);
-                        rlog((isZh ? '已导出: ' : 'Exported: ') + filename + ` (${dpi} DPI, ${outW}×${outH})`);
-                    }, 'image/png');
-                    dlg.remove();
+                    try {
+                        const bytes = await require('./vector-export').encodeRaster(expCanvas,fm,dpi,geometryJobs);
+                        if(!editorEvents.signal.aborted) downloadBlob(new Blob([bytes],{type:fm==='tif'?'image/tiff':'image/png'}),f.name.replace(/\.\w+$/,'')+(fm==='tif'?'.tif':'.png'));
+                    } catch(error) { editorTools?.notify(error.message); }
+                    finally { expCanvas.width=expCanvas.height=0; }
+                    destroyExport();
                 };
                 img.src = url;
             };
@@ -21078,16 +21349,6 @@ function renderRPanelUI(instance, container) {
             bakeTransformRelative(el);
         }
 
-        function exportAsPdf(canvas, filename) {
-            const imgData = canvas.toDataURL('image/jpeg', 0.95);
-            const w = window.open('', '_blank', `width=${imgW},height=${imgH}`);
-            if (w) {
-                w.document.write(`<!DOCTYPE html><html><head><title>${filename}</title><style>@page{size:${imgW}px ${imgH}px;margin:0;}body{margin:0;}</style></head><body><img src="${imgData}" style="width:100%;height:auto;"/></body></html>`);
-                w.document.close();
-                setTimeout(() => { w.print(); rlog(currentLang==='zh'?'请在打印框中选择另存为PDF':'Select Save as PDF'); }, 500);
-            }
-        }
-
         function downloadBlob(blob, filename) {
             const a = document.createElement('a');
             a.href = URL.createObjectURL(blob);
@@ -21098,22 +21359,33 @@ function renderRPanelUI(instance, container) {
         }
 
         // Close
-        function closeEditor() {
-            if (editorEvents.signal.aborted) return;
-            overlay.querySelector('.r-ve-text-panel')?._flushLiveChanges?.();
-            pointerFrame.cancel();
-            editorEvents.abort();
-            textHitIndex?.dispose();
-            textHitIndex = null;
-            history.reset();
-            document.removeEventListener('keydown', keyHandler);
-            if (sessionKey) instance._liveEditorSessions.delete(sessionKey);
-            overlay.remove();
-            options.onClose?.();
-            // If in standalone native window, close the window
-            if (window.__editorStandalone) {
-                window.close();
-            }
+        let closePending = false;
+        async function closeEditor() {
+            if (editorEvents.signal.aborted || closePending) return;
+            closePending = true;
+            try {
+                gradientEditor?.close();
+                if (editorTools && !(await editorTools.requestClose())) return;
+                overlay.querySelector('.r-ve-text-panel')?._flushLiveChanges?.();
+                pointerFrame.cancel();
+                editorTools?.dispose();
+                geometryJobs.dispose();
+                editorEvents.abort();
+                textHitIndex?.dispose();
+                textHitIndex = null;
+                history.reset();
+                document.removeEventListener('keydown', keyHandler);
+                if (sessionKey) instance._liveEditorSessions.delete(sessionKey);
+                overlay.remove();
+                options.onClose?.();
+                if (window.__standaloneEditorClose === closeEditor) window.__standaloneEditorClose = null;
+                // If in standalone native window, close the window
+                if (window.__editorStandalone) {
+                    await ipcRenderer.invoke('vector-editor-close-approved');
+                    window.close();
+                }
+            } catch (error) { rlog('[ERROR] '+error.message); }
+            finally { closePending = false; }
         }
         overlay.querySelector('.r-ve-close-btn').onclick = () => closeEditor();
         overlay.onclick = e => {
@@ -21124,18 +21396,51 @@ function renderRPanelUI(instance, container) {
             }
         };
 
+        editorTools = require('./vector-editor-tools').mount({overlay,canvas:canvasWrap,
+            svg:()=>liveSvg,draw:()=>drawSvg,selected:()=>selectedEls,roots:getTopLevelEls,
+            select:els=>els.length===1?selectElement(els[0]):multiSelect(els),bounds:getElBoundsInSvg,
+            bake:bakeTransformRelative,pathData:elemToPath,point:getPointInSvg,refresh:refreshSelectionHighlights,
+            save:saveState,undo,redo,restore:state=>{history.reset();restoreState(state);history.commit(documentSnapshot());},
+            snapshot:()=>lastDocumentSnapshot,width:()=>canvasW,height:()=>canvasH,zoom:()=>scale,
+            origin:()=>({x:canvasOriginX,y:canvasOriginY}),unitScale:()=>documentUnitsPerInch/96,
+            flushText:()=>{gradientEditor?.commit();overlay.querySelectorAll('.r-ve-inline-editor').forEach(el=>el._commit?.());overlay.querySelector('.r-ve-text-panel')?._flushLiveChanges?.();saveState();},
+            notify:message=>rlog('[EDITOR] '+message),jobs:geometryJobs,
+            activateTool:activateCanvasTool,space:()=>spacebarDown,
+            penStyle:()=>({fill:fillIsNone?'none':fillInput.value,stroke:strokeIsNone?'none':strokeInput.value,width:strokeWidthInput.value,opacity:getOpacityValue()}),
+            lang:currentLang,filename:f.name,get key(){return editorRecoveryKey;},signal:editorEvents.signal});
+        paintSwatches = require('./vector-swatches').mount({overlay,svg:()=>liveSvg,selected:()=>selectedEls,
+            none:attr=>attr==='fill'?fillIsNone:strokeIsNone,
+            clear:attr=>{applyPaint(attr,'none');saveState(currentLang==='zh'?'无颜色':'No paint');},lang:currentLang,signal:editorEvents.signal});
+        if (window.__editorStandalone) window.__standaloneEditorClose = closeEditor;
+        // Toolbar edits use their existing live preview, then commit once per input gesture.
+        listen(overlay.querySelector('.r-ve-props-bar'),'change',()=>saveState(currentLang==='zh'?'属性':'Properties'));
+        listen(overlay.querySelector('.r-ve-props-bar'),'click',e=>{if(e.target.closest('button:not(.r-ve-gradient-btn):not(.r-ve-paint-trigger)'))saveState(currentLang==='zh'?'属性':'Properties');});
+
+        // Coalesce live results while a save/discard decision is pending.
+        let pendingLiveSvg = null, applyingLiveSvg = false;
         // ---- Register live editor session (for re-rendering on parameter change) ----
         if (sessionKey) {
             instance._liveEditorSessions.set(sessionKey, {
                 overlay,
-                updateFn: (newSvgText) => {
-                    svgSourceText = newSvgText;
-                    deselectAll();
-                    pointerFrame.cancel();
-                    history.reset();
-                    renderSvgFromText(newSvgText);
-                    saveState();
-                    rlog(currentLang==='zh' ? '🔄 图形已实时更新' : '🔄 Figure updated (live)');
+                updateFn: async (newSvgText, sourcePath) => {
+                    pendingLiveSvg = {text:newSvgText,sourcePath};
+                    if (applyingLiveSvg) return;
+                    applyingLiveSvg = true;
+                    try {
+                        gradientEditor?.commit();
+                        if (!(await editorTools.beforeReplace()) || editorEvents.signal.aborted) {pendingLiveSvg=null;return;}
+                        svgSourceText = pendingLiveSvg.text;
+                        if(pendingLiveSvg.sourcePath)editorRecoveryKey=recoveryIdentity(pendingLiveSvg.sourcePath);
+                        pendingLiveSvg = null;
+                        deselectAll();
+                        pointerFrame.cancel();
+                        history.reset();
+                        renderSvgFromText(svgSourceText);
+                        saveState();
+                        editorTools.replaced(documentSnapshot(),0,true);
+                        rlog(currentLang==='zh' ? '🔄 图形已实时更新' : '🔄 Figure updated (live)');
+                    } catch(error) {if(!editorEvents.signal.aborted)rlog('[ERROR] '+error.message);}
+                    finally {applyingLiveSvg=false;}
                 },
                 filename: f.name
             });
@@ -21172,7 +21477,7 @@ function renderRPanelUI(instance, container) {
     // ===  LIVE RENDERING: Auto-open vector editors after R script run ==
     // ==================================================================
     async function autoOpenLiveEditors() {
-        const outDir = instance.outDir || '';
+        const outDir = instance.lastRunOutDir || instance.outDir || '';
         try {
             const url = API_BASE + '/r/list-outputs' + (outDir ? '?outDir=' + encodeURIComponent(outDir) : '');
             const r = await fetch(url);
@@ -21200,7 +21505,7 @@ function renderRPanelUI(instance, container) {
                 // Check if editor window already open for this file → update via IPC
                 if (instance._liveEditorSessions.has(sessionKey)) {
                     try {
-                        const res = await ipcRenderer.invoke('update-editor-svg', { sessionKey, svgText });
+                        const res = await ipcRenderer.invoke('update-editor-svg', { sessionKey, svgText, sourcePath:f.path });
                         if (res.status === 'updated') {
                             rlog(currentLang==='zh' ? `🔄 ${f.name} 已更新` : `🔄 ${f.name} updated`);
                             continue;
@@ -21215,6 +21520,7 @@ function renderRPanelUI(instance, container) {
                     const res = await ipcRenderer.invoke('create-editor-window', {
                         sessionKey,
                         filename: f.name,
+                        sourcePath: f.path,
                         svgText,
                         lang: currentLang,
                         posIndex: i,
@@ -21953,7 +22259,8 @@ function renderPluginUI(instance, container) {
             paramBlock.appendChild(label); paramBlock.appendChild(widget);
         }
         else if (param.type === 'checkbox') {
-            const wrapper = document.createElement('div'); wrapper.style.display = 'flex';
+            paramBlock.classList.add('param-checkbox-block');
+            const wrapper = document.createElement('div'); wrapper.className = 'param-checkbox-content';
             const widget = document.createElement('input'); widget.type = 'checkbox';
             widget.checked = !!S[param.id];
             widget.onchange = e => { S[param.id] = e.target.checked; stateChanged(); };
@@ -22041,8 +22348,10 @@ function renderPluginUI(instance, container) {
     // ==========================================
     if (p.run_mode !== 'native_gui') {
         const outBox = document.createElement('div'); outBox.className = 'params-box';
-        outBox.innerHTML = `<b>${t('output_dir_label')}</b><input type="text" class="plugin-output-dir-input" placeholder="${t('drag_folder_hint')}" style="width:100%;padding:8px;margin-top:5px">`;
+        outBox.innerHTML = `<button type="button" class="plugin-output-dir-open" lang="${currentLang}" title="${currentLang === 'zh' ? '点击打开上次运行输出目录' : 'Click to open last run output directory'}"><span class="plugin-output-dir-label">${t('output_dir_label')}</span><i class="fas fa-external-link-alt" aria-hidden="true"></i></button><input type="text" class="plugin-output-dir-input" placeholder="${t('auto_output_dir_hint')}" style="width:100%;padding:8px;margin-top:5px">`;
+        outBox.querySelector('.plugin-output-dir-open').onclick = () => openRunOutputDirectory(instance.lastRunOutDir);
         const outInput = outBox.querySelector('input');
+        outInput.value = instance.outDir || instance.lastRunOutDir || '';
         outInput.oninput = (e) => { instance.outDir = e.target.value.trim(); };
         outInput.ondragover = e => { e.preventDefault(); outInput.style.borderColor = '#2196F3'; outInput.style.background = '#e3f2fd'; };
         outInput.ondragleave = () => { outInput.style.borderColor = ''; outInput.style.background = ''; };
@@ -22050,6 +22359,7 @@ function renderPluginUI(instance, container) {
             e.preventDefault();
             outInput.style.borderColor = ''; outInput.style.background = '';
             const file = e.dataTransfer.files[0];
+            if (!file) return;
             instance.outDir = file.path;
             e.target.value = instance.outDir;
             log(`[USER] Set output: ${instance.outDir}`);
@@ -22097,16 +22407,15 @@ function renderPluginUI(instance, container) {
                 else                             params[pm.id] = S[pm.id];
             });
 
-            if (!instance.outDir && p.run_mode !== 'native_gui') {
-                log(`[ERROR] Output directory not set.`);
-                alert(currentLang === 'zh' ? '请先设置输出目录！' : 'Please set an output directory first!');
-                return;
-            }
-
             const payload = { pluginId: p.id, params, outDir: instance.outDir, _visibleFileParams, clientRunId };
             if (instance.threads && Number(instance.threads) > 0) payload.threads = Number(instance.threads);
 
             const resp = await post('/run-plugin', payload);
+            if (resp && resp.outDir) {
+                instance.lastRunOutDir = resp.outDir;
+                const outInput = container.querySelector('.plugin-output-dir-input');
+                if (outInput && !instance.outDir) outInput.value = resp.outDir;
+            }
 
             if (resp && resp.status === 'success') {
                 if (p.run_mode === 'native_gui') {
@@ -22592,6 +22901,12 @@ if (!window.__editorStandalone) {
     // Normal main window mode
     openWelcomeTab();
     updateLanguage(currentLang);
+    if (_menuMarketplace) {
+        marketplaceReviewNotice = marketplace.watchReviews({ ipc: ipcRenderer, button: _menuMarketplace, language: () => currentLang,
+            prepareSession: async () => { await _ghRestoreSharedSession(); await _ghSyncMarketSession().catch(() => {}); },
+            openReviews: () => { _menuMarketplace.click(); tabs['sys-marketplace']?.showReviews(); } });
+        window.addEventListener('beforeunload', () => marketplaceReviewNotice?.dispose(), { once: true });
+    }
     initWelcomeGithubStar();
     init();
 
@@ -22633,16 +22948,17 @@ if (!window.__editorStandalone) {
     // ================================================================
     // Standalone Editor Window mode — bootstrapped via IPC
     // ================================================================
-    ipcRenderer.on('init-editor', (event, { sessionKey, filename, svgText, lang }) => {
+    ipcRenderer.on('init-editor', (event, { sessionKey, filename, sourcePath, svgText, lang }) => {
         currentLang = lang || 'zh';
-        _bootstrapStandaloneEditor(filename, svgText, sessionKey);
+        _bootstrapStandaloneEditor(filename, svgText, sessionKey, sourcePath);
     });
 
-    ipcRenderer.on('update-svg', (event, svgText) => {
+    ipcRenderer.on('update-svg', (event, svgText, sourcePath) => {
         if (window.__standaloneEditorUpdate) {
-            window.__standaloneEditorUpdate(svgText);
+            window.__standaloneEditorUpdate(svgText, sourcePath);
         }
     });
+    ipcRenderer.on('editor-request-close', () => window.__standaloneEditorClose?.());
 
     ipcRenderer.on('update-lang', (event, lang) => {
         currentLang = lang;
@@ -22668,7 +22984,7 @@ if (!window.__editorStandalone) {
 // Standalone editor bootstrap — reuses the real openVectorEditor
 // by calling renderRPanelUI in standalone mode
 // ================================================================
-function _bootstrapStandaloneEditor(filename, svgText, sessionKey) {
+function _bootstrapStandaloneEditor(filename, svgText, sessionKey, sourcePath = '') {
     // Create a fake instance with standalone flag
     const fakeInstance = {
         config: { id: 'standalone-editor', name: filename, parameters: [], packages: [] },
@@ -22685,10 +23001,10 @@ function _bootstrapStandaloneEditor(filename, svgText, sessionKey) {
     renderRPanelUI(fakeInstance, fakeContainer);
 
     // Now call the exposed openVectorEditor to create the editor UI
-    const fakeFile = { name: filename, path: '', ext: '.svg' };
-    const update = (newSvgText) => {
+    const fakeFile = { name: filename, path: sourcePath, ext: '.svg' };
+    const update = (newSvgText, newSourcePath) => {
         const session = fakeInstance._liveEditorSessions.get(sessionKey);
-        if (session?.updateFn) session.updateFn(newSvgText);
+        if (session?.updateFn) session.updateFn(newSvgText, newSourcePath);
     };
     fakeInstance.__openVectorEditor(fakeFile, {
         sessionKey: sessionKey,

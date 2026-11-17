@@ -3,7 +3,7 @@ const {Worker} = require('worker_threads');
 const path=require('path'),crypto=require('crypto'),fs=require('fs');
 const {Readable}=require('stream');
 function registerPreviewService(ipcMain, getWindow) {
-    const sessions=new Map(),counts=new Map(),sources=new Map(),closing=new Set();
+    const sessions=new Map(),sources=new Map(),closing=new Set();
     const authorize=event=>{
         if(event.sender!==getWindow()?.webContents || event.senderFrame!==event.sender.mainFrame) throw Error('Preview requires the application window');
     };
@@ -23,16 +23,11 @@ function registerPreviewService(ipcMain, getWindow) {
         const cacheDir=kind==='archive'?null:require('./preview-cache').create();
         const id=crypto.randomUUID();let worker;
         try{worker=new Worker(path.join(__dirname,kind==='archive'?'archive-preview-worker.js':'file-preview-worker.js'),{
-            workerData:{path:filePath,kind,cacheDir,cachedCount:counts.get(filePath)},resourceLimits:{maxOldGenerationSizeMb:256}});}
+            workerData:{path:filePath,kind,cacheDir},resourceLimits:{maxOldGenerationSizeMb:256}});}
         catch(error){if(cacheDir)fs.rmSync(cacheDir,{recursive:true,force:true});throw error;}
         const session={worker,cacheDir,owner:event.sender,onClose:()=>close(id)};
         sessions.set(id,session);event.sender.once('destroyed',session.onClose);
         worker.on('message',result=>{
-            if(result.event==='line-count'){
-                if(!result.error){counts.delete(filePath);counts.set(filePath,result);while(counts.size>64)counts.delete(counts.keys().next().value);}
-                if(sessions.has(id) && !session.owner.isDestroyed?.())session.owner.send?.('file-preview-count',id,result);
-                return;
-            }
             const pending=session.pending;if(!pending)return;session.pending=null;clearTimeout(session.timer);pending.resolve(result);
         });
         worker.on('error',error=>{session.pending?.reject(error);session.pending=null;close(id);});

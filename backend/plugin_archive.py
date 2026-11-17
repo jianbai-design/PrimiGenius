@@ -1,4 +1,5 @@
 """Validate plugin ZIPs before extraction and replace installations atomically."""
+import copy
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -11,6 +12,8 @@ import zipfile
 
 MAX_FILES = 10000
 MAX_EXPANDED = 1024 * 1024 * 1024
+MAX_INSTALL_FILES = 100000
+MAX_INSTALL_EXPANDED = 128 * 1024 * 1024 * 1024
 _RESERVED = re.compile(r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)', re.I)
 _ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
 
@@ -20,14 +23,28 @@ def valid_plugin_id(value):
             and not value.endswith('.') and not _RESERVED.match(value))
 
 
-def inspect_archive(archive, max_expanded=MAX_EXPANDED):
+def inspect_archive(archive, max_expanded=MAX_EXPANDED, max_files=MAX_FILES):
     entries, seen, total = [], set(), 0
-    if len(archive.infolist()) > MAX_FILES:
+    if len(archive.infolist()) > max_files:
         raise ValueError('压缩包文件数量超过限制')
     for info in archive.infolist():
-        name = info.filename.rstrip('/')
+        # Windows ZIP tools may store backslashes. Validate the portable path,
+        # retaining orig_filename so ZipFile can still verify the source header.
+        filename = info.orig_filename.replace('\\', '/')
+        while filename.startswith('./'):
+            filename = filename[2:]
+        # A ZIP's optional current-directory entry contains no installable path.
+        if not filename and info.orig_filename.endswith(('/', '\\')):
+            mode = info.external_attr >> 16
+            if stat.S_IFMT(mode) not in (0, stat.S_IFDIR) or info.file_size:
+                raise ValueError('压缩包不允许符号链接或特殊文件')
+            continue
+        if filename != info.filename:
+            info = copy.copy(info)
+            info.filename = filename
+        name = filename.rstrip('/')
         parts = name.split('/')
-        if (not name or '\\' in info.orig_filename or '\\' in name or name.startswith('/') or
+        if (not name or name.startswith('/') or
                 any(p in ('', '.', '..') or p.endswith((' ', '.')) or
                     any(ord(c) < 32 or c in '<>:"|?*' for c in p) or _RESERVED.match(p)
                     for p in parts)):
@@ -65,9 +82,20 @@ def inspect_archive(archive, max_expanded=MAX_EXPANDED):
     return config, prefix, entries
 
 
-def extract_plugin(zip_path, target):
+def inspect_install_archive(archive):
+    return inspect_archive(archive, max_expanded=MAX_INSTALL_EXPANDED, max_files=MAX_INSTALL_FILES)
+
+
+def extract_plugin(zip_path, target, max_expanded=MAX_EXPANDED, max_files=MAX_FILES):
     with zipfile.ZipFile(zip_path) as archive:
-        config, prefix, entries = inspect_archive(archive)
+        config, prefix, entries = inspect_archive(archive, max_expanded=max_expanded, max_files=max_files)
+        volume = Path(target).resolve()
+        while not volume.exists():
+            volume = volume.parent
+        # Stage and previous version coexist; the latter is already in used space.
+        required = sum(info.file_size for info in entries) + len(entries) * 4096 + 512 * 1024 * 1024
+        if shutil.disk_usage(volume).free < required:
+            raise ValueError(f'插件安装磁盘空间不足，至少需要 {required / (1024 ** 3):.2f} GiB 可用空间')
         for info in entries:
             relative = info.filename[len(prefix):] if info.filename.startswith(prefix) else ''
             if not relative:
@@ -142,7 +170,7 @@ def replace_plugin(zip_path, destination):
     try:
         stage, backup = Path(temporary) / 'new', Path(temporary) / 'previous'
         stage.mkdir()
-        config = extract_plugin(zip_path, stage)
+        config = extract_plugin(zip_path, stage, max_expanded=MAX_INSTALL_EXPANDED, max_files=MAX_INSTALL_FILES)
         if dest.is_symlink() or getattr(dest, 'is_junction', lambda: False)():
             raise ValueError('安装目录不能是符号链接')
         if dest.exists():

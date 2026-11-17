@@ -5,7 +5,10 @@ const os = require('os');
 const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
-const { isPublicGithubProxyUrl } = require('./github-public');
+const { isPublicGithubProxyUrl, publicGithubCandidates, raceGithubReads } = require('./github-public');
+const { commitSource, readSourcePage, decodeBlob } = require('./market-source');
+const { LegacyPreviewStore } = require('./market-legacy-preview');
+const { installState } = require('./market-install-state');
 
 const REPOSITORY = 'jianbai-design/PrimiGenius-community-plugins';
 const ADMIN_ID = 134767426;
@@ -153,7 +156,11 @@ function submissionSummary(record) {
         `- 安装包大小 / Size: ${record.size} bytes\n` +
         `- SHA256: \`${record.sha256}\`\n\n` +
         `${escape(metadata.description)}\n\n` +
-        `更新说明 / Changes: ${escape(record.changelog)}\n\n`;
+        `更新说明 / Changes: ${escape(record.changelog)}\n\n` +
+        (/^[a-f0-9]{40}$/.test(record.source?.commit || '') &&
+         /^[A-Za-z0-9-]+\/PrimiGenius-market-uploads$/.test(record.source?.repository || '') &&
+         record.source.path === `plugins/${record.plugin_id}` ?
+            `[源码 / Source](https://github.com/${record.source.repository}/tree/${record.source.commit}/${record.source.path})\n\n` : '');
 }
 
 function submissionReadme(repository, records) {
@@ -167,10 +174,37 @@ function submissionReadme(repository, records) {
             `[审核记录 / Review](https://github.com/${REPOSITORY}/issues/${Number(record.review.issue)})\n\n`).join('---\n\n');
 }
 
-function register({ app, ipcMain, safeStorage, dialog, shell, getWindow, getBackendPort, getBackendToken, getDownloadCounts, download, net }) {
+function register({ app, ipcMain, safeStorage, dialog, shell, getWindow, getBackendPort, getBackendToken, getDownloadCounts, getNetworkMode = () => 'auto', download, net }) {
     let cache = null, accountCache = null, busyInstall = false, authVersion = 0;
     const publicProfiles = new Map();
+    const sourceCache = new Map();
+    let sourceCacheBytes = 0;
+    function rememberSource(key, value) {
+        const size = Buffer.byteLength(JSON.stringify(value));
+        if (size > 4 * 1024 * 1024) return value;
+        if (sourceCache.has(key)) { sourceCacheBytes -= sourceCache.get(key).size; sourceCache.delete(key); }
+        while (sourceCache.size && sourceCacheBytes + size > 4 * 1024 * 1024) {
+            const oldest = sourceCache.keys().next().value;
+            sourceCacheBytes -= sourceCache.get(oldest).size; sourceCache.delete(oldest);
+        }
+        sourceCache.set(key, { value, size }); sourceCacheBytes += size;
+        return value;
+    }
     const request = (url, options) => requestJSON(url, { ...options, net });
+    const legacyPreviews = new LegacyPreviewStore({ download, hash: sha256, maxSize: MAX_SIZE,
+        async readPublic(route, validate) {
+            const mode = await getNetworkMode();
+            const urls = publicGithubCandidates('https://api.github.com' + route, {}, mode);
+            try {
+                return await raceGithubReads(urls, async (url, controller) => {
+                    // Only public attachment metadata is accelerated. No token is sent to mirrors.
+                    const value = await request(url, { timeout: 6000, signal: controller.signal });
+                    if (!validate(value)) throw new Error('原始附件信息不合法或仓库归属不一致');
+                    return value;
+                }, mode === 'cn' ? 0 : 350);
+            } catch (error) { throw new Error('读取公开附件信息失败：' + (error.errors?.[0]?.message || error.message)); }
+        }
+    });
     const selections = new Map();
     const vault = () => path.join(app.getPath('userData'), 'github-market-session.bin');
     const readToken = () => {
@@ -223,6 +257,12 @@ function register({ app, ipcMain, safeStorage, dialog, shell, getWindow, getBack
             return callback(args, event);
         });
     }
+    async function installedPlugins(){
+        const result=await request(`http://127.0.0.1:${getBackendPort()}/get-plugins`,{timeout:6000});
+        if(result.status!=='success'||!Array.isArray(result.plugins))throw new Error('无法读取本地插件安装状态，请刷新后重试');
+        return Object.fromEntries(result.plugins.filter(p=>p&&typeof p.id==='string').map(p=>[p.id,{id:p.id,version:p.version,marketplace:p.marketplace}]));
+    }
+    handle('market-installed',async()=>({ok:true,plugins:await installedPlugins()}));
     handle('market-list', async ({ force }) => {
         const [catalog, identity] = await Promise.all([state(!!force),
             readToken() ? user().then(value => ({ value }), error => ({ error })) : { value: null }]);
@@ -316,7 +356,7 @@ function register({ app, ipcMain, safeStorage, dialog, shell, getWindow, getBack
                     if (!size || size > MAX_SIZE) throw new Error('安装包须小于或等于 256 MiB');
                     const digest = await sha256(result.zipPath);
                     if (selection.temporary) fs.rmSync(selection.file, { force: true });
-                    Object.assign(selection, { file: result.zipPath, temporary: true, size, sha256: digest, version, config: result.config, source: null, issue: null, issueInput: null });
+                    Object.assign(selection, { file: result.zipPath, temporary: true, size, sha256: digest, version, config: result.config, source: null, snapshot: null, snapshotTarget: null, issue: null, issueInput: null });
                 } catch (error) { fs.rmSync(result.zipPath, { force: true }); throw error; }
             }
             progress('验证 GitHub 账号');
@@ -348,6 +388,23 @@ function register({ app, ipcMain, safeStorage, dialog, shell, getWindow, getBack
                 if (!marker || JSON.parse(Buffer.from(marker.content, 'base64').toString('utf8')).primigenius_market_uploads !== 1) {
                     throw new Error('同名上传仓库缺少市场标识，已停止上传以免改动其他项目');
                 }
+                const snapshotTarget = `${repository}:${pluginId}:${selection.sha256}`;
+                if (!selection.snapshot || selection.snapshotTarget !== snapshotTarget) {
+                    progress('同步可浏览的源码与滚动预览索引');
+                    const snapshot = await request(`http://127.0.0.1:${getBackendPort()}/prepare-plugin-source`, {
+                        method: 'POST', data: { zipPath: selection.file }, timeout: 300000, desktopToken: getBackendToken() });
+                    if (snapshot.status !== 'success') throw new Error(snapshot.message || '准备源码失败');
+                    const snapshotDirectory = path.resolve(snapshot.directory);
+                    if (path.dirname(snapshotDirectory) !== path.resolve(os.tmpdir()) || !path.basename(snapshotDirectory).startsWith('primigenius-source-')) {
+                        throw new Error('源码临时目录不合法');
+                    }
+                    try {
+                        selection.snapshot = await commitSource({ api, repository, branch: staging.default_branch || 'main',
+                            pluginId: pluginId === 'new' ? `community_${account.id}_${selection.config.id.slice(0, 90)}` : pluginId,
+                            directory: snapshotDirectory, index: snapshot.index, version });
+                        selection.snapshotTarget = snapshotTarget;
+                    } finally { fs.rmSync(snapshotDirectory, { recursive: true, force: true }); }
+                }
                 progress('准备 GitHub Release');
                 if (!selection.release) selection.release = await api(`/repos/${repository}/releases`, 'POST', {
                     tag_name: `submission-${crypto.randomBytes(16).toString('hex')}`,
@@ -365,7 +422,7 @@ function register({ app, ipcMain, safeStorage, dialog, shell, getWindow, getBack
                 if (!asset) asset = await request(`https://uploads.github.com/repos/${repository}/releases/${release.id}/assets?name=plugin.zip`,
                     { method: 'POST', file: selection.file, token: readToken(), timeout: 600000 });
                 if (asset.digest && asset.digest !== `sha256:${selection.sha256}`) throw new Error('GitHub 上传摘要不一致');
-                selection.source = { repository, release_id: release.id, asset_id: asset.id, sha256: selection.sha256 };
+                selection.source = { repository, release_id: release.id, asset_id: asset.id, sha256: selection.sha256, ...selection.snapshot };
             }
             progress('提交市场审核申请');
             const result = selection.issue || await issue(pluginId === 'new' ? '[插件发布] 新插件' : `[插件更新] ${pluginId}`, {
@@ -452,27 +509,48 @@ function register({ app, ipcMain, safeStorage, dialog, shell, getWindow, getBack
         publicProfiles.set(String(profile.id), entry); publicProfiles.set(profile.login.toLowerCase(), entry);
         return profile;
     });
-    handle('market-preview', async ({ number, file }) => {
+    handle('market-preview-close', async ({ session }) => {
+        if (!/^[a-f0-9]{32}$/.test(session || '')) throw new Error('预览会话不合法');
+        legacyPreviews.close(session); return { ok: true };
+    });
+    handle('market-preview', async ({ number, file, page = 0, session, requestId }, event) => {
         if (!Number.isSafeInteger(number) || number <= 0 || typeof file !== 'string' || file.length > 1000) throw new Error('预览请求不合法');
         const catalog = await state();
         const record = catalog.requests[String(number)];
         if (!record || record.kind !== 'release' || !Object.prototype.hasOwnProperty.call(record.files, file)) throw new Error('文件不存在');
         const source = record.source;
-        if (!/^[A-Za-z0-9-]+\/PrimiGenius-market-uploads$/.test(source.repository) || !Number.isSafeInteger(source.asset_id)) throw new Error('原始附件地址不合法');
-        const repository = await api(`/repos/${source.repository}`);
-        if (repository.owner.id !== record.author.id || repository.private) throw new Error('上传仓库归属不一致');
-        const asset = await api(`/repos/${source.repository}/releases/assets/${source.asset_id}`);
-        if (!asset.browser_download_url.startsWith(`https://github.com/${source.repository}/releases/download/`) || asset.size > MAX_SIZE) throw new Error('附件不合法');
-        const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'primigenius-market-preview-'));
-        try {
-            const zip = path.join(temporary, 'source.zip');
-            await download(asset.browser_download_url, zip, async candidate => {
-                if (fs.statSync(candidate).size !== asset.size || await sha256(candidate) !== source.sha256) throw new Error('原始附件摘要不一致');
-                return true;
-            });
-            return await request(`http://127.0.0.1:${getBackendPort()}/preview-plugin-archive`, {
-                method: 'POST', data: { zipPath: zip, file }, timeout: 120000, desktopToken: getBackendToken() });
-        } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
+        if (source.commit && record.source_verified === true) {
+            if (!/^[A-Za-z0-9-]+\/PrimiGenius-market-uploads$/.test(source.repository) ||
+                !/^[a-f0-9]{40}$/.test(source.commit) || !/^[a-f0-9]{40}$/.test(source.index_sha) ||
+                !Number.isSafeInteger(page) || page < 0) throw new Error('在线源码位置不合法');
+            // These object IDs were verified against the ZIP by the trusted review runner.
+            const indexKey = `${source.repository}:${source.commit}:${source.index_sha}`;
+            let index = sourceCache.get(indexKey)?.value;
+            if (!index) index = rememberSource(indexKey, JSON.parse(decodeBlob(
+                await api(`/repos/${source.repository}/git/blobs/${source.index_sha}`), source.index_sha).toString('utf8')));
+            const chunkKey = `${indexKey}:${file}:${page}`;
+            if (sourceCache.has(chunkKey)) return sourceCache.get(chunkKey).value;
+            return rememberSource(chunkKey, await readSourcePage(api, source, index, file, page));
+        }
+        if (page !== 0) throw new Error('此历史提交尚未保存在线源码，请作者重新提交');
+        if (!/^[A-Za-z0-9-]+\/PrimiGenius-market-uploads$/.test(source.repository) || !Number.isSafeInteger(source.asset_id) ||
+            !/^[a-f0-9]{64}$/.test(source.sha256 || '')) throw new Error('原始附件地址不合法');
+        let progressAt = 0, progressPhase, progressHadBytes = false;
+        return legacyPreviews.read({ id: session, source, author: record.author,
+            progress(update) {
+                const now = Date.now();
+                const hasBytes = update.transferred !== undefined;
+                if (progressPhase === update.phase && now - progressAt < 100 && update.percent !== 100 && (progressHadBytes || !hasBytes)) return;
+                if (progressPhase !== update.phase) progressHadBytes = false;
+                progressHadBytes ||= hasBytes;
+                progressAt = now; progressPhase = update.phase;
+                if (/^[a-f0-9]{32}$/.test(requestId || '') && !event.sender.isDestroyed?.()) {
+                    event.sender.send('market-preview-progress', { requestId, ...update });
+                }
+            },
+            readFile: async zip => ({ ...await request(`http://127.0.0.1:${getBackendPort()}/preview-plugin-archive`, {
+                method: 'POST', data: { zipPath: zip, file }, timeout: 120000, desktopToken: getBackendToken() }), hasNext: false, startLine: 1 })
+        });
     });
     handle('market-open', async ({ url }) => {
         const target = new URL(url);
@@ -495,6 +573,13 @@ function register({ app, ipcMain, safeStorage, dialog, shell, getWindow, getBack
             if (!plugin || !plugin.listed || catalog.blocked.includes(plugin.owner.id) || !plugin.published) throw new Error('插件未发布或已下架');
             const key = fs.readFileSync(path.join(__dirname, 'marketplace-public-key.pem'), 'utf8');
             const info = verifyManifest(plugin.published, key, pluginId);
+            const local=(await installedPlugins())[pluginId],status=installState(local,info);
+            if(status==='installed'||status==='newer'){
+                progress({phase:'done',text:status==='installed'?'已安装当前版本，跳过重复安装':'本地版本较新，已跳过安装'});
+                return {ok:true,skipped:true,status,id:info.id,version:local.version};
+            }
+            if(status==='conflict')throw new Error('本地已有同 ID 但来源或作者不同的插件，已阻止覆盖');
+            if(status==='unknown')throw new Error('无法识别本地插件版本，已阻止覆盖，请检查插件配置');
             const minimum = String(info.min_app_version).split('.').map(Number), current = app.getVersion().split('.').map(Number);
             if (minimum.length !== 3 || minimum.some(n => !Number.isSafeInteger(n))) throw new Error('最低软件版本声明不合法');
             for (let i = 0; i < 3; i++) { if (current[i] > minimum[i]) break; if (current[i] < minimum[i]) throw new Error(`需要 PrimiGenius ${info.min_app_version} 或更新版本`); }
@@ -521,7 +606,7 @@ function register({ app, ipcMain, safeStorage, dialog, shell, getWindow, getBack
             throw error;
         } finally { if (temporary) fs.rmSync(temporary, { recursive: true, force: true }); busyInstall = false; }
     });
-    app.on('will-quit', () => { for (const item of selections.values()) if (item.temporary) fs.rmSync(item.file, { force: true }); });
+    app.on('will-quit', () => { legacyPreviews.closeAll(); for (const item of selections.values()) if (item.temporary) fs.rmSync(item.file, { force: true }); });
 }
 
 module.exports = { register, verifyManifest, requestJSON, sha256, REPOSITORY, ADMIN_ID, submissionRecord, submissionReadme, submissionSummary };

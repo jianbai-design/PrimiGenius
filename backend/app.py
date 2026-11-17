@@ -22,7 +22,7 @@ import datetime
 import traceback
 import uuid
 import platform
-from flask import Flask, jsonify, request, send_from_directory, Response 
+from flask import Flask, jsonify, request, send_from_directory, Response, g
 from flask_cors import CORS  # type: ignore
 from werkzeug.serving import make_server
 import threading
@@ -42,7 +42,8 @@ import hashlib
 import functools
 import gzip
 import secrets
-from plugin_archive import inspect_archive, replace_plugin, pack_source, package_upload
+from plugin_archive import inspect_archive, inspect_install_archive, replace_plugin, pack_source, package_upload
+from plugin_source import source_index
 from podman_manager import (
     PodmanManager,
     DEFAULT_DOCKERHUB_MIRRORS,
@@ -92,6 +93,13 @@ app.logger.disabled = True
 
 @app.after_request
 def _add_low_latency_headers(response):
+    # Include the actual run directory on both success and failure responses.
+    out_dir = getattr(g, 'analysis_output_dir', None)
+    if out_dir and response.is_json:
+        payload = response.get_json()
+        if isinstance(payload, dict):
+            payload['outDir'] = out_dir
+            response.set_data(app.json.dumps(payload))
     if request.path.startswith('/logs/') or request.path.startswith('/podman/') or request.path.startswith('/r/install-status'):
         response.headers.setdefault('Cache-Control', 'no-cache, no-store, must-revalidate')
         response.headers.setdefault('Pragma', 'no-cache')
@@ -406,6 +414,20 @@ def _publish_run_log_event(run_id, channel, msg):
         _LOG_EVENT_COND.notify_all()
 
 
+@app.route('/logs/events', methods=['POST'])
+def append_client_logs():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'status': 'error', 'message': 'Log event required'}), 400
+    run_id, channel, message = data.get('runId'), data.get('channel'), data.get('message')
+    if (not isinstance(run_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_./:-]{0,199}', run_id)
+            or not isinstance(channel, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,32}', channel)
+            or not isinstance(message, str) or len(message) > 256 * 1024):
+        return jsonify({'status': 'error', 'message': 'Invalid log event'}), 400
+    _publish_run_log_event(run_id, channel, message)
+    return jsonify({'status': 'success'})
+
+
 @app.route('/logs/history', methods=['GET'])
 def log_history():
     run_id = str(request.args.get('runId') or '').strip()
@@ -438,7 +460,7 @@ def download_run_logs():
             batch = _LOG_JOURNAL.read(run_id, after, until=latest)
             if not batch:
                 return
-            yield ''.join((f"[RUN:{event['runId']}] " if run_id == '*' else '') + event['line'] + '\n' for event in batch)
+            yield ''.join((f"[RUN:{event['runId']}] " if run_id == '*' or event['runId'] != run_id else '') + event['line'] + '\n' for event in batch)
             after = batch[-1]['seq']
     return Response(chunks(), content_type='text/plain; charset=utf-8',
                     headers={'Content-Disposition': 'attachment; filename="primigenius-log.txt"'})
@@ -1728,6 +1750,8 @@ _cache_preload_done = False
 _cache_preload_lock = threading.Lock()
 
 def _publish_runtime_state(kind, state):
+    if kind == 'r':
+        _images_cache.update(data=None, time=0)
     # Reuse the desktop startup pipe: no extra polling connection or web server.
     print('PRIMIGENIUS_RUNTIME_STATE=' + json.dumps({'kind': kind, 'state': state}, ensure_ascii=True), flush=True)
     if kind == 'engine' and state.get('engine_ready'):
@@ -2122,6 +2146,24 @@ def _collect_final_logs(container, seen_set, on_line):
 # 默认输出目录和R包目录放在主程序安装目录下
 USER_DOCS = os.path.join(APP_INSTALL_DIR, 'outputs')
 os.makedirs(USER_DOCS, exist_ok=True)
+
+
+def _prepare_analysis_output(plugin_id, requested_dir, category, workflow=False):
+    """Resolve CLI, R and workflow outputs without reusing a previous run path."""
+    requested_dir = (requested_dir or '').strip()
+    root = os.path.abspath(requested_dir or os.path.join(
+        USER_DOCS, 'workflow_output' if workflow else category))
+    if workflow or category == 'r_outputs' or not requested_dir:
+        safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', str(plugin_id or 'output'))
+        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+        root = os.path.join(root, f'{safe_name}_{ts}_{uuid.uuid4().hex[:6]}')
+        os.makedirs(root, exist_ok=False)
+    else:
+        os.makedirs(root, exist_ok=True)
+    g.analysis_output_dir = root
+    log(f'[SYSTEM] Output directory: {root}')
+    return root
+
 
 # Plugins are stored directly in the app's own plugins/ directory (under r/ and linux/ subdirs).
 # No duplication to Documents — single location only.
@@ -3313,6 +3355,13 @@ def _get_r_image():
     return image_id
 
 
+def _r_image_has_system_deps(image):
+    # OfflineR publishes the immutable ID only after environment validation.
+    return image == R_CUSTOM_IMAGE or bool(
+        _OFFLINE_R_ENV and _OFFLINE_R_ENV.image_id and image == _OFFLINE_R_ENV.image_id
+    )
+
+
 def _ensure_custom_r_image(client=None, silent=False, progress_cb=None):
     try:
         _offline_r_environment().ensure()
@@ -3619,10 +3668,10 @@ def _run_r_container_with_realtime_logs(client, command, mounts, environment, li
 
     try:
         r_image = _get_r_image()
-        if r_image != R_CUSTOM_IMAGE and install_system_deps:
+        if not _r_image_has_system_deps(r_image) and install_system_deps:
             if _ensure_custom_r_image(client, silent=True):
                 r_image = _get_r_image()
-        needs_deps_prefix = install_system_deps and r_image != R_CUSTOM_IMAGE
+        needs_deps_prefix = install_system_deps and not _r_image_has_system_deps(r_image)
         if needs_deps_prefix:
             deps_check = _r_system_deps_prefix()
             if isinstance(command, list):
@@ -4047,11 +4096,11 @@ def _run_r_install_job_locked(job_id, pkgs, repo=None, local_path=None, skip_rep
         mounts.append(script_mount)
 
         r_image = _get_r_image()
-        if r_image != R_CUSTOM_IMAGE:
+        if not _r_image_has_system_deps(r_image):
             _enqueue_job_log(job_id, '[SYSTEM] Preparing R build environment...')
             if _ensure_custom_r_image(client, silent=True, progress_cb=lambda line: _enqueue_job_log(job_id, line)):
                 r_image = _get_r_image()
-        if r_image == R_CUSTOM_IMAGE:
+        if _r_image_has_system_deps(r_image):
             deps_prefix = ''
         else:
             deps_prefix = _r_system_deps_prefix()
@@ -4308,12 +4357,12 @@ def _run_rscript_docker(script_path, params, out_dir, plugin_dir, extra_mounts=N
                         )
                         mounts.append(preflight_script_mount)
                         preflight_r_image = _get_r_image()
-                        if preflight_r_image != R_CUSTOM_IMAGE:
+                        if not _r_image_has_system_deps(preflight_r_image):
                             if _ensure_custom_r_image(client, silent=True):
                                 preflight_r_image = _get_r_image()
                         preflight_container = client.containers.run(
                             image=preflight_r_image,
-                            command=["bash", "-c", ('' if preflight_r_image == R_CUSTOM_IMAGE else _r_system_deps_prefix()) + shlex.join(['Rscript', preflight_script_path])],
+                            command=["bash", "-c", ('' if _r_image_has_system_deps(preflight_r_image) else _r_system_deps_prefix()) + shlex.join(['Rscript', preflight_script_path])],
                             mounts=mounts, environment=env,
                             detach=True, user='0', platform='linux/amd64',
                             log_config={'type': 'json-file'}
@@ -4371,9 +4420,10 @@ def _run_rscript_docker(script_path, params, out_dir, plugin_dir, extra_mounts=N
         'assign("svg",.psvg,envir=globalenv());assign("cairo_svg",.psvg,envir=globalenv());'
         'tryCatch({ns<-asNamespace("grDevices");unlockBinding("svg",ns);assign("svg",.psvg,envir=ns);invisible(lockBinding("svg",ns))},error=function(e){});'
         'tryCatch({ns<-asNamespace("grDevices");unlockBinding("cairo_svg",ns);assign("cairo_svg",.psvg,envir=ns);invisible(lockBinding("cairo_svg",ns))},error=function(e){})'
-        '}else{cat("[PrimiGenius] svglite not found, svg override skipped\\n")};'
+        '}else{cat("[PrimiGenius] svglite could not be loaded; using the native SVG device (text may be glyph outlines, not editable text)\\n")};'
     )
     r_bootstrap = (
+        'cat("[R-DOCKER] R started; loading graphics support and plugin packages...\\n");' +
         'invisible({' +
         r_svg_override +
         '});' +
@@ -4404,10 +4454,10 @@ def _run_rscript_docker(script_path, params, out_dir, plugin_dir, extra_mounts=N
     log(f'[R-DOCKER] Running with svglite override: {container_script}')
 
     r_image = _get_r_image()
-    if r_image != R_CUSTOM_IMAGE:
+    if not _r_image_has_system_deps(r_image):
         if _ensure_custom_r_image(client, silent=True):
             r_image = _get_r_image()
-    if r_image == R_CUSTOM_IMAGE:
+    if _r_image_has_system_deps(r_image):
         deps_prefix = ''
     else:
         deps_prefix = _r_system_deps_prefix()
@@ -5306,6 +5356,27 @@ def preview_plugin_archive():
         return jsonify(error=str(exc)), 400
 
 
+@app.route('/prepare-plugin-source', methods=['POST'])
+def prepare_plugin_source():
+    token = os.environ.get('PRIMIGENIUS_DESKTOP_TOKEN', '')
+    if not token or not secrets.compare_digest(token.encode(), request.headers.get('X-PrimiGenius-Desktop', '').encode()):
+        return jsonify(error='需要有效的桌面程序会话'), 403
+    directory = None
+    try:
+        from plugin_archive import extract_plugin
+        directory = tempfile.mkdtemp(prefix='primigenius-source-')
+        extract_plugin((request.get_json() or {})['zipPath'], directory)
+        with zipfile.ZipFile((request.get_json() or {})['zipPath']) as archive:
+            _, prefix, entries = inspect_archive(archive)
+            modes = {info.filename[len(prefix):]: '100755' if info.external_attr >> 16 & 0o111 else '100644'
+                     for info in entries if not info.is_dir()}
+        return jsonify(status='success', directory=directory, index=source_index(directory, modes))
+    except Exception as exc:
+        if directory:
+            shutil.rmtree(directory, ignore_errors=True)
+        return jsonify(status='error', message=str(exc)), 400
+
+
 @app.route('/package-plugin-source', methods=['POST'])
 @app.route('/prepare-plugin-upload', methods=['POST'])
 def package_plugin_source():
@@ -5335,7 +5406,7 @@ def install_plugin_panel():
     data = request.json
     try:
         with zipfile.ZipFile(data['zipPath'], 'r') as z:
-            cfg, _, _ = inspect_archive(z)
+            cfg, _, _ = inspect_install_archive(z)
         expected = data.get('expected')
         if expected:
             origin = cfg.get('marketplace') or {}
@@ -6194,10 +6265,7 @@ def _run_native_java_cli_plugin(cfg, data):
     if not os.path.isfile(jar_path):
         return jsonify({"status": "error", "message": f"JAR 文件未找到: {main_jar}，请先安装插件依赖"})
 
-    host_out_dir = os.path.normpath(os.path.abspath(data.get('outDir') or ''))
-    if not host_out_dir:
-        return jsonify({"status": "error", "message": "缺少输出目录"})
-    os.makedirs(host_out_dir, exist_ok=True)
+    host_out_dir = data['outDir']
 
     log_path = os.path.join(host_out_dir, f"PrimiGenius.{run_start:%Y-%m-%d_%H-%M-%S}.log")
 
@@ -6406,6 +6474,10 @@ def run_plugin():
         # === native_gui mode: launch Java GUI directly on Windows (no Docker needed) ===
         if cfg.get('run_mode') == 'native_gui':
             return _run_native_gui_plugin(cfg, data)
+        data['outDir'] = _prepare_analysis_output(
+            data.get('pluginId'), data.get('outDir'),
+            'r_outputs' if str(cfg.get('type') or '').lower().startswith('r') else 'cli_outputs',
+            workflow=data.get('outputContext') == 'workflow')
         if cfg.get('run_mode') == 'native_java_cli':
             return _run_native_java_cli_plugin(cfg, data)
 
@@ -6493,8 +6565,7 @@ def run_plugin():
                         log(f"[ERROR] {msg}")
                         return jsonify({"status": "error", "error_type": "docker_pull_failed", "docker_image": img, "message": "无法拉取 Docker 镜像: %s" % img})
         
-        host_out_dir = os.path.normpath(os.path.abspath(data['outDir']))
-        if not os.path.exists(host_out_dir): os.makedirs(host_out_dir, exist_ok=True)
+        host_out_dir = data['outDir']
 
         log_path = os.path.join(host_out_dir, f"PrimiGenius.{run_start:%Y-%m-%d_%H-%M-%S}.log")
         
@@ -7859,6 +7930,7 @@ def r_prepare_runtime():
 def r_cleanup_previous_runtime():
     try:
         _offline_r_environment().cleanup_previous((request.get_json(silent=True) or {}).get('confirmed'))
+        _images_cache.update(data=None, time=0)
         return jsonify(status='success')
     except Exception as exc:
         return jsonify(status='error', message=str(exc)), 409
@@ -8417,8 +8489,6 @@ def r_run_script():
         pluginId = request.form.get('pluginId')
         script = request.form.get('script')
         params_raw = request.form.get('params') or '{}'
-        default_r_outputs = os.path.join(USER_DOCS, 'r_outputs')
-        out_dir = request.form.get('outDir') or default_r_outputs
         try:
             params = json.loads(params_raw)
         except:
@@ -8431,19 +8501,14 @@ def r_run_script():
         if not cfg_path:
             return jsonify({'status': 'error', 'message': 'plugin not found'})
 
-        # Create a unique timestamped subfolder per run.  Milliseconds plus a
-        # short UUID keep rapid re-runs from colliding within the same second.
-        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-        run_suffix = uuid.uuid4().hex[:6]
-        safe_name = pluginId.replace(' ', '_') if pluginId else 'unknown'
-        out_dir = os.path.join(out_dir, f'{safe_name}_{ts}_{run_suffix}')
-
         plugin_dir = os.path.dirname(cfg_path)
         script_path = os.path.join(plugin_dir, script)
         if not os.path.exists(script_path):
             return jsonify({'status': 'error', 'message': 'script not found'})
 
-        os.makedirs(out_dir, exist_ok=True)
+        out_dir = _prepare_analysis_output(
+            pluginId, request.form.get('outDir'), 'r_outputs',
+            workflow=request.form.get('outputContext') == 'workflow')
 
         # Load plugin config once for both branches
         cfg = load_all_plugins().get(pluginId) or {}
@@ -8911,8 +8976,6 @@ def _parse_images(raw_images):
         labels = img_data.get('Labels') or (img_data.get('Config') or {}).get('Labels') or {}
         builtin_r = bool(labels.get('org.primigenius.r-version'))
         tags = img_data.get('RepoTags') or ['<none>:<none>']
-        if builtin_r:
-            tags = [R_CUSTOM_IMAGE]
         short_id = img_data['Id'].replace('sha256:', '')[:12]
         _hide = False
         for t in tags:
@@ -8935,8 +8998,12 @@ def _parse_images(raw_images):
             parts = [tag[:colon], tag[colon + 1:]] if colon > slash else [tag, 'latest']
             is_system_r_image = builtin_r or _is_pinned_r_runtime_local_ref(tag)
             if builtin_r:
-                display_repo, display_tag = R_CUSTOM_IMAGE.rsplit(':', 1)
-                canonical_ref = local_ref = display_name = R_CUSTOM_IMAGE
+                display_repo = 'primigenius-r-base'
+                display_tag = (f"r{labels.get('org.primigenius.r-version', 'unknown')}-"
+                               f"bioc{labels.get('org.primigenius.bioconductor-version', 'unknown')}-"
+                               f"v{labels.get('org.primigenius.recipe-version', 'unknown')}")
+                display_name = f'{display_repo}:{display_tag} [{short_id}]'
+                canonical_ref = local_ref = img_data['Id']
                 entry_key = ('builtin-r', img_data['Id'])
             elif is_system_r_image:
                 display_repo = R_DOCKER_IMAGE_REPOSITORY
